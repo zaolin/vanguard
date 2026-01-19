@@ -1,0 +1,23 @@
+# Build artifacts
+/vanguard
+*.exe
+
+# Embedded init binaries (built by make)
+cmd/vanguard/embed/init
+cmd/vanguard/embed/init-debug
+
+# Test directory
+test/
+
+# Temporary files
+tmp/
+*.tmp
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# OS
+.DS_Store
+.claude/
