@@ -441,13 +441,20 @@ func UnmountBootEarly() error {
 
 // SetupPCRLockEarly copies pcrlock.json from /boot to /var/lib/systemd/ in initramfs
 // This must be called before LUKS unlock when TPM2 token uses pcrlock policy
+// It derives the pcrlock path from the booted UKI path via EFI variable
 func SetupPCRLockEarly() error {
-	src := "/boot/pcrlock.json"
 	dst := "/var/lib/systemd/pcrlock.json"
 
-	// Check if pcrlock.json exists
+	// Get pcrlock path derived from booted UKI
+	src := getPCRLockPath()
+	if src == "" {
+		// Not an error if no pcrlock.json exists
+		return nil
+	}
+
+	// Check if file exists
 	if _, err := os.Stat(src); err != nil {
-		// Not an error if pcrlock.json doesn't exist
+		console.DebugPrint("vanguard: pcrlock not found at %s\n", src)
 		return nil
 	}
 
@@ -470,6 +477,74 @@ func SetupPCRLockEarly() error {
 	return nil
 }
 
+// getPCRLockPath derives the pcrlock.json path from the booted UKI
+// It reads the LoaderImageIdentifier EFI variable to get the UKI path,
+// then replaces .efi with .pcrlock.json
+// Returns empty string if UKI path cannot be determined
+func getPCRLockPath() string {
+	ukiPath := getBootedUKIPath()
+	if ukiPath == "" {
+		return ""
+	}
+
+	// Convert UKI path to pcrlock path: kernel.efi -> kernel.pcrlock.json
+	pcrPath := strings.TrimSuffix(ukiPath, ".efi") + ".pcrlock.json"
+	console.DebugPrint("vanguard: derived pcrlock path: %s\n", pcrPath)
+	return pcrPath
+}
+
+// getBootedUKIPath reads the LoaderImageIdentifier EFI variable to get the booted UKI path
+// Returns the path relative to /boot (e.g., /boot/EFI/Gentoo/kernel.efi)
+func getBootedUKIPath() string {
+	// LoaderImageIdentifier is set by systemd-stub/systemd-boot
+	// GUID: 4a67b082-0a4c-41cf-b6c7-440b29bb8c4f
+	efiVarPath := "/sys/firmware/efi/efivars/LoaderImageIdentifier-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+
+	data, err := os.ReadFile(efiVarPath)
+	if err != nil {
+		console.DebugPrint("vanguard: LoaderImageIdentifier not available: %v\n", err)
+		return ""
+	}
+
+	// EFI variable format: 4-byte attributes + UTF-16LE string
+	if len(data) < 6 {
+		return ""
+	}
+
+	// Skip 4-byte attribute header, decode UTF-16LE
+	utf16Data := data[4:]
+	path := decodeUTF16LE(utf16Data)
+
+	// Convert backslashes to forward slashes and prepend /boot
+	path = strings.ReplaceAll(path, "\\", "/")
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	path = "/boot" + path
+
+	console.DebugPrint("vanguard: booted UKI: %s\n", path)
+	return path
+}
+
+// decodeUTF16LE decodes a UTF-16LE byte slice to a string
+func decodeUTF16LE(data []byte) string {
+	if len(data) < 2 {
+		return ""
+	}
+
+	// Convert bytes to uint16 slice
+	var runes []rune
+	for i := 0; i+1 < len(data); i += 2 {
+		r := rune(data[i]) | rune(data[i+1])<<8
+		if r == 0 {
+			break // Null terminator
+		}
+		runes = append(runes, r)
+	}
+
+	return string(runes)
+}
+
 // getBootFromCmdline parses kernel cmdline for boot= parameter
 func getBootFromCmdline() string {
 	data, err := os.ReadFile("/proc/cmdline")
@@ -488,6 +563,13 @@ func getBootFromCmdline() string {
 
 // findBootPartition scans block devices to find a partition containing pcrlock.json
 func findBootPartition() string {
+	// Get expected pcrlock path from booted UKI
+	pcrLockPath := getPCRLockPath()
+	if pcrLockPath == "" {
+		console.DebugPrint("vanguard: cannot determine pcrlock path, skipping boot scan\n")
+		return ""
+	}
+
 	// Read /sys/block to find all block devices
 	sysBlocks, err := os.ReadDir("/sys/block")
 	if err != nil {
@@ -513,13 +595,12 @@ func findBootPartition() string {
 		}
 	}
 
-	// Try each candidate - mount as vfat and check for pcrlock.json
+	// Try each candidate - mount as vfat and check for pcrlock.json at derived path
 	for _, dev := range candidates {
 		if err := unix.Mount(dev, "/boot", "vfat", unix.MS_RDONLY, ""); err == nil {
-			// Check if pcrlock.json exists
-			if _, err := os.Stat("/boot/pcrlock.json"); err == nil {
-				// Found it!
-				console.DebugPrint("vanguard: found pcrlock.json on %s\n", dev)
+			// Check if pcrlock.json exists at the derived path
+			if _, err := os.Stat(pcrLockPath); err == nil {
+				console.DebugPrint("vanguard: found pcrlock on %s\n", dev)
 				unix.Unmount("/boot", 0)
 				return dev
 			}

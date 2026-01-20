@@ -214,7 +214,7 @@ sudo reboot
 
 Vanguard uses systemd-pcrlock's variant directory feature to allow both the old and new kernel to unlock:
 
-- Creates `/etc/pcrlock.d/100-uki.pcrlock.d/new.pcrlock`
+- Creates `/etc/pcrlock.d/510-uki.pcrlock.d/new.pcrlock`
 - Contains measurements for the new UKI
 - Policy accepts either old or new measurements
 - After reboot, old variant can be removed

@@ -19,8 +19,9 @@ type GenerateCmd struct {
 // UpdatePolicyCmd updates TPM2 pcrlock policy
 type UpdatePolicyCmd struct {
 	UKIPath      string `short:"u" required:"" help:"Path to UKI file (e.g., /boot/EFI/Gentoo/kernel.efi)"`
-	PolicyOutput string `short:"p" default:"/etc/boot-bundle/pcrlock.json" help:"Output path for policy JSON"`
-	BundleDir    string `default:"/etc/boot-bundle" help:"Directory for policy files"`
+	PolicyOutput string `short:"p" help:"Output path for policy JSON (default: <uki-path>.pcrlock.json)"`
 	LUKSDevice   string `short:"l" help:"LUKS device to measure (e.g., /dev/nvme0n1p2)"`
 	NoVerify     bool   `help:"Skip policy verification"`
+	Verbose      bool   `short:"v" help:"Show verbose output from pcrlock tools"`
+	Cleanup      bool   `short:"c" help:"Remove old unused pcrlock NV indices from TPM"`
 }

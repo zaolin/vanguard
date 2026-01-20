@@ -1,6 +1,8 @@
 package pcrlock
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -82,7 +84,13 @@ func InjectPCR8(policyPath string) error {
 			}
 			if alg, ok := dig["hashAlg"].(string); ok && alg == "sha256" {
 				if val, ok := dig["digest"].(string); ok {
-					pcr8Values = append(pcr8Values, val)
+					// Compute PCR extension: new_pcr = SHA256(old_pcr || data_hash)
+					// PCR 8 starts at all zeros, so we extend from zeros
+					extendedVal, err := computePCRExtend(val)
+					if err != nil {
+						return fmt.Errorf("failed to compute PCR extend: %w", err)
+					}
+					pcr8Values = append(pcr8Values, extendedVal)
 				}
 			}
 		}
@@ -92,7 +100,9 @@ func InjectPCR8(policyPath string) error {
 		return fmt.Errorf("no sha256 digests found in luks pcrlock")
 	}
 
-	fmt.Printf("[+] Injecting PCR 8 values from %s: %v\n", luksLockPath, pcr8Values)
+	if Verbose {
+		fmt.Printf("[+] Injecting PCR 8 values from %s: %v\n", luksLockPath, pcr8Values)
+	}
 
 	// 5. Add to policy
 	newPCR := map[string]interface{}{
@@ -115,4 +125,24 @@ func InjectPCR8(policyPath string) error {
 	}
 
 	return nil
+}
+
+// computePCRExtend computes PCR extension from a zero-initialized PCR.
+// PCR extension formula: new_pcr = SHA256(old_pcr || data_hash)
+func computePCRExtend(dataHashHex string) (string, error) {
+	dataHash, err := hex.DecodeString(dataHashHex)
+	if err != nil {
+		return "", fmt.Errorf("invalid hex digest: %w", err)
+	}
+
+	// PCR 8 starts at all zeros (32 bytes for SHA256)
+	initialPCR := make([]byte, 32)
+
+	// Concatenate old_pcr || data_hash and hash
+	h := sha256.New()
+	h.Write(initialPCR)
+	h.Write(dataHash)
+	extended := h.Sum(nil)
+
+	return hex.EncodeToString(extended), nil
 }
