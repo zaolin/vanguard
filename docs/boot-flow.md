@@ -147,13 +147,10 @@ sequenceDiagram
 
 ### Step 11: LUKS Unlock Strategy
 
-Before attempting unlock, Vanguard measures the LUKS header into PCR 8 (if TPM is available) for policy verification.
-
 ```mermaid
 flowchart TD
     A[Scan /sys/block] --> B[Find LUKS devices]
-    B --> C[Measure LUKS header to PCR 8]
-    C --> D{Has TPM2 token?}
+    B --> D{Has TPM2 token?}
     
     D -->|Yes| E[Wait for /dev/tpmrm0]
     D -->|No| K

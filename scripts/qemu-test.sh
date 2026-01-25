@@ -16,8 +16,13 @@ DISK_IMG="${TEST_DIR}/test-disk.qcow2"
 INITRAMFS="${TEST_DIR}/initramfs.img"
 DISK_SIZE="1G"
 LUKS_PASS="testpass"
+TPM_PIN="1234"  # PIN for TPM-protected unlock
 TPM_DIR="${TEST_DIR}/tpm"
 TPM_SOCKET="${TEST_DIR}/swtpm.sock"
+
+# Console size simulation (rows cols)
+# Default to 128x48 (approx 1024x768 standard console) if not set
+CONSOLE_SIZE="${CONSOLE_SIZE:-48 128}"
 
 #=============================================================================
 # Utility Functions
@@ -284,16 +289,33 @@ enroll_tpm() {
     init_swtpm_state
     start_swtpm_for_enrollment
 
-    info "Enrolling TPM2 token..."
+    info "Enrolling TPM2 token (no PIN)..."
     local pcrlock_arg=""
     if [ -f "${TEST_DIR}/pcrlock.json" ]; then
         pcrlock_arg="${TEST_DIR}/pcrlock.json"
         info "Using pcrlock policy: ${pcrlock_arg}"
     fi
-    sudo "${SCRIPT_DIR}/helpers/enroll-tpm.sh" "${DISK_IMG}" "${DISK_RAW}" "${TPM_SOCKET}" "${LUKS_PASS}" "${pcrlock_arg}"
+    sudo "${SCRIPT_DIR}/helpers/enroll-tpm.sh" "${DISK_IMG}" "${DISK_RAW}" "${TPM_SOCKET}" "${LUKS_PASS}" "${pcrlock_arg}" ""
 
     stop_swtpm
-    info "TPM enrollment complete"
+    info "TPM enrollment complete (no PIN)"
+}
+
+enroll_tpm_pin() {
+    check_swtpm_deps
+    init_swtpm_state
+    start_swtpm_for_enrollment
+
+    info "Enrolling TPM2 token with PIN: ${TPM_PIN}..."
+    local pcrlock_arg=""
+    if [ -f "${TEST_DIR}/pcrlock.json" ]; then
+        pcrlock_arg="${TEST_DIR}/pcrlock.json"
+        info "Using pcrlock policy: ${pcrlock_arg}"
+    fi
+    sudo "${SCRIPT_DIR}/helpers/enroll-tpm.sh" "${DISK_IMG}" "${DISK_RAW}" "${TPM_SOCKET}" "${LUKS_PASS}" "${pcrlock_arg}" "${TPM_PIN}"
+
+    stop_swtpm
+    info "TPM enrollment complete with PIN"
 }
 
 #=============================================================================
@@ -307,6 +329,20 @@ run_qemu() {
     [ -f "${DISK_IMG}" ] || error "Disk not found. Run: $0 disk"
 
     info "Starting QEMU..."
+    
+    # Handle console resizing if requested
+    local old_stty=""
+    if [ -n "${CONSOLE_SIZE}" ]; then
+        old_stty=$(stty -g)
+        # Split rows/cols
+        local rows=$(echo "${CONSOLE_SIZE}" | awk '{print $1}')
+        local cols=$(echo "${CONSOLE_SIZE}" | awk '{print $2}')
+        if [ -n "$rows" ] && [ -n "$cols" ]; then
+            info "Resizing console to ${rows}x${cols}..."
+            stty rows "$rows" cols "$cols"
+        fi
+    fi
+
     qemu-system-x86_64 -m 2G -cpu host -enable-kvm \
         -kernel "${kernel}" -initrd "${INITRAMFS}" \
         -append "root=/dev/vg0/root console=ttyS0" \
@@ -314,6 +350,12 @@ run_qemu() {
         -device scsi-hd,drive=hd0,bus=scsi0.0 \
         -drive file="${DISK_IMG}",format=qcow2,id=hd0,if=none \
         -nographic -no-reboot
+    
+    # Restore console size if we changed it
+    if [ -n "${old_stty}" ]; then
+        stty "${old_stty}"
+        info "Console size restored"
+    fi
 }
 
 run_qemu_quick() {
@@ -338,6 +380,19 @@ run_qemu_tpm() {
     trap stop_swtpm EXIT
 
     info "Starting QEMU with TPM..."
+
+    # Handle console resizing if requested
+    local old_stty=""
+    if [ -n "${CONSOLE_SIZE}" ]; then
+        old_stty=$(stty -g)
+        local rows=$(echo "${CONSOLE_SIZE}" | awk '{print $1}')
+        local cols=$(echo "${CONSOLE_SIZE}" | awk '{print $2}')
+        if [ -n "$rows" ] && [ -n "$cols" ]; then
+            info "Resizing console to ${rows}x${cols}..."
+            stty rows "$rows" cols "$cols"
+        fi
+    fi
+
     qemu-system-x86_64 -machine q35 -m 2G -cpu host -enable-kvm \
         -kernel "${kernel}" -initrd "${INITRAMFS}" \
         -append "root=/dev/vg0/root console=ttyS0" \
@@ -348,6 +403,10 @@ run_qemu_tpm() {
         -tpmdev emulator,id=tpm0,chardev=chrtpm \
         -device tpm-crb,tpmdev=tpm0 \
         -nographic -no-reboot
+
+    if [ -n "${old_stty}" ]; then
+        stty "${old_stty}"
+    fi
 
     trap - EXIT
     stop_swtpm
@@ -391,12 +450,22 @@ case "${1:-}" in
         run_qemu_tpm "${2:-}" ;;  # Same as tpm, uses TUI initramfs from build-tui
     enroll-tpm)
         enroll_tpm ;;
+    enroll-tpm-pin)
+        enroll_tpm_pin ;;
     all-tpm)
         check_deps; setup_test_dir; create_test_disk; enroll_tpm
         start_swtpm_for_enrollment; generate_pcrlock; stop_swtpm
         build_initramfs; run_qemu_tpm "${2:-}" ;;
     all-tpm-tui)
         check_deps; setup_test_dir; create_test_disk; enroll_tpm
+        start_swtpm_for_enrollment; generate_pcrlock; stop_swtpm
+        build_initramfs_tui; run_qemu_tpm "${2:-}" ;;
+    all-tpm-pin)
+        check_deps; setup_test_dir; create_test_disk; enroll_tpm_pin
+        start_swtpm_for_enrollment; generate_pcrlock; stop_swtpm
+        build_initramfs; run_qemu_tpm "${2:-}" ;;
+    all-tpm-pin-tui)
+        check_deps; setup_test_dir; create_test_disk; enroll_tpm_pin
         start_swtpm_for_enrollment; generate_pcrlock; stop_swtpm
         build_initramfs_tui; run_qemu_tpm "${2:-}" ;;
     clean)
@@ -422,9 +491,12 @@ Run Commands:
 TPM Commands:
   tpm [kernel]       Run QEMU with swtpm (debug mode)
   tpm-tui [kernel]   Run QEMU with swtpm (TUI mode, use build-tui first)
-  enroll-tpm         Enroll TPM2 token (no PCR binding)
+  enroll-tpm         Enroll TPM2 token (no PIN)
+  enroll-tpm-pin     Enroll TPM2 token with PIN (default: 1234)
   all-tpm [kernel]   Full TPM test: disk, enroll, build, run (debug mode)
   all-tpm-tui [kernel] Full TPM test with TUI mode
+  all-tpm-pin [kernel] Full TPM test with PIN (debug mode)
+  all-tpm-pin-tui [kernel] Full TPM test with PIN and TUI mode
 
 Maintenance:
   clean              Remove all test files
@@ -433,7 +505,7 @@ Examples:
   $0 build
   $0 build-tui
   $0 all-tpm
-  $0 all-tpm-tui
+  $0 all-tpm-pin-tui   # Test PIN entry in TUI mode
   $0 run /boot/vmlinuz
 HELP
         exit 1

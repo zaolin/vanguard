@@ -7,6 +7,7 @@ DISK_RAW="$2"
 TPM_SOCKET="$3"
 LUKS_PASS="$4"
 PCRLOCK_JSON="$5"
+TPM_PIN="$6"
 
 qemu-img convert -f qcow2 -O raw "${DISK_IMG}" "${DISK_RAW}"
 LOOP=$(losetup -f --show "${DISK_RAW}")
@@ -32,6 +33,18 @@ if [ -n "$PCRLOCK_JSON" ] && [ -f "$PCRLOCK_JSON" ]; then
 else
     ENROLL_ARGS+=(--tpm2-pcrlock=)
     echo "Enrolling without pcrlock policy"
+fi
+
+# Add PIN if requested
+if [ -n "$TPM_PIN" ]; then
+    ENROLL_ARGS+=(--tpm2-with-pin=yes)
+    echo ""
+    echo "=================================================="
+    echo "TPM PIN enrollment requested."
+    echo "When prompted, enter PIN: ${TPM_PIN}"
+    echo "You can use: systemd-tty-ask-password-agent --query"
+    echo "=================================================="
+    echo ""
 fi
 
 systemd-cryptenroll "${ENROLL_ARGS[@]}" "$PART"

@@ -5,9 +5,7 @@ import (
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
-	"os"
 	"os/exec"
-	"path/filepath"
 )
 
 // LUKSTPMToken represents the systemd-tpm2 token data from a LUKS device
@@ -88,35 +86,4 @@ func extractNVIndexFromBlob(b64 string) (int, error) {
 	// Read as big-endian 4-byte value
 	nvIndex := binary.BigEndian.Uint32(data[0:4])
 	return int(nvIndex), nil
-}
-
-// LockLUKSHeader locks PCR 8 for the LUKS header of the specified device.
-// It uses cryptsetup luksHeaderBackup to get the header and systemd-pcrlock lock-raw to create the policy.
-func LockLUKSHeader(devicePath string) error {
-	stdout, stderr := cmdOutput()
-
-	// 1. Dump LUKS header to temporary file
-	tmpFile := filepath.Join(os.TempDir(), "luks-header.img")
-	// Remove any existing file first (cryptsetup refuses to overwrite)
-	os.Remove(tmpFile)
-	// Make sure we clean up
-	defer os.Remove(tmpFile)
-
-	cmd := exec.Command("cryptsetup", "luksHeaderBackup", "--header-backup-file", tmpFile, devicePath)
-	if output, err := cmd.CombinedOutput(); err != nil {
-		return fmt.Errorf("luksHeaderBackup failed: %v output: %s", err, string(output))
-	}
-
-	// 2. Generate pcrlock file using lock-raw on PCR 8
-	// 800-luks-header.pcrlock seems appropriate (after 750-enter-initrd, before 830-root-fs)
-	policyPath := filepath.Join(PCRLockDir, "800-luks-header.pcrlock")
-
-	cmd = exec.Command(PCRLockBin, "lock-raw", "--pcr=8", fmt.Sprintf("--pcrlock=%s", policyPath), tmpFile)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("lock-raw failed: %w", err)
-	}
-
-	return nil
 }

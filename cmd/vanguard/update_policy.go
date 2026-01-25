@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 
 	"github.com/zaolin/vanguard/internal/pcrlock"
@@ -35,18 +36,58 @@ func (c *UpdatePolicyCmd) Run() error {
 	}
 
 	// Phase 1: Configure PCR masks
-	fmt.Println("[1/4] Configuring PCR masks...")
+	fmt.Println("[1/5] Configuring PCR masks...")
 	if err := pcrlock.ConfigureMasks(); err != nil {
 		return fmt.Errorf("failed to configure masks: %w", err)
 	}
 
 	// Phase 2: Lock PCRs
-	fmt.Println("[2/4] Locking PCR measurements...")
+	fmt.Println("[2/5] Locking PCR measurements...")
 	if c.Verbose {
 		fmt.Println("      Locking Secure Boot (PCR 7)...")
 	}
 	if err := pcrlock.LockSecureBoot(); err != nil {
 		return fmt.Errorf("failed to lock secure boot: %w", err)
+	}
+
+	// Lock GPT partition table (PCR 5) - auto-enabled when LUKS device specified
+	gptEnabled := c.LUKSDevice != "" && !c.NoGPT
+	if gptEnabled {
+		if c.Verbose {
+			fmt.Println("      Locking GPT partition table (PCR 5)...")
+		}
+		// Derive the parent disk from the LUKS device (e.g., /dev/nvme0n1p2 -> /dev/nvme0n1)
+		gptDevice := getParentDisk(c.LUKSDevice)
+		if c.Verbose && gptDevice != "" {
+			fmt.Printf("      Using disk: %s\n", gptDevice)
+		}
+		if err := pcrlock.LockGPT(gptDevice); err != nil {
+			if err == pcrlock.ErrNoGPT {
+				// Disk doesn't have GPT - skip GPT binding with a warning
+				fmt.Println("      Note: Disk does not have GPT partition table, skipping PCR 5 binding")
+				gptEnabled = false
+				// Mask GPT pcrlock since we can't use it
+				if err := pcrlock.MaskPolicy("600-gpt.pcrlock"); err != nil {
+					return fmt.Errorf("failed to mask GPT policy: %w", err)
+				}
+			} else {
+				return fmt.Errorf("failed to lock GPT: %w", err)
+			}
+		} else {
+			// Also lock EFI action events (ExitBootServices) which are measured into PCR 5
+			// These include both success and failure cases (failure happens on memory map changes)
+			if c.Verbose {
+				fmt.Println("      Locking EFI action events (PCR 5)...")
+			}
+			if err := pcrlock.LockEFIActions(); err != nil {
+				return fmt.Errorf("failed to lock EFI actions: %w", err)
+			}
+		}
+	} else {
+		// Mask GPT pcrlock when not using LUKS device binding
+		if err := pcrlock.MaskPolicy("600-gpt.pcrlock"); err != nil {
+			return fmt.Errorf("failed to mask GPT policy: %w", err)
+		}
 	}
 
 	if c.Verbose {
@@ -56,46 +97,35 @@ func (c *UpdatePolicyCmd) Run() error {
 		return fmt.Errorf("failed to lock UKI: %w", err)
 	}
 
-	if c.LUKSDevice != "" {
-		if c.Verbose {
-			fmt.Printf("      Locking LUKS Header (PCR 8): %s\n", c.LUKSDevice)
-		}
-		if err := pcrlock.LockLUKSHeader(c.LUKSDevice); err != nil {
-			return fmt.Errorf("failed to lock LUKS header: %w", err)
-		}
-	}
-
 	// Phase 3: Generate policy with recovery PIN
-	fmt.Println("[3/4] Generating TPM policy...")
+	fmt.Println("[3/5] Generating TPM policy...")
 	fmt.Println("      Enter Recovery PIN when prompted:")
 	if err := pcrlock.MakePolicy(c.PolicyOutput); err != nil {
 		return fmt.Errorf("failed to generate policy: %w", err)
 	}
 
-	// Inject PCR 8 if needed (systemd-pcrlock drops it if not in event log)
-	if c.LUKSDevice != "" {
-		pcrs, err := pcrlock.Predict(c.PolicyOutput)
-		if err == nil && !pcrs[8] {
-			if c.Verbose {
-				fmt.Println("      Injecting PCR 8 (not in event log)...")
-			}
-			if err := pcrlock.InjectPCR8(c.PolicyOutput); err != nil {
-				return fmt.Errorf("failed to inject PCR 8: %w", err)
-			}
-		}
-	}
-
 	// Phase 4: Verification and Summary
-	fmt.Println("[4/4] Verifying policy...")
+	fmt.Println("[4/5] Verifying policy...")
 
 	if !c.NoVerify {
-		requiredPCRs := []int{7}
-		if c.LUKSDevice != "" {
-			requiredPCRs = append(requiredPCRs, 8)
-		}
+		// Require PCR 4 (boot loader) and PCR 7 (secure boot)
+		requiredPCRs := []int{4, 7}
 
 		if err := pcrlock.VerifyPolicy(c.PolicyOutput, requiredPCRs); err != nil {
 			return fmt.Errorf("policy verification failed: %w", err)
+		}
+
+		// Check if GPT binding (PCR 5) was requested but not included
+		if gptEnabled {
+			pcrs, _ := pcrlock.Predict(c.PolicyOutput)
+			if !pcrs[5] {
+				fmt.Println("")
+				fmt.Println("WARNING: GPT binding (PCR 5) was requested but not included in policy.")
+				fmt.Println("         This typically happens when the firmware has additional PCR 5")
+				fmt.Println("         events that systemd-pcrlock cannot predict (e.g., EFI errors).")
+				fmt.Println("         Device identity validation via GPT will NOT be active.")
+				gptEnabled = false
+			}
 		}
 	}
 
@@ -127,12 +157,14 @@ func (c *UpdatePolicyCmd) Run() error {
 				fmt.Println("WARNING: The LUKS token points to a different NV index.")
 				fmt.Println("         You need to re-enroll the TPM token with:")
 				fmt.Printf("         systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto \\\n")
-				fmt.Printf("           --tpm2-with-pin=yes --tpm2-pcrlock=%s %s\n", c.PolicyOutput, c.LUKSDevice)
+				fmt.Printf("           --tpm2-with-pin=yes \\\n")
+				fmt.Printf("           --tpm2-pcrlock=%s \\\n", c.PolicyOutput)
+				fmt.Printf("           %s\n", c.LUKSDevice)
 			}
 		}
 	}
 
-	// Show active PCRs
+	// Show active PCRs in pcrlock policy
 	pcrs, _ := pcrlock.Predict(c.PolicyOutput)
 	fmt.Print("Active PCRs:         ")
 	first := true
@@ -140,10 +172,10 @@ func (c *UpdatePolicyCmd) Run() error {
 		2: "external-code",
 		3: "external-config",
 		4: "boot-loader-code",
+		5: "gpt-partition",
 		7: "secure-boot",
-		8: "luks-header",
 	}
-	for _, p := range []int{2, 3, 4, 7, 8} {
+	for _, p := range []int{2, 3, 4, 5, 7} {
 		if pcrs[p] {
 			if !first {
 				fmt.Print(", ")
@@ -157,8 +189,8 @@ func (c *UpdatePolicyCmd) Run() error {
 	// Show PCR details in verbose mode
 	if c.Verbose {
 		fmt.Println("")
-		fmt.Println("PCR Details:")
-		for _, p := range []int{2, 3, 4, 7, 8} {
+		fmt.Println("PCR Details (pcrlock policy):")
+		for _, p := range []int{2, 3, 4, 5, 7} {
 			status := "inactive"
 			if pcrs[p] {
 				status = "active"
@@ -169,6 +201,17 @@ func (c *UpdatePolicyCmd) Run() error {
 			}
 			fmt.Printf("  PCR %2d (%s): %s\n", p, name, status)
 		}
+	}
+
+	// Show enrollment command if LUKS device specified
+	if c.LUKSDevice != "" {
+		fmt.Println("")
+		fmt.Println("Enrollment Command")
+		fmt.Println("==================")
+		fmt.Printf("  systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto \\\n")
+		fmt.Printf("    --tpm2-with-pin=yes \\\n")
+		fmt.Printf("    --tpm2-pcrlock=%s \\\n", c.PolicyOutput)
+		fmt.Printf("    %s\n", c.LUKSDevice)
 	}
 
 	// Warnings for missing PCRs
@@ -205,6 +248,83 @@ func (c *UpdatePolicyCmd) Run() error {
 
 	fmt.Println("")
 	fmt.Printf("Policy written to: %s\n", c.PolicyOutput)
+	fmt.Println("")
+
+	// Final Phase: Comprehensive Setup Verification
+	fmt.Println("[5/5] Verifying Setup Integrity...")
+
+	// Parse the newly created policy to verify against TPM
+	newPolicy, err := pcrlock.ParsePolicy(c.PolicyOutput)
+	if err != nil {
+		fmt.Printf("⚠️  Failed to parse new policy for verification: %v\n", err)
+	} else {
+		// 1. Verify NV Index Sync
+		_, nvMatch, err := pcrlock.VerifyNVIndex(newPolicy)
+		if err != nil {
+			fmt.Printf("   ❌ NV Index Check: Failed to read (%v)\n", err)
+		} else if nvMatch {
+			fmt.Println("✅ NV Index:       Synchronized (TPM matches policy)")
+		} else {
+			fmt.Println("❌ NV Index:       MISMATCH (TPM content differs from policy)")
+			fmt.Println("Note: This is expected if you haven't run systemd-pcrlock make-policy yet,")
+			fmt.Println("or if this is a fresh policy not yet written to NV index.")
+		}
+
+		// 2. Verify PCRs
+		pcrMatches, currentValues, err := pcrlock.VerifyPCRs(newPolicy)
+		if err != nil {
+			fmt.Printf("❌ PCR Check:      Failed to read (%v)\n", err)
+		} else {
+			pcrFailures := 0
+			for p, match := range pcrMatches {
+				if !match {
+					pcrFailures++
+					fmt.Printf("  ❌ PCR %-2d:       MISMATCH (Current: %s)\n", p, currentValues[p])
+				}
+			}
+			if pcrFailures == 0 {
+				fmt.Println("✅ PCR Values:     Match Policy")
+			} else {
+				fmt.Println("❌ PCR Values:     MISMATCH (System state differs from policy)")
+			}
+		}
+	}
 
 	return nil
+}
+
+// getParentDisk extracts the parent disk device from a partition device path
+// using /sys/block to handle all device types and naming schemes.
+// For example: /dev/nvme0n1p2 -> /dev/nvme0n1, /dev/sda2 -> /dev/sda
+func getParentDisk(devicePath string) string {
+	// Resolve symlinks to get the real device path
+	realPath, err := filepath.EvalSymlinks(devicePath)
+	if err != nil {
+		realPath = devicePath
+	}
+
+	// Extract device name from path (e.g., /dev/nvme0n1p2 -> nvme0n1p2)
+	devName := filepath.Base(realPath)
+
+	// Check if this device has a parent in /sys/block/*/devName
+	// For partitions, the structure is: /sys/block/<disk>/<partition>
+	sysBlockPath := "/sys/block"
+	entries, err := os.ReadDir(sysBlockPath)
+	if err != nil {
+		return ""
+	}
+
+	for _, entry := range entries {
+		diskName := entry.Name()
+		// Check if our device is a partition of this disk
+		partPath := filepath.Join(sysBlockPath, diskName, devName)
+		if _, err := os.Stat(partPath); err == nil {
+			// Found the parent disk
+			return "/dev/" + diskName
+		}
+	}
+
+	// Device might be a whole disk itself, or couldn't find parent
+	// Return empty to let systemd-pcrlock auto-detect
+	return ""
 }

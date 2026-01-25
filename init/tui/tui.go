@@ -71,6 +71,15 @@ type Model struct {
 	attempts      int
 	passwordErr   string
 	passwordDone  chan string
+
+	// TPM lockout state
+	lockedOut       bool
+	lockoutMessage  string
+	lockoutRecovery string
+
+	// Window dimensions
+	width  int
+	height int
 }
 
 type stageEntry struct {
@@ -96,7 +105,21 @@ type PasswordPromptMsg struct {
 	Done   chan string
 }
 type PasswordErrorMsg string
+type PasswordErrorWithRetryMsg struct {
+	Message string
+	Done    chan string
+}
+type PasswordPromptDoneMsg struct{} // Signals password entry is complete
+type TPMLockoutMsg struct {
+	Message      string
+	RecoveryHint string
+}
+type TPMErrorMsg struct {
+	Message string
+}
 type QuitMsg struct{}
+
+// ... (existing helper types) ...
 
 // New creates a new boot TUI model
 func New() Model {
@@ -116,6 +139,8 @@ func New() Model {
 		stages:        []stageEntry{},
 		passwordInput: ti,
 		passwordDone:  nil,
+		width:         80, // Default width
+		height:        24, // Default height
 	}
 }
 
@@ -129,20 +154,32 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	var cmds []tea.Cmd
 
 	switch msg := msg.(type) {
+	case tea.WindowSizeMsg:
+		m.width = msg.Width
+		m.height = msg.Height
+
 	case tea.KeyMsg:
 		if m.passwordMode {
 			switch msg.Type {
-			case tea.KeyEnter:
+			case tea.KeyEnter, tea.KeyCtrlJ:
 				password := m.passwordInput.Value()
+				// Sanitize password to remove any potential newline/CR characters
+				// We do NOT use TrimSpace as passphrases may strictly contain spaces
+				password = strings.TrimRight(password, "\r\n")
 				m.passwordInput.SetValue("")
 				if m.passwordDone != nil {
 					m.passwordDone <- password
 					m.passwordDone = nil
 				}
-				m.passwordMode = false
-				m.passwordErr = ""
+				// Keep passwordMode=true - wait for explicit PasswordPromptDoneMsg or new prompt
+				// This allows error messages to be displayed before the next prompt
 				return m, nil
 			case tea.KeyCtrlC:
+				// Send empty string to unblock PromptPassword before quitting
+				if m.passwordDone != nil {
+					m.passwordDone <- ""
+					m.passwordDone = nil
+				}
 				return m, tea.Quit
 			}
 			var cmd tea.Cmd
@@ -188,15 +225,55 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 
 	case PasswordPromptMsg:
+		// Reset state if this is a different device
+		if m.deviceName != msg.Device {
+			m.attempts = 0
+			m.passwordErr = ""
+		}
 		m.passwordMode = true
+		m.lockedOut = false
 		m.deviceName = msg.Device
 		m.passwordDone = msg.Done
+		m.passwordInput.Reset()
 		m.passwordInput.Focus()
 		return m, textinput.Blink
 
 	case PasswordErrorMsg:
 		m.passwordErr = string(msg)
 		m.attempts++
+		// Re-enable input for next attempt (but no channel - use PasswordErrorWithRetryMsg for retries)
+		m.passwordInput.Reset()
+		m.passwordInput.Focus()
+		return m, textinput.Blink
+
+	case PasswordErrorWithRetryMsg:
+		// Error with retry - set up new channel for next attempt
+		m.passwordErr = msg.Message
+		m.attempts++
+		m.passwordMode = true
+		m.passwordDone = msg.Done
+		m.passwordInput.Reset()
+		m.passwordInput.Focus()
+		return m, textinput.Blink
+
+	case PasswordPromptDoneMsg:
+		// Explicitly end password mode
+		m.passwordMode = false
+		m.passwordErr = ""
+		m.attempts = 0
+
+	case TPMLockoutMsg:
+		// Show lockout message without password prompt
+		m.passwordMode = false
+		m.passwordErr = ""
+		m.lockedOut = true
+		m.lockoutMessage = msg.Message
+		m.lockoutRecovery = msg.RecoveryHint
+
+	case TPMErrorMsg:
+		// Show TPM error (PCR mismatch, etc.)
+		m.passwordMode = false
+		m.passwordErr = msg.Message
 
 	case QuitMsg:
 		m.done = true
@@ -213,47 +290,89 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 // View implements tea.Model
 func (m Model) View() string {
-	var b strings.Builder
-
-	// ANSI escape to clear line (prevents artifacts from previous longer text)
-	const clearLine = "\033[2K"
-
-	// Title
-	b.WriteString(titleStyle.Render("⚡ vanguard boot"))
-	b.WriteString("\n\n")
-
-	// Current stage with spinner (always shown unless password mode)
-	if m.stage != "" && !m.passwordMode {
-		b.WriteString(fmt.Sprintf("%s %s %s\n", clearLine, m.spinner.View(), stageStyle.Render(m.stage)))
+	// Use fallback dimensions if window size is not yet detected
+	width := m.width
+	if width == 0 {
+		width = 80
+	}
+	height := m.height
+	if height == 0 {
+		height = 24
 	}
 
-	// Password prompt mode - show below the stage
+	const clearLine = "\033[2K"
+
+	// 1. Logo
+	// Logo is embedded ANSI art. We wrap it in a style to center it if needed,
+	// but since it's a fixed block, we can just treat it as a string.
+	// We use lipgloss.JoinVertical to stack elements.
+
+	// 2. Title
+	// 2. Title
+	// Title is now embedded ANSI art generated from Exo 2 font
+	title := Title
+
+	// 3. Main Content
+	var mainContent strings.Builder
+
+	// Current stage with spinner
+	if m.stage != "" && !m.passwordMode && !m.lockedOut {
+		mainContent.WriteString(fmt.Sprintf("%s %s %s\n", clearLine, m.spinner.View(), stageStyle.Render(m.stage)))
+	}
+
+	// TPM Lockout display (no password prompt)
+	if m.lockedOut {
+		mainContent.WriteString("\n")
+		mainContent.WriteString(errorStyle.Render("⚠ TPM Locked"))
+		mainContent.WriteString("\n\n")
+		mainContent.WriteString(stageStyle.Render(m.lockoutMessage))
+		mainContent.WriteString("\n")
+		if m.lockoutRecovery != "" {
+			mainContent.WriteString("\n")
+			mainContent.WriteString(helpStyle.Render(m.lockoutRecovery))
+			mainContent.WriteString("\n")
+		}
+	}
+
+	// Password prompt
 	if m.passwordMode {
 		if m.stage != "" {
-			b.WriteString(fmt.Sprintf("%s %s %s\n", clearLine, m.spinner.View(), stageStyle.Render(m.stage)))
+			mainContent.WriteString(fmt.Sprintf("%s %s %s\n", clearLine, m.spinner.View(), stageStyle.Render(m.stage)))
 		}
-		b.WriteString("\n")
-		b.WriteString(promptStyle.Render(fmt.Sprintf("Enter passphrase for %s:", m.deviceName)))
-		b.WriteString("\n\n")
-		b.WriteString(m.passwordInput.View())
-		b.WriteString("\n\n")
+		mainContent.WriteString("\n")
+		// Show error from previous attempt BEFORE the new prompt
 		if m.passwordErr != "" {
-			b.WriteString(errorStyle.Render(m.passwordErr))
-			b.WriteString("\n")
+			mainContent.WriteString(errorStyle.Render(m.passwordErr))
+			mainContent.WriteString("\n\n")
 		}
-		if m.attempts > 0 {
-			b.WriteString(helpStyle.Render(fmt.Sprintf("Attempt %d of 3", m.attempts+1)))
-			b.WriteString("\n")
+		// Show attempt counter (1-indexed, always show current attempt)
+		attemptNum := m.attempts + 1
+		if attemptNum <= 3 {
+			mainContent.WriteString(helpStyle.Render(fmt.Sprintf("Attempt %d of 3", attemptNum)))
+			mainContent.WriteString("\n\n")
 		}
+		mainContent.WriteString(promptStyle.Render(fmt.Sprintf("Enter passphrase for %s:", m.deviceName)))
+		mainContent.WriteString("\n\n")
+		mainContent.WriteString(m.passwordInput.View())
+		mainContent.WriteString("\n")
 	}
 
 	if m.err != nil {
-		b.WriteString("\n")
-		b.WriteString(errorStyle.Render(fmt.Sprintf("Error: %v", m.err)))
-		b.WriteString("\n")
+		mainContent.WriteString("\n" + errorStyle.Render(fmt.Sprintf("Error: %v", m.err)) + "\n")
 	}
 
-	return b.String()
+	// Assemble the centralized block
+	// We use JoinVertical to stack Logo, Title, and MainContent
+	ui := lipgloss.JoinVertical(lipgloss.Center,
+		Logo,
+		"\n",
+		title,
+		"\n\n",
+		mainContent.String(),
+	)
+
+	// Center the UI block in the entire window
+	return lipgloss.Place(width, height, lipgloss.Center, lipgloss.Center, ui)
 }
 
 // Program is the global TUI program instance
@@ -327,14 +446,60 @@ func PromptPassword(device string) (string, error) {
 	done := make(chan string, 1)
 	Program.Send(PasswordPromptMsg{Device: device, Done: done})
 
-	password := <-done
-	return password, nil
+	select {
+	case password := <-done:
+		return password, nil
+	case <-time.After(5 * time.Minute):
+		return "", fmt.Errorf("password prompt timeout")
+	}
 }
 
 // PasswordError shows a password error message
 func PasswordError(msg string) {
 	if Program != nil {
 		Program.Send(PasswordErrorMsg(msg))
+	}
+}
+
+// PasswordErrorWithRetry shows a password error and waits for retry
+// Returns the next password attempt
+func PasswordErrorWithRetry(msg string) (string, error) {
+	if Program == nil {
+		return "", fmt.Errorf("TUI not initialized")
+	}
+
+	done := make(chan string, 1)
+	Program.Send(PasswordErrorWithRetryMsg{Message: msg, Done: done})
+
+	select {
+	case password := <-done:
+		return password, nil
+	case <-time.After(5 * time.Minute):
+		return "", fmt.Errorf("password prompt timeout")
+	}
+}
+
+// PasswordPromptDone signals that password entry is complete
+// Call this after successful unlock or when giving up on PIN entry
+func PasswordPromptDone() {
+	if Program != nil {
+		Program.Send(PasswordPromptDoneMsg{})
+	}
+}
+
+// ShowTPMLockout displays a lockout message without PIN prompt
+// Use when TPM is in DA lockout state before prompting for PIN
+func ShowTPMLockout(message, recoveryHint string) {
+	if Program != nil {
+		Program.Send(TPMLockoutMsg{Message: message, RecoveryHint: recoveryHint})
+	}
+}
+
+// ShowTPMError displays a TPM error that prevents unlock
+// Use for non-retryable errors like PCR mismatch
+func ShowTPMError(message string) {
+	if Program != nil {
+		Program.Send(TPMErrorMsg{Message: message})
 	}
 }
 

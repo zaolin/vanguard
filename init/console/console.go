@@ -29,8 +29,12 @@ func Setup() error {
 		if err == nil {
 			consoleFd = fd
 			// Redirect stdout/stderr to console
-			_ = unix.Dup2(int(fd.Fd()), 1)
-			_ = unix.Dup2(int(fd.Fd()), 2)
+			if err := unix.Dup2(int(fd.Fd()), 1); err != nil {
+				fmt.Fprintf(fd, "warning: failed to redirect stdout: %v\n", err)
+			}
+			if err := unix.Dup2(int(fd.Fd()), 2); err != nil {
+				fmt.Fprintf(fd, "warning: failed to redirect stderr: %v\n", err)
+			}
 			return nil
 		}
 	}
@@ -51,6 +55,35 @@ func SuppressKernelMessages() {
 func RestoreKernelMessages() {
 	// Restore to level 4 (KERN_WARNING and above)
 	_ = os.WriteFile("/proc/sys/kernel/printk", []byte("4"), 0644)
+}
+
+// SuppressStderr redirects stderr to /dev/null to prevent external commands
+// (like tpm2-tss library) from corrupting the TUI display.
+// Returns a function to restore stderr. Call this before exec.Command.Run().
+func SuppressStderr() func() {
+	if !TUIActive {
+		return func() {}
+	}
+
+	// Save current stderr fd
+	savedStderr, err := unix.Dup(2)
+	if err != nil {
+		return func() {}
+	}
+
+	// Open /dev/null and redirect stderr to it
+	devNull, err := os.OpenFile("/dev/null", os.O_WRONLY, 0)
+	if err != nil {
+		unix.Close(savedStderr)
+		return func() {}
+	}
+	_ = unix.Dup2(int(devNull.Fd()), 2)
+	devNull.Close()
+
+	return func() {
+		_ = unix.Dup2(savedStderr, 2)
+		unix.Close(savedStderr)
+	}
 }
 
 // Print outputs to the early console (suppressed when TUI is active)
@@ -100,7 +133,8 @@ func ReadPassword(prompt string) (string, error) {
 	}
 	defer unix.IoctlSetTermios(int(consoleFd.Fd()), unix.TCSETS, oldState)
 
-	// Read password
+	// Read password (max 4KB to prevent memory exhaustion)
+	const maxPasswordLen = 4096
 	var password []byte
 	buf := make([]byte, 1)
 	for {
@@ -110,6 +144,10 @@ func ReadPassword(prompt string) (string, error) {
 		}
 		if buf[0] == '\n' || buf[0] == '\r' {
 			break
+		}
+		if len(password) >= maxPasswordLen {
+			// Discard additional input but keep reading until newline
+			continue
 		}
 		password = append(password, buf[0])
 	}

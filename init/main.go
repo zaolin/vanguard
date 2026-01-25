@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/zaolin/vanguard/init/bootlog"
+	"github.com/zaolin/vanguard/init/buildtags"
 	"github.com/zaolin/vanguard/init/console"
 	"github.com/zaolin/vanguard/init/cryptsetup"
 	"github.com/zaolin/vanguard/init/fsck"
@@ -32,16 +33,17 @@ func main() {
 	console.SuppressKernelMessages()
 
 	// Enable debug output in console package based on build tag
-	console.DebugEnabled = debugEnabled
+	console.DebugEnabled = buildtags.DebugEnabled
 
-	debug("vanguard: starting init\n")
+	buildtags.Debug("vanguard: starting init\n")
 
 	// Pass debug function to packages
-	cryptsetup.Debug = debug
-	vconsole.Debug = debug
-	resume.Debug = debug
-	fsck.Debug = debug
-	gpt.Debug = debug
+	cryptsetup.Debug = buildtags.Debug
+	cryptsetup.StrictMode = buildtags.StrictMode
+	vconsole.Debug = buildtags.Debug
+	resume.Debug = buildtags.Debug
+	fsck.Debug = buildtags.Debug
+	gpt.Debug = buildtags.Debug
 
 	// Pass boot logging function to cryptsetup package
 	cryptsetup.LogFunc = func(event string, kvPairs ...string) {
@@ -49,37 +51,37 @@ func main() {
 	}
 
 	// 2. Mount essential filesystems
-	debug("vanguard: mounting filesystems\n")
+	buildtags.Debug("vanguard: mounting filesystems\n")
 	if err := mount.Essential(); err != nil {
 		console.Print("vanguard: failed to mount filesystems: %v\n", err)
 		halt()
 	}
 
 	// 3. Configure vconsole (keymap + font) BEFORE any password prompts
-	debug("vanguard: configuring vconsole\n")
+	buildtags.Debug("vanguard: configuring vconsole\n")
 	if err := vconsole.Configure(); err != nil {
-		debug("vanguard: vconsole configuration: %v\n", err)
+		buildtags.Debug("vanguard: vconsole configuration: %v\n", err)
 	}
 
 	// Start TUI in non-debug mode (no-op in debug mode)
 	if tui.IsEnabled() {
 		if err := tui.Start(); err != nil {
-			debug("vanguard: TUI start failed: %v\n", err)
+			buildtags.Debug("vanguard: TUI start failed: %v\n", err)
 		}
 		defer tui.Quit()
 	}
 
 	// 4. Mount /boot early for logging (before anything else)
-	debug("vanguard: mounting /boot early\n")
+	buildtags.Debug("vanguard: mounting /boot early\n")
 	earlyBootMounted, err := mount.MountBootEarly()
 	if err != nil {
-		debug("vanguard: early mount /boot: %v\n", err)
+		buildtags.Debug("vanguard: early mount /boot: %v\n", err)
 	}
 
 	// 5. Initialize boot log immediately after /boot is mounted
 	if earlyBootMounted {
 		if err := bootlog.Init(); err != nil {
-			debug("vanguard: bootlog init: %v\n", err)
+			buildtags.Debug("vanguard: bootlog init: %v\n", err)
 		} else {
 			bootlog.Log(bootlog.EventBootStart)
 			bootlog.Log(bootlog.EventEssentialMounts, "status", "ok")
@@ -98,35 +100,35 @@ func main() {
 
 	// 6. Start udevd BEFORE loading modules (for firmware loading)
 	tui.UpdateStage(tui.StageUdev)
-	debug("vanguard: starting udevd\n")
+	buildtags.Debug("vanguard: starting udevd\n")
 	if err := udev.Start(); err != nil {
-		debug("vanguard: udevd start warning: %v\n", err)
+		buildtags.Debug("vanguard: udevd start warning: %v\n", err)
 	}
 	tui.StageDone(tui.StageUdev)
 
 	// 7. Load kernel modules (only those available in the image)
 	tui.UpdateStage(tui.StageModules)
-	debug("vanguard: loading kernel modules\n")
+	buildtags.Debug("vanguard: loading kernel modules\n")
 	availableModules := discoverModules()
 	if len(availableModules) > 0 {
-		debug("vanguard: found %d modules\n", len(availableModules))
+		buildtags.Debug("vanguard: found %d modules\n", len(availableModules))
 		modules.LoadAll(availableModules)
 	}
 	bootlog.Log(bootlog.EventModulesLoaded, "count", fmt.Sprintf("%d", len(availableModules)))
 	tui.StageDone(tui.StageModules)
 
 	// 8. Trigger udev events for firmware loading
-	debug("vanguard: triggering udev events\n")
+	buildtags.Debug("vanguard: triggering udev events\n")
 	udev.Trigger()
 	udev.Settle(10 * time.Second)
 
 	// 9. Load TPM modules explicitly before cryptsetup
 	tui.UpdateStage(tui.StageTPM)
-	debug("vanguard: loading TPM modules\n")
+	buildtags.Debug("vanguard: loading TPM modules\n")
 	tpmModules := []string{"tpm_crb", "tpm_tis", "tpm_tis_core"}
 	for _, mod := range tpmModules {
 		if err := modules.LoadByName(mod); err != nil {
-			debug("vanguard: tpm module %s: %v\n", mod, err)
+			buildtags.Debug("vanguard: tpm module %s: %v\n", mod, err)
 		}
 	}
 	tui.StageDone(tui.StageTPM)
@@ -134,9 +136,9 @@ func main() {
 	// 10. Setup pcrlock (needed before LUKS unlock if using pcrlock policy)
 	if earlyBootMounted {
 		tui.UpdateStage(tui.StagePCRLock)
-		debug("vanguard: setting up pcrlock early\n")
+		buildtags.Debug("vanguard: setting up pcrlock early\n")
 		if err := mount.SetupPCRLockEarly(); err != nil {
-			debug("vanguard: early pcrlock setup: %v\n", err)
+			buildtags.Debug("vanguard: early pcrlock setup: %v\n", err)
 			bootlog.Log(bootlog.EventPCRLock, "found", "false", "error", err.Error())
 		} else {
 			bootlog.Log(bootlog.EventPCRLock, "found", "true")
@@ -147,7 +149,7 @@ func main() {
 
 	// 11. Unlock encrypted devices (required - halt if none found)
 	tui.UpdateStage(tui.StageLUKS)
-	debug("vanguard: unlocking encrypted devices\n")
+	buildtags.Debug("vanguard: unlocking encrypted devices\n")
 	unlocked, err := cryptsetup.UnlockDevices()
 	if err != nil {
 		tui.StageError(tui.StageLUKS, err)
@@ -168,15 +170,15 @@ func main() {
 
 	// 11a. Trigger udev to process dm-crypt device (for db_persist)
 	// Since we use DM_DISABLE_UDEV=1, we need to manually trigger udev
-	debug("vanguard: triggering udev for dm-crypt devices\n")
+	buildtags.Debug("vanguard: triggering udev for dm-crypt devices\n")
 	udev.Trigger()
 	udev.Settle(5 * time.Second)
 
 	// 12. Scan and activate LVM
 	tui.UpdateStage(tui.StageLVM)
-	debug("vanguard: activating LVM volumes\n")
+	buildtags.Debug("vanguard: activating LVM volumes\n")
 	if err := lvm.Activate(); err != nil {
-		debug("vanguard: warning: LVM activation failed: %v\n", err)
+		buildtags.Debug("vanguard: warning: LVM activation failed: %v\n", err)
 		bootlog.Log(bootlog.EventLVMActivate, "status", "error", "error", err.Error())
 	} else {
 		bootlog.Log(bootlog.EventLVMActivate, "status", "ok")
@@ -184,32 +186,34 @@ func main() {
 	tui.StageDone(tui.StageLVM)
 
 	// 12a. Trigger udev to process LVM devices (for db_persist)
-	debug("vanguard: triggering udev for LVM devices\n")
+	buildtags.Debug("vanguard: triggering udev for LVM devices\n")
 	udev.Trigger()
 	udev.Settle(5 * time.Second)
 
 	// 13. Try hibernate resume (swap is now accessible after LUKS+LVM)
 	// This must happen BEFORE mounting root read-write
 	tui.UpdateStage(tui.StageResume)
-	debug("vanguard: checking for hibernate resume\n")
+	buildtags.Debug("vanguard: checking for hibernate resume\n")
 	if err := resume.TryResume(); err != nil {
-		debug("vanguard: resume error: %v\n", err)
+		buildtags.Debug("vanguard: resume error: %v\n", err)
 	}
 	tui.StageDone(tui.StageResume)
 	// If resume succeeded, we never reach this point (kernel takes over)
 
 	// 14. Determine root device (cmdline -> fstab -> GPT autodiscovery)
-	debug("vanguard: determining root device\n")
+	buildtags.Debug("vanguard: determining root device\n")
 	rootDev, rootFSType, err := mount.GetRootDevice()
 	if err != nil {
 		// Try GPT autodiscovery as last resort
 		if gpt.IsGPTAutoEnabled() {
-			debug("vanguard: trying GPT autodiscovery\n")
+			buildtags.Debug("vanguard: trying GPT autodiscovery\n")
 			if discovered, discoverErr := gpt.DiscoverRootPartition(); discoverErr == nil {
 				rootDev = discovered
 				rootFSType = "" // Will be auto-detected
 				err = nil
 				bootlog.Log(bootlog.EventDebug, "msg", fmt.Sprintf("GPT autodiscovery found root: %s", rootDev))
+			} else {
+				buildtags.Debug("vanguard: GPT autodiscovery failed: %v\n", discoverErr)
 			}
 		}
 	}
@@ -223,7 +227,7 @@ func main() {
 	// 15. Run fsck on root device before mounting
 	if fsck.CheckEnabled() {
 		tui.UpdateStage(tui.StageFsck)
-		debug("vanguard: running fsck on %s\n", rootDev)
+		buildtags.Debug("vanguard: running fsck on %s\n", rootDev)
 		if err := fsck.Check(rootDev, rootFSType); err != nil {
 			bootlog.Log(bootlog.EventDebug, "msg", fmt.Sprintf("fsck error: %v", err))
 			console.Print("vanguard: fsck failed on %s: %v\n", rootDev, err)
@@ -236,7 +240,7 @@ func main() {
 
 	// 16. Mount real root filesystem
 	tui.UpdateStage(tui.StageRoot)
-	debug("vanguard: mounting root filesystem\n")
+	buildtags.Debug("vanguard: mounting root filesystem\n")
 	if err := mount.RootWithDevice("/sysroot", rootDev, rootFSType); err != nil {
 		tui.StageError(tui.StageRoot, err)
 		bootlog.Log(bootlog.EventRootMounted, "status", "error", "error", err.Error())
@@ -248,39 +252,39 @@ func main() {
 	bootlog.Log(bootlog.EventRootMounted, "target", "/sysroot", "device", rootDev, "status", "ok")
 
 	// 16a. Create LVM symlinks in /sysroot/dev for persistence after switch_root
-	debug("vanguard: creating LVM symlinks in sysroot\n")
+	buildtags.Debug("vanguard: creating LVM symlinks in sysroot\n")
 	if err := lvm.CreateSymlinksForSysroot("/sysroot"); err != nil {
-		debug("vanguard: warning: failed to create sysroot LVM symlinks: %v\n", err)
+		buildtags.Debug("vanguard: warning: failed to create sysroot LVM symlinks: %v\n", err)
 	}
 
 	// 17. Cleanup udev before switch_root
 	// Wait for all udev events to settle
-	debug("vanguard: waiting for udev events to settle\n")
+	buildtags.Debug("vanguard: waiting for udev events to settle\n")
 	udev.Settle(5 * time.Second)
 
 	// Clean up udev database - dm devices with db_persist flag will survive
-	debug("vanguard: cleaning up udev database\n")
+	buildtags.Debug("vanguard: cleaning up udev database\n")
 	if err := udev.CleanupDB(); err != nil {
-		debug("vanguard: warning: udev cleanup: %v\n", err)
+		buildtags.Debug("vanguard: warning: udev cleanup: %v\n", err)
 	}
 
 	// Stop udevd gracefully
-	debug("vanguard: stopping udevd\n")
+	buildtags.Debug("vanguard: stopping udevd\n")
 	udev.Stop()
 
 	// 18. Close boot log and unmount /boot before switchroot
 	bootlog.Log(bootlog.EventSwitchroot, "target", "/sysroot")
 	bootlog.Close()
 	if earlyBootMounted {
-		debug("vanguard: unmounting early /boot\n")
+		buildtags.Debug("vanguard: unmounting early /boot\n")
 		if err := mount.UnmountBootEarly(); err != nil {
-			debug("vanguard: early unmount /boot: %v\n", err)
+			buildtags.Debug("vanguard: early unmount /boot: %v\n", err)
 		}
 	}
 
 	// 19. Switch root to init
 	tui.UpdateStage(tui.StageSwitchroot)
-	debug("vanguard: switching root to /sysroot\n")
+	buildtags.Debug("vanguard: switching root to /sysroot\n")
 	initPaths := []string{
 		"/usr/lib/systemd/systemd",
 		"/lib/systemd/systemd",
@@ -291,7 +295,7 @@ func main() {
 	for _, initPath := range initPaths {
 		err := switchroot.SwitchRoot("/sysroot", initPath)
 		if err != nil {
-			debug("vanguard: %s: %v\n", initPath, err)
+			buildtags.Debug("vanguard: %s: %v\n", initPath, err)
 		}
 		// If we get here, exec failed - try next
 	}
@@ -305,7 +309,11 @@ func discoverModules() []string {
 	var mods []string
 
 	filepath.Walk("/lib/modules", func(path string, info os.FileInfo, err error) error {
-		if err != nil || info.IsDir() {
+		if err != nil {
+			buildtags.Debug("vanguard: module discovery error at %s: %v\n", path, err)
+			return nil
+		}
+		if info.IsDir() {
 			return nil
 		}
 

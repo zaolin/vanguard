@@ -13,6 +13,7 @@ type Config struct {
 	Firmware    []string `toml:"firmware"`
 	Modules     []string `toml:"modules"`
 	Debug       bool     `toml:"debug"`
+	StrictMode  bool     `toml:"strict_mode"`
 }
 
 // DefaultConfig returns a config with sensible defaults

@@ -43,6 +43,20 @@ func PromptPassword(device string) (string, error) {
 // PasswordError is a no-op in debug mode
 func PasswordError(msg string) {}
 
+// PasswordErrorWithRetry returns empty in debug mode - use console.ReadPassword for retries
+func PasswordErrorWithRetry(msg string) (string, error) {
+	return "", nil
+}
+
+// PasswordPromptDone is a no-op in debug mode
+func PasswordPromptDone() {}
+
+// ShowTPMLockout is a no-op in debug mode
+func ShowTPMLockout(message, recoveryHint string) {}
+
+// ShowTPMError is a no-op in debug mode
+func ShowTPMError(message string) {}
+
 // Quit is a no-op in debug mode
 func Quit() {}
 

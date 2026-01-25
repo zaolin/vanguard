@@ -227,6 +227,10 @@ func detectFSTypeBlkid(device string) (string, error) {
 	// For now, try common types
 	commonTypes := []string{"ext4", "xfs", "btrfs"}
 
+	// Create test mount directory
+	os.MkdirAll("/tmp/.fstest", 0755)
+	defer os.RemoveAll("/tmp/.fstest")
+
 	for _, fstype := range commonTypes {
 		// Try mounting with this type (will fail fast if wrong)
 		if err := unix.Mount(device, "/tmp/.fstest", fstype, unix.MS_RDONLY, ""); err == nil {

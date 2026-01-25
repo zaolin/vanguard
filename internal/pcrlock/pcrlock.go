@@ -3,6 +3,7 @@ package pcrlock
 import (
 	"bufio"
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -39,12 +40,13 @@ func cmdOutput() (io.Writer, io.Writer) {
 // Masked policies - noisy/unsupported PCRs that change frequently
 // PCR 15 policies are masked because vanguard unlocks LUKS before systemd
 // extends PCR 15, causing a timing mismatch with pcrlock predictions
+// Note: 600-gpt.pcrlock is NOT masked by default - it's conditionally masked
+// in update_policy.go based on whether --luks-device is specified
 var maskedPolicies = []string{
 	"200-firmware-code.pcrlock",
 	"220-firmware-config.pcrlock",
 	"250-firmware-code-early.pcrlock",
 	"250-firmware-config-early.pcrlock",
-	"600-gpt.pcrlock",
 	"750-enter-initrd.pcrlock",
 	"800-leave-initrd.pcrlock",
 	"820-machine-id.pcrlock",
@@ -164,6 +166,109 @@ func LockSecureBoot() error {
 		return fmt.Errorf("lock-secureboot-authority failed: %w", err)
 	}
 
+	return nil
+}
+
+// ErrNoGPT is returned when the disk doesn't have a GPT partition table
+var ErrNoGPT = fmt.Errorf("disk does not have GPT partition table")
+
+// LockEFIActions adds a variant to handle EFI ExitBootServices retry scenarios.
+// The standard systemd pcrlock at /usr/lib/pcrlock.d/700-action-efi-exit-boot-services.pcrlock.d
+// only covers direct success (Invocation → Success), but some systems retry after failure:
+// Invocation → Failure → Invocation → Success
+// We add a variant to /etc/pcrlock.d to cover this case.
+func LockEFIActions() error {
+	// Add variant to /etc/pcrlock.d with same component name
+	variantDir := filepath.Join(PCRLockDir, "700-action-efi-exit-boot-services.pcrlock.d")
+
+	// Clean up old locations
+	os.RemoveAll(filepath.Join(PCRLockDir, "550-efi-actions.pcrlock.d"))
+	os.Remove(filepath.Join(PCRLockDir, "550-efi-actions.pcrlock"))
+
+	// Create variant directory
+	if err := os.MkdirAll(variantDir, 0755); err != nil {
+		return fmt.Errorf("failed to create efi-actions variant directory: %w", err)
+	}
+
+	// EFI action strings - must match exactly what firmware measures
+	invocation := "Exit Boot Services Invocation"
+	success := "Exit Boot Services Returned with Success"
+	failure := "Exit Boot Services Returned with Failure"
+
+	// Helper to create a record
+	makeRecord := func(action string) map[string]interface{} {
+		sha256Hash := sha256.Sum256([]byte(action))
+		return map[string]interface{}{
+			"pcr": 5,
+			"digests": []map[string]interface{}{
+				{
+					"hashAlg": "sha256",
+					"digest":  fmt.Sprintf("%x", sha256Hash[:]),
+				},
+			},
+		}
+	}
+
+	// Variant: With retry - some firmware logs: Failure → Invocation → Success
+	// (The first Invocation is missing from the log, only the retry sequence appears)
+	withRetry := map[string]interface{}{
+		"records": []map[string]interface{}{
+			makeRecord(failure),
+			makeRecord(invocation),
+			makeRecord(success),
+		},
+	}
+
+	// Write the retry variant
+	data, err := json.MarshalIndent(withRetry, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal with-retry pcrlock: %w", err)
+	}
+	// Use 350- prefix to be tried before 600-absent but in same selection as 300-present
+	if err := os.WriteFile(filepath.Join(variantDir, "350-with-retry.pcrlock"), data, 0644); err != nil {
+		return fmt.Errorf("failed to write with-retry pcrlock: %w", err)
+	}
+
+	return nil
+}
+
+// LockGPT creates a pcrlock file for the GPT partition table (PCR 5).
+// This binds the policy to the specific disk's partition layout, providing
+// device identity validation. The measurement is done by firmware and is
+// already in the UEFI event log before the initramfs runs.
+// If device is empty, systemd-pcrlock will auto-detect the boot device.
+// Returns ErrNoGPT if the disk doesn't have a GPT partition table.
+func LockGPT(device string) error {
+	args := []string{"lock-gpt"}
+	if device != "" {
+		args = append(args, device)
+	}
+	cmd := exec.Command(PCRLockBin, args...)
+
+	if Verbose {
+		// In verbose mode, we still need to capture output to detect GPT errors
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			outputStr := string(output)
+			// Print output for verbose mode
+			fmt.Print(outputStr)
+			if strings.Contains(outputStr, "does not have GPT partition table") {
+				return ErrNoGPT
+			}
+			return fmt.Errorf("lock-gpt failed: %w", err)
+		}
+		fmt.Print(string(output))
+	} else {
+		// Capture stderr for error reporting even in non-verbose mode
+		output, err := cmd.CombinedOutput()
+		if err != nil {
+			outputStr := strings.TrimSpace(string(output))
+			if strings.Contains(outputStr, "does not have GPT partition table") {
+				return ErrNoGPT
+			}
+			return fmt.Errorf("lock-gpt failed: %w: %s", err, outputStr)
+		}
+	}
 	return nil
 }
 

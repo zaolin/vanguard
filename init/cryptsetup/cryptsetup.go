@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/zaolin/vanguard/init/console"
-	"github.com/zaolin/vanguard/init/luks"
 	"github.com/zaolin/vanguard/init/tui"
 )
 
@@ -33,6 +32,95 @@ var Debug func(format string, args ...any) = func(format string, args ...any) {}
 // LogFunc is a callback for boot logging - will be set by the main init package
 // Parameters: event string, key-value pairs
 var LogFunc func(event string, kvPairs ...string) = func(event string, kvPairs ...string) {}
+
+// StrictMode is set by main.go based on build tags
+// When true, no passphrase fallback is allowed after token failure
+var StrictMode bool = false
+
+// Maximum PIN retry attempts before giving up
+const maxPINAttempts = 3
+
+// TPMErrorType classifies TPM unlock failures
+type TPMErrorType int
+
+const (
+	TPMErrorUnknown      TPMErrorType = iota
+	TPMErrorWrongPIN                  // 0x98e - auth HMAC failed, retryable
+	TPMErrorPCRMismatch               // 0x99d - policy check failed, not recoverable
+	TPMErrorLockout                   // 0x921 - DA lockout active
+	TPMErrorUnavailable               // TPM device not found
+	TPMErrorInvalidParam              // 0x1c4 - value out of range (policy misconfigured)
+)
+
+// classifyTPMError analyzes tpm2-tss stderr output to determine error type
+// tpm2-tss outputs errors to stderr by default (see TSS2_LOGFILE env var)
+func classifyTPMError(stderr string) TPMErrorType {
+	// tpm2-tss error codes from TPM2 spec, validated with tpm2_rc_decode
+	// Reference: https://github.com/tpm2-software/tpm2-tss/blob/master/doc/logging.md
+
+	lower := strings.ToLower(stderr)
+
+	// Wrong PIN/authorization failure (TPM_RC_AUTH_FAIL with DA increment)
+	// tpm2_rc_decode 0x98e: "tpm:session(1):the authorization HMAC check failed and DA counter incremented"
+	if strings.Contains(lower, "0x98e") ||
+		strings.Contains(lower, "authorization hmac check failed") ||
+		strings.Contains(lower, "da counter incremented") {
+		return TPMErrorWrongPIN
+	}
+
+	// PCR policy mismatch (TPM_RC_POLICY_FAIL)
+	// tpm2_rc_decode 0x99d: "tpm:session(1):a policy check failed"
+	if strings.Contains(lower, "0x99d") ||
+		strings.Contains(lower, "policy check failed") ||
+		strings.Contains(lower, "failed to unseal") {
+		return TPMErrorPCRMismatch
+	}
+
+	// Dictionary Attack lockout (TPM_RC_LOCKOUT)
+	// tpm2_rc_decode 0x921: "tpm:warn(2):authorizations for objects subject to DA protection are not allowed"
+	if strings.Contains(lower, "0x921") ||
+		strings.Contains(lower, "lockout") ||
+		strings.Contains(lower, "da protection") {
+		return TPMErrorLockout
+	}
+
+	// Invalid parameter / value out of range (TPM_RC_VALUE)
+	// tpm2_rc_decode 0x1c4: "tpm:parameter(1):value is out of range or is not correct for the context"
+	if strings.Contains(lower, "0x1c4") ||
+		strings.Contains(lower, "value is out of range") ||
+		strings.Contains(lower, "not correct for the context") {
+		return TPMErrorInvalidParam
+	}
+
+	return TPMErrorUnknown
+}
+
+// isRetryableTPMError returns true if the error type allows retry
+// For PIN mode, we retry on wrong PIN and unknown errors (give user benefit of doubt)
+// Only PCR mismatch, lockout, and invalid param are definitely non-retryable
+func isRetryableTPMError(errType TPMErrorType) bool {
+	switch errType {
+	case TPMErrorPCRMismatch, TPMErrorLockout, TPMErrorInvalidParam, TPMErrorUnavailable:
+		return false
+	default:
+		return true // WrongPIN and Unknown are retryable
+	}
+}
+
+// TokenUnlockError wraps TPM unlock failures with classification
+type TokenUnlockError struct {
+	Type    TPMErrorType
+	Message string
+	Err     error
+}
+
+func (e *TokenUnlockError) Error() string {
+	return fmt.Sprintf("token unlock failed: %s", e.Message)
+}
+
+func (e *TokenUnlockError) Unwrap() error {
+	return e.Err
+}
 
 // findCryptsetup finds the cryptsetup binary
 func findCryptsetup() string {
@@ -209,28 +297,53 @@ func unlockDevice(cs string, dev LUKSDevice) error {
 		return nil
 	}
 
-	// Measure LUKS header into PCR 8 before unlock
-	// This ensures the policy can verify the LUKS header integrity
-	if err := luks.MeasureHeader(dev.Path); err != nil {
-		console.Print("cryptsetup: warning: failed to measure LUKS header for %s: %v\n", dev.Path, err)
-		// We don't block unlock here - if policy requires PCR 8, TPM unlock will fail naturally
-	}
-
 	// Check if device has any tokens (TPM2, FIDO2, etc.)
 	if hasTokens(cs, dev.Path) {
 		console.DebugPrint("cryptsetup: found token(s) on %s, trying token unlock\n", dev.Path)
-		if err := unlockWithToken(cs, dev); err == nil {
+		err := unlockWithToken(cs, dev)
+
+		if err == nil {
 			console.DebugPrint("cryptsetup: %s unlocked with token\n", dev.Path)
-			LogFunc("LUKS_UNLOCK", "device", dev.Path, "method", "tpm2", "status", "ok")
+			LogFunc("LUKS_UNLOCK", "device", dev.Path, "method", "token", "status", "ok")
 			return nil
-		} else {
-			console.DebugPrint("cryptsetup: token unlock failed: %v\n", err)
-			console.Print("cryptsetup: falling back to passphrase\n")
-			LogFunc("PASSPHRASE_FALLBACK", "device", dev.Path, "reason", err.Error())
 		}
+
+		console.DebugPrint("cryptsetup: token unlock failed: %v\n", err)
+
+		// Strict mode: no passphrase fallback
+		if StrictMode {
+			console.Print("cryptsetup: strict mode - no passphrase fallback\n")
+			LogFunc("LUKS_FAIL", "device", dev.Path, "method", "token", "error", err.Error(), "mode", "strict")
+			return fmt.Errorf("token unlock failed (strict mode): %w", err)
+		}
+
+		// Normal mode: fall back to passphrase
+		console.Print("cryptsetup: falling back to passphrase: %v\n", err)
+
+		// Show failure reason in TUI with appropriate message for error type
+		if tui.IsEnabled() {
+			var msg string
+			if tokenErr, ok := err.(*TokenUnlockError); ok {
+				switch tokenErr.Type {
+				case TPMErrorLockout:
+					msg = "TPM locked - use recovery passphrase"
+				case TPMErrorPCRMismatch:
+					msg = "TPM policy mismatch - use recovery passphrase"
+				case TPMErrorInvalidParam:
+					msg = "TPM configuration error - use recovery passphrase"
+				default:
+					msg = fmt.Sprintf("TPM unlock failed: %v", err)
+				}
+			} else {
+				msg = fmt.Sprintf("TPM unlock failed: %v", err)
+			}
+			tui.PasswordError(msg)
+		}
+
+		LogFunc("PASSPHRASE_FALLBACK", "device", dev.Path, "reason", err.Error())
 	}
 
-	// Use passphrase
+	// Use passphrase (only reached if tokens not present or in non-strict mode)
 	if err := unlockWithPassphrase(cs, dev); err != nil {
 		LogFunc("LUKS_FAIL", "device", dev.Path, "method", "passphrase", "error", err.Error())
 		return err
@@ -279,61 +392,288 @@ func hasTokens(cs, path string) bool {
 	return false
 }
 
+// findTpm2Tool finds a tpm2-tools binary by name
+func findTpm2Tool(name string) string {
+	paths := []string{"/usr/bin/" + name, "/bin/" + name, "/usr/sbin/" + name}
+	for _, p := range paths {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return ""
+}
+
+// checkTPMLockoutStatus checks if the TPM is in DA lockout mode before prompting for PIN.
+// Returns (locked bool, recoveryHint string)
+func checkTPMLockoutStatus() (bool, string) {
+	tpm2Getcap := findTpm2Tool("tpm2_getcap")
+	if tpm2Getcap == "" {
+		Debug("cryptsetup: tpm2_getcap not found, skipping lockout check\n")
+		return false, "" // Can't check, assume not locked
+	}
+
+	cmd := exec.Command(tpm2Getcap, "properties-variable")
+	cmd.Env = append(os.Environ(),
+		"TPM2TOOLS_TCTI=device:/dev/tpmrm0",
+		"TCTI=device:/dev/tpmrm0",
+	)
+
+	// Suppress stderr to avoid TUI corruption
+	restoreStderr := console.SuppressStderr()
+	output, err := cmd.CombinedOutput()
+	restoreStderr()
+
+	if err != nil {
+		Debug("cryptsetup: tpm2_getcap failed: %v\n", err)
+		return false, ""
+	}
+
+	// Parse output for lockout status
+	outStr := string(output)
+
+	// Helper to parse hex or decimal values
+	parseValue := func(pattern *regexp.Regexp) int64 {
+		if m := pattern.FindStringSubmatch(outStr); len(m) > 1 {
+			val := strings.TrimPrefix(m[1], "0x")
+			val = strings.TrimPrefix(val, "0X")
+			// Try hex first if it was prefixed, otherwise try decimal
+			if strings.ContainsAny(m[1], "xX") || strings.ContainsAny(val, "abcdefABCDEF") {
+				if n, err := strconv.ParseInt(val, 16, 64); err == nil {
+					return n
+				}
+			}
+			if n, err := strconv.ParseInt(val, 10, 64); err == nil {
+				return n
+			}
+		}
+		return 0
+	}
+
+	// Check inLockout flag directly (most reliable)
+	inLockoutPattern := regexp.MustCompile(`inLockout:\s*(\d+)`)
+	if m := inLockoutPattern.FindStringSubmatch(outStr); len(m) > 1 && m[1] == "1" {
+		Debug("cryptsetup: TPM inLockout flag is set\n")
+		// Get recovery time
+		recoveryPattern := regexp.MustCompile(`TPM2_PT_LOCKOUT_RECOVERY:\s*(0x[0-9a-fA-F]+|\d+)`)
+		lockoutRecovery := parseValue(recoveryPattern)
+		hint := ""
+		if lockoutRecovery > 0 {
+			hint = fmt.Sprintf("Wait %d seconds or reboot to clear lockout", lockoutRecovery)
+		} else {
+			hint = "Reboot to clear lockout"
+		}
+		return true, hint
+	}
+
+	// Fallback: check counter vs max
+	counterPattern := regexp.MustCompile(`TPM2_PT_LOCKOUT_COUNTER:\s*(0x[0-9a-fA-F]+|\d+)`)
+	maxPattern := regexp.MustCompile(`TPM2_PT_MAX_AUTH_FAIL:\s*(0x[0-9a-fA-F]+|\d+)`)
+	recoveryPattern := regexp.MustCompile(`TPM2_PT_LOCKOUT_RECOVERY:\s*(0x[0-9a-fA-F]+|\d+)`)
+
+	lockoutCounter := parseValue(counterPattern)
+	maxAuthFail := parseValue(maxPattern)
+	lockoutRecovery := parseValue(recoveryPattern)
+
+	Debug("cryptsetup: TPM lockout status - counter=%d, max=%d, recovery=%ds\n", lockoutCounter, maxAuthFail, lockoutRecovery)
+
+	// Check if in lockout (counter >= max means locked)
+	if maxAuthFail > 0 && lockoutCounter >= maxAuthFail {
+		hint := ""
+		if lockoutRecovery > 0 {
+			hint = fmt.Sprintf("Wait %d seconds or reboot to clear lockout", lockoutRecovery)
+		} else {
+			hint = "Reboot to clear lockout"
+		}
+		return true, hint
+	}
+
+	return false, ""
+}
+
 // unlockWithToken attempts to unlock using any available token (TPM2, FIDO2, etc.)
 func unlockWithToken(cs string, dev LUKSDevice) error {
 	// Wait for TPM device to be ready
 	if !waitForTPM() {
-		return fmt.Errorf("TPM device not available")
+		return &TokenUnlockError{
+			Type:    TPMErrorUnavailable,
+			Message: "TPM device not available",
+		}
+	}
+
+	// Pre-check for lockout BEFORE prompting for PIN
+	if locked, hint := checkTPMLockoutStatus(); locked {
+		msg := "TPM locked - too many failed attempts"
+		if tui.IsEnabled() {
+			tui.ShowTPMLockout(msg, hint)
+		} else {
+			console.Print("cryptsetup: %s\n", msg)
+			if hint != "" {
+				console.Print("cryptsetup: %s\n", hint)
+			}
+		}
+		LogFunc("TPM_LOCKOUT", "device", dev.Path, "hint", hint)
+		return &TokenUnlockError{Type: TPMErrorLockout, Message: msg}
 	}
 
 	// Check if TPM2 token requires PIN
 	needsPIN := hasPINRequired(cs, dev.Path)
 	if needsPIN {
 		Debug("cryptsetup: TPM2 token requires PIN\n")
+		return unlockWithTokenPIN(cs, dev)
 	}
 
-	// Use --token-only to prevent passphrase fallback
-	cmd := exec.Command(cs, "open", "--token-only", dev.Path, dev.Name)
+	return unlockWithTokenNoPIN(cs, dev)
+}
 
-	// Set environment to help TPM2 libraries find the device
+// unlockWithTokenNoPIN attempts token unlock without PIN (single attempt)
+func unlockWithTokenNoPIN(cs string, dev LUKSDevice) error {
+	cmd := exec.Command(cs, "open", "--token-only", dev.Path, dev.Name)
 	cmd.Env = append(os.Environ(),
 		"TPM2TOOLS_TCTI=device:/dev/tpmrm0",
 		"TCTI=device:/dev/tpmrm0",
 	)
+	cmd.Stdin = nil
 
-	if needsPIN {
-		// Prompt for PIN using TUI if available, otherwise console
-		var pin string
-		var err error
-		if tui.IsEnabled() {
-			pin, err = tui.PromptPassword(dev.Path + " (TPM PIN)")
-		} else {
-			pin, err = console.ReadPassword(fmt.Sprintf("Enter TPM2 PIN for %s: ", dev.Path))
-		}
-		if err != nil {
-			return fmt.Errorf("failed to read PIN: %w", err)
-		}
-		cmd.Stdin = strings.NewReader(pin + "\n")
-	} else {
-		// Close stdin to prevent "Nothing to read on input" error
-		cmd.Stdin = nil
-	}
+	// Capture stdout/stderr - tpm2-tss outputs errors to stderr
+	var stdout, stderr bytes.Buffer
+	cmd.Stdout = &stdout // Capture stdout to prevent console leak
+	cmd.Stderr = &stderr
 
-	output, err := cmd.CombinedOutput()
+	// Suppress stderr from tpm2-tss library when TUI is active
+	restoreStderr := console.SuppressStderr()
+	err := cmd.Run()
+	restoreStderr()
+
 	if err != nil {
-		outStr := strings.TrimSpace(string(output))
-		if outStr != "" {
-			Debug("cryptsetup: token unlock output: %s\n", outStr)
-		}
-
-		// Log PCR debug information when TPM unlock fails
+		stderrStr := strings.TrimSpace(stderr.String())
+		Debug("cryptsetup: token unlock stderr: %s\n", stderrStr)
 		logPCRDebugInfo(cs, dev.Path)
 
-		return fmt.Errorf("token unlock failed: %v", err)
+		errType := classifyTPMError(stderrStr)
+		return &TokenUnlockError{
+			Type:    errType,
+			Message: stderrStr,
+			Err:     err,
+		}
 	}
 
-	// Ensure device node exists after unlock
 	return ensureMapperNode(dev.Name)
+}
+
+// unlockWithTokenPIN attempts token unlock with PIN and retry logic
+func unlockWithTokenPIN(cs string, dev LUKSDevice) error {
+	var lastError error
+	var pin string
+	var err error
+
+	for attempt := 1; attempt <= maxPINAttempts; attempt++ {
+		// Prompt for PIN (first attempt or after error with retry)
+		if attempt == 1 {
+			// First attempt - use PromptPassword to set up initial prompt
+			if tui.IsEnabled() {
+				pin, err = tui.PromptPassword(dev.Path + " (TPM PIN)")
+			} else {
+				pin, err = console.ReadPassword(fmt.Sprintf("Enter TPM2 PIN for %s: ", dev.Path))
+			}
+		}
+		// For subsequent attempts, pin is already set by PasswordErrorWithRetry below
+
+		if err != nil {
+			if tui.IsEnabled() {
+				tui.PasswordPromptDone()
+			}
+			return fmt.Errorf("failed to read PIN: %w", err)
+		}
+
+		// Attempt unlock with stdout/stderr capture (prevent any output leak)
+		cmd := exec.Command(cs, "open", "--token-only", dev.Path, dev.Name)
+		cmd.Env = append(os.Environ(),
+			"TPM2TOOLS_TCTI=device:/dev/tpmrm0",
+			"TCTI=device:/dev/tpmrm0",
+		)
+		cmd.Stdin = strings.NewReader(pin + "\n")
+
+		var stdout, stderr bytes.Buffer
+		cmd.Stdout = &stdout // Capture stdout to prevent console leak
+		cmd.Stderr = &stderr
+
+		// Suppress stderr from tpm2-tss library when TUI is active
+		restoreStderr := console.SuppressStderr()
+		cmdErr := cmd.Run()
+		restoreStderr()
+
+		if cmdErr == nil {
+			// Success - signal password prompt complete
+			if tui.IsEnabled() {
+				tui.PasswordPromptDone()
+			}
+			return ensureMapperNode(dev.Name)
+		}
+
+		// Classify error from tpm2-tss stderr
+		stderrStr := strings.TrimSpace(stderr.String())
+		Debug("cryptsetup: token unlock attempt %d stderr: %s\n", attempt, stderrStr)
+
+		errType := classifyTPMError(stderrStr)
+
+		// Map error type to user-friendly message (never show raw stderr to user)
+		var userMsg string
+		switch errType {
+		case TPMErrorWrongPIN:
+			userMsg = fmt.Sprintf("Incorrect PIN (attempt %d of %d)", attempt, maxPINAttempts)
+		case TPMErrorPCRMismatch:
+			userMsg = "TPM policy mismatch - system configuration changed"
+		case TPMErrorInvalidParam:
+			userMsg = "TPM policy configuration error"
+		case TPMErrorLockout:
+			userMsg = "TPM locked - too many failed attempts"
+		default:
+			userMsg = "TPM unlock failed"
+		}
+
+		lastError = &TokenUnlockError{Type: errType, Message: userMsg, Err: cmdErr}
+
+		// Retry for retryable errors (wrong PIN or unknown) if not last attempt
+		if isRetryableTPMError(errType) && attempt < maxPINAttempts {
+			LogFunc("TPM_PIN_FAIL", "device", dev.Path, "attempt", strconv.Itoa(attempt))
+			// Show error and wait for next PIN attempt
+			if tui.IsEnabled() {
+				pin, err = tui.PasswordErrorWithRetry(userMsg)
+			} else {
+				console.Print("cryptsetup: %s\n", userMsg)
+				pin, err = console.ReadPassword(fmt.Sprintf("Enter TPM2 PIN for %s: ", dev.Path))
+			}
+			continue
+		}
+
+		// Non-retryable error or last attempt - show appropriate error
+		if tui.IsEnabled() {
+			switch errType {
+			case TPMErrorLockout:
+				// Check for recovery hint
+				_, hint := checkTPMLockoutStatus()
+				tui.ShowTPMLockout(userMsg, hint)
+			case TPMErrorPCRMismatch, TPMErrorInvalidParam:
+				tui.ShowTPMError(userMsg)
+				tui.PasswordPromptDone()
+			default:
+				tui.PasswordError(userMsg)
+				tui.PasswordPromptDone()
+			}
+		} else {
+			console.Print("cryptsetup: %s\n", userMsg)
+		}
+
+		if errType != TPMErrorWrongPIN {
+			logPCRDebugInfo(cs, dev.Path)
+			LogFunc("TPM_ERROR", "device", dev.Path, "type", fmt.Sprintf("%d", errType), "message", userMsg)
+		} else {
+			LogFunc("TPM_PIN_EXHAUSTED", "device", dev.Path)
+		}
+		return lastError
+	}
+
+	return fmt.Errorf("failed to unlock after %d PIN attempts: %w", maxPINAttempts, lastError)
 }
 
 // logPCRDebugInfo logs the enrolled PCRs and their current values for debugging
@@ -503,20 +843,31 @@ func hasPINRequired(cs, path string) bool {
 	cmd := exec.Command(cs, "luksDump", path)
 	output, err := cmd.CombinedOutput()
 	if err != nil {
+		Debug("cryptsetup: luksDump failed: %v\n", err)
 		return false
 	}
+	outStr := string(output)
 
-	// Look for "tpm2-pin" in the systemd-tpm2 token section
-	// The output contains "tpm2-pin: true" when PIN is required
-	return strings.Contains(string(output), "tpm2-pin")
+	// Look for "tpm2-pin: true" in the systemd-tpm2 token section
+	// Use regex to handle variable whitespace (e.g. "tpm2-pin:         true")
+	pinRegex := regexp.MustCompile(`tpm2-pin:\s+true`)
+	hasPin := pinRegex.MatchString(outStr)
+
+	Debug("cryptsetup: PIN detection for %s: %v\n", path, hasPin)
+	if !hasPin && strings.Contains(outStr, "systemd-tpm2") {
+		// Log detailed output if we expected a PIN but found none
+		Debug("cryptsetup: systemd-tpm2 token found but no PIN detected (regex: %s). luksDump: %s\n", pinRegex.String(), outStr)
+	}
+
+	return hasPin
 }
 
 // ensureMapperNode ensures the /dev/mapper/<name> device node exists after unlock
 func ensureMapperNode(name string) error {
 	mappedPath := "/dev/mapper/" + name
 
-	// Wait briefly for node to appear
-	for i := 0; i < 10; i++ {
+	// Wait for node to appear (3 seconds for slow systems)
+	for i := 0; i < 30; i++ {
 		if _, err := os.Stat(mappedPath); err == nil {
 			Debug("cryptsetup: device node %s ready\n", mappedPath)
 			return nil

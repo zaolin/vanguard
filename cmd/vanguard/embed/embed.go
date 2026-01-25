@@ -11,3 +11,13 @@ var InitBinary []byte
 //
 //go:embed init-debug
 var InitDebugBinary []byte
+
+// InitStrictBinary contains the pre-built init binary (strict mode, token-only unlock)
+//
+//go:embed init-strict
+var InitStrictBinary []byte
+
+// InitDebugStrictBinary contains the pre-built init binary (debug + strict mode)
+//
+//go:embed init-debug-strict
+var InitDebugStrictBinary []byte

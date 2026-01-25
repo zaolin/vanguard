@@ -105,14 +105,42 @@ PCRLock provides fine-grained control over which boot measurements are validated
 | 1 | BIOS configuration | Changes on BIOS settings change | No |
 | 2 | External code (Option ROMs) | Varies | Optional |
 | 3 | External configuration | Varies | Optional |
-| 4 | Boot loader code (EFI binaries) | Changes on bootloader/UKI update | Yes |
+| 4 | Boot loader code (EFI binaries) | Changes on bootloader/UKI update | **Yes (required)** |
+| 5 | GPT partition table | Changes on partition changes | **Yes (auto with -l)** |
 | 7 | Secure Boot state | Stable if SB enabled | **Yes (required)** |
-| 8 | LUKS header (custom extension) | Changes if LUKS modified | Yes (if enabled) |
 | 9 | Kernel command line | Changes on cmdline change | No |
 | 11 | Unified kernel measurements | Changes on UKI update | No |
 | 15 | systemd machine-id, root-fs | Extended during boot | **No (masked)** |
 
 **Important:** PCR 15 is explicitly masked/disabled in Vanguard's policy because Vanguard unlocks LUKS **before** systemd extends PCR 15, causing a timing mismatch that would always fail.
+
+### GPT Partition Table Binding (PCR 5)
+
+When a LUKS device is specified with `--luks-device` (`-l`), Vanguard automatically enables GPT partition table binding via PCR 5. This provides **device identity validation** by including the disk's partition layout (including partition GUIDs) in the policy.
+
+**Benefits:**
+- Validates that the correct disk is being unlocked
+- Protects against attacks where a different disk with the same UKI is used
+- No initramfs modifications needed (firmware measures GPT into event log)
+
+**Caveats:**
+- **Partition changes break unlock**: Adding, removing, or resizing partitions changes PCR 5
+- **Before partition changes**: Use `--no-gpt` or ensure passphrase is available
+- **After partition changes**: Re-run `vanguard update-tpm-policy -l <device>`
+
+To disable GPT binding when using `--luks-device`, add `--no-gpt`:
+```bash
+sudo vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi -l /dev/sda2 --no-gpt
+```
+
+### PCRLock Enrollment
+
+Vanguard uses **PCRLock Policy** via `systemd-pcrlock` to handle dynamic firmware/kernel measurements:
+
+- **PCR 4**: Boot loader code (UKI/kernel)
+- **PCR 7**: Secure Boot state
+
+The policy is stored in a TPM NV index and validated at unlock time.
 
 ### Setup PCRLock Policy
 
@@ -130,13 +158,13 @@ flowchart TD
 # Generate PCRLock policy for your UKI
 sudo vanguard update-tpm-policy --uki-path /boot/EFI/Linux/kernel.efi
 
-# With LUKS header measurement (PCR 8)
+# Optionally specify LUKS device for verification
 sudo vanguard update-tpm-policy \
   --uki-path /boot/EFI/Linux/kernel.efi \
   --luks-device /dev/sda2
 ```
 
-This creates `/etc/boot-bundle/pcrlock.json` with predicted PCR values.
+This creates the pcrlock policy file (e.g., `/boot/EFI/Linux/kernel.pcrlock.json`) with predicted PCR values.
 
 #### Step 2: Enroll with PCRLock
 
@@ -146,7 +174,8 @@ sudo systemd-cryptenroll --wipe-slot=tpm2 /dev/sdX
 
 # Enroll with PCRLock policy
 sudo systemd-cryptenroll --tpm2-device=auto \
-  --tpm2-pcrlock=/etc/boot-bundle/pcrlock.json \
+  --tpm2-with-pin=yes \
+  --tpm2-pcrlock=/boot/EFI/Linux/kernel.pcrlock.json \
   /dev/sdX
 ```
 
@@ -240,19 +269,19 @@ This information is also written to the boot log at `/boot/.vanguard.log` with e
 1. Secure Boot state changed (PCR 7)
 2. Firmware updated (PCR 0, 2)
 3. Boot loader/UKI updated (PCR 4)
-4. LUKS header modified (PCR 8, if enrolled)
 
 **Solution:**
 1. Boot with passphrase
-2. Re-enroll TPM2 token with current state:
+2. Regenerate PCRLock policy and re-enroll:
    ```bash
-   sudo systemd-cryptenroll --wipe-slot=tpm2 /dev/sdX
-   sudo systemd-cryptenroll --tpm2-device=auto /dev/sdX
-   ```
-3. Or regenerate PCRLock policy if using that:
-   ```bash
-   sudo vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi
-   sudo cp /etc/boot-bundle/pcrlock.json /boot/pcrlock.json
+   # Regenerate policy
+   sudo vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi -l /dev/sdX
+   
+   # Re-enroll (follow the enrollment command shown by update-tpm-policy)
+   sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto \
+     --tpm2-with-pin=yes \
+     --tpm2-pcrlock=/boot/EFI/Linux/kernel.pcrlock.json \
+     /dev/sdX
    ```
 
 ### TPM Device Not Found

@@ -59,18 +59,20 @@ vanguard update-tpm-policy [options]
 | `--uki-path` | `-u` | string | *required* | Path to the Unified Kernel Image (UKI) |
 | `--policy-output` | `-p` | string | `/etc/boot-bundle/pcrlock.json` | Output path for policy JSON |
 | `--bundle-dir` | | string | `/etc/boot-bundle` | Directory for policy files |
-| `--luks-device` | `-l` | string | | LUKS device for PCR 8 measurement |
+| `--luks-device` | `-l` | string | | LUKS device for token verification (enables GPT binding) |
+| `--no-gpt` | | bool | `false` | Disable GPT partition table binding (PCR 5) |
 | `--no-verify` | | bool | `false` | Skip policy verification step |
+| `--verbose` | `-v` | bool | `false` | Show verbose output from pcrlock tools |
+| `--cleanup` | `-c` | bool | `false` | Remove old unused pcrlock NV indices from TPM |
 
 #### What It Does
 
 1. Configures PCR masks (disables PCR 15 which causes timing issues with Vanguard)
 2. Locks Secure Boot state (PCR 7)
-3. Locks UKI measurement (PCR 4) using `lock-pe` with `lock-uki` fallback
-4. Optionally locks LUKS header (PCR 8) if `--luks-device` specified
+3. Locks GPT partition table (PCR 5) - **auto-enabled when `--luks-device` is specified**
+4. Locks UKI measurement (PCR 4) using `lock-pe` with `lock-uki` fallback
 5. Generates policy with recovery PIN prompt
-6. Injects PCR 8 manually (systemd-pcrlock drops it from event log)
-7. Verifies the generated policy
+6. Verifies the generated policy
 
 #### Examples
 
@@ -82,7 +84,7 @@ sudo vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi
 sudo vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi \
   -p /boot/pcrlock.json
 
-# Include LUKS header measurement (PCR 8)
+# With LUKS device for token verification
 sudo vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi \
   -l /dev/sda2
 
@@ -168,7 +170,6 @@ The generator automatically includes these binaries and their library dependenci
 | `systemd-udevd` | Device event daemon | Yes |
 | `udevadm` | udev administration | Yes |
 | `tpm2_pcrread` | TPM PCR debugging (shows values on unlock failure) | Optional |
-| `tpm2_pcrextend` | TPM PCR extension (for LUKS header measurement) | Optional |
 | `loadkeys` | Keyboard layout loading | Optional |
 | `setfont` | Console font loading | Optional |
 | `fsck` | Generic filesystem check wrapper | Optional |

@@ -53,7 +53,15 @@ func Start() error {
 	}
 
 	if err := udevdCmd.Start(); err != nil {
+		if devNull != nil {
+			devNull.Close()
+		}
 		return fmt.Errorf("failed to start udevd: %w", err)
+	}
+
+	// Close devNull after udevd has started (it inherits the fd)
+	if devNull != nil {
+		devNull.Close()
 	}
 
 	// Wait briefly for daemon to initialize

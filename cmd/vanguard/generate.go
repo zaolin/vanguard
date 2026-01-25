@@ -40,6 +40,9 @@ func (c *GenerateCmd) Run() error {
 	if c.Debug {
 		cfg.Debug = true
 	}
+	if c.Strict {
+		cfg.StrictMode = true
+	}
 
 	return runGenerate(cfg)
 }
@@ -70,13 +73,20 @@ func runGenerate(cfg *config.Config) error {
 		fmt.Printf("  root device: %s\n", rootDev)
 	}
 
-	// Get embedded init binary
+	// Get embedded init binary based on configuration
 	fmt.Printf("vanguard: using embedded init binary...\n")
 	var initContent []byte
-	if cfg.Debug {
+	switch {
+	case cfg.Debug && cfg.StrictMode:
+		initContent = embed.InitDebugStrictBinary
+		fmt.Printf("  using debug+strict init (%d bytes)\n", len(initContent))
+	case cfg.StrictMode:
+		initContent = embed.InitStrictBinary
+		fmt.Printf("  using strict init (%d bytes)\n", len(initContent))
+	case cfg.Debug:
 		initContent = embed.InitDebugBinary
 		fmt.Printf("  using debug init (%d bytes)\n", len(initContent))
-	} else {
+	default:
 		initContent = embed.InitBinary
 		fmt.Printf("  using release init (%d bytes)\n", len(initContent))
 	}

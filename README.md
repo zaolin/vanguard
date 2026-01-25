@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/logo.png" alt="Vanguard Logo" width="200"/>
+</p>
+
 # Vanguard
 
 A minimal, security-focused initramfs generator for Linux systems with full disk encryption. Written in Go, Vanguard creates lightweight boot images optimized for LUKS + LVM + TPM2 setups.
@@ -14,6 +18,13 @@ A minimal, security-focused initramfs generator for Linux systems with full disk
 - **Minimal Footprint** - Only includes binaries and modules needed for your configuration
 - **Fast Boot** - zstd compression, parallel device scanning
 - **Self-contained** - CLI embeds pre-built init binaries
+
+## Screens
+
+<p align="center">
+  <img src="assets/ui_example.png" alt="Vanguard Boot TUI" width="600"/>
+</p>
+
 
 ## Quick Start
 
@@ -70,7 +81,7 @@ vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi [options]
 |--------|-------------|
 | `-u, --uki-path` | Path to UKI file (required) |
 | `-p, --policy-output` | Output path for policy JSON |
-| `--luks-device` | LUKS device for PCR 8 measurement |
+| `--luks-device` | LUKS device for token verification |
 | `--no-verify` | Skip policy verification |
 
 ## Configuration File
@@ -186,9 +197,8 @@ See [docs/boot-flow.md](docs/boot-flow.md) for detailed documentation.
 
 ## Security Features
 
-- TPM2 sealed keys with PCR policy binding (PCR 7 for Secure Boot, PCR 4 for UKI, PCR 8 for LUKS header)
+- TPM2 sealed keys with PCR policy binding (PCR 4 for UKI, PCR 7 for Secure Boot)
 - PCRLock for predictable boot measurement validation
-- LUKS header measurement into PCR 8 before unlock attempt
 - PIN protection for TPM2 tokens
 - Passphrase fallback when TPM2 fails (3 attempts before halt)
 - Kernel message suppression during password entry
