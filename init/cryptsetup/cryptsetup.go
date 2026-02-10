@@ -45,51 +45,191 @@ type TPMErrorType int
 
 const (
 	TPMErrorUnknown      TPMErrorType = iota
-	TPMErrorWrongPIN                  // 0x98e - auth HMAC failed, retryable
-	TPMErrorPCRMismatch               // 0x99d - policy check failed, not recoverable
-	TPMErrorLockout                   // 0x921 - DA lockout active
+	TPMErrorWrongPIN                  // 0x98e/0x984/0x985/0x9a2/0x22e - auth HMAC failed, retryable
+	TPMErrorPCRMismatch               // 0x99d/0x98d/0x2c4/0x2c5 - policy check failed, not recoverable
+	TPMErrorLockout                   // 0x921/0x923 - DA lockout active
 	TPMErrorUnavailable               // TPM device not found
 	TPMErrorInvalidParam              // 0x1c4 - value out of range (policy misconfigured)
+	TPMErrorCommunication             // TSS2/ESAPI/TCTI communication errors (0x60000+, 0x70000+, 0xA0000+)
+	TPMErrorBadAuth                   // 0x9a2/0x923 - authorization failed (may be retryable)
+	TPMErrorHandleInvalid             // 0x902 - invalid handle/session
 )
 
 // classifyTPMError analyzes tpm2-tss stderr output to determine error type
 // tpm2-tss outputs errors to stderr by default (see TSS2_LOGFILE env var)
+//
+// TPM Response Codes (TPM_RC):
+//   - FMT0 errors (0x000-0x3BF): Simple error codes
+//   - FMT1 errors (0x800-0xBFF): Format 1 with session/parameter/handle info
+//   - Warning codes (0xC00-0xFFF): Warning level responses
+//
+// Common codes from cryptsetup + libcryptsetup tpm2 plugin:
+//   0x98e = TPM_RC_AUTH_FAIL (FMT1, session 1)
+//   0x984 = TPM_RC_AUTH_UNTESTED (FMT1, session 1)
+//   0x985 = TPM_RC_AUTH_FAIL variant (FMT1, session 1)
+//   0x99d = TPM_RC_POLICY_FAIL (FMT1, session 1)
+//   0x98d = TPM_RC_POLICY_FAIL (FMT1, session 1, alternate)
+//   0x921 = TPM_RC_LOCKOUT (warning)
+//   0x923 = TPM_RC_BAD_AUTH (warning)
+//   0x9a2 = TPM_RC_BAD_AUTH (FMT1, session 1)
+//   0x902 = TPM_RC_HANDLE (FMT1, session 1) - invalid handle
+//   0x1c4 = TPM_RC_VALUE - parameter out of range
+//   0x184 = TPM_RC_FAILURE - general failure
+//
+// TSS2 Layer errors (upper bits indicate layer):
+//   0x60000+ = FAPI layer errors
+//   0x70000+ = ESAPI layer errors
+//   0x80000+ = SYS layer errors
+//   0xA0000+ = TCTI layer errors
 func classifyTPMError(stderr string) TPMErrorType {
-	// tpm2-tss error codes from TPM2 spec, validated with tpm2_rc_decode
-	// Reference: https://github.com/tpm2-software/tpm2-tss/blob/master/doc/logging.md
-
 	lower := strings.ToLower(stderr)
 
-	// Wrong PIN/authorization failure (TPM_RC_AUTH_FAIL with DA increment)
-	// tpm2_rc_decode 0x98e: "tpm:session(1):the authorization HMAC check failed and DA counter incremented"
-	if strings.Contains(lower, "0x98e") ||
-		strings.Contains(lower, "authorization hmac check failed") ||
-		strings.Contains(lower, "da counter incremented") {
-		return TPMErrorWrongPIN
+	// Helper to check for TPM error codes in both short (0x98e) and long (0x0000098e) formats
+	hasErrorCode := func(code string) bool {
+		// Check short format (e.g., 0x98e)
+		if strings.Contains(lower, code) {
+			return true
+		}
+		// Check long format with leading zeros (e.g., 0x0000098e)
+		// Convert short code like "0x98e" to "0x0000098e"
+		if len(code) > 2 {
+			hexPart := code[2:] // Remove "0x" prefix
+			longForm := "0x" + strings.Repeat("0", 8-len(hexPart)) + hexPart
+			if strings.Contains(lower, longForm) {
+				return true
+			}
+		}
+		return false
 	}
 
-	// PCR policy mismatch (TPM_RC_POLICY_FAIL)
-	// tpm2_rc_decode 0x99d: "tpm:session(1):a policy check failed"
-	if strings.Contains(lower, "0x99d") ||
-		strings.Contains(lower, "policy check failed") ||
-		strings.Contains(lower, "failed to unseal") {
-		return TPMErrorPCRMismatch
-	}
-
-	// Dictionary Attack lockout (TPM_RC_LOCKOUT)
-	// tpm2_rc_decode 0x921: "tpm:warn(2):authorizations for objects subject to DA protection are not allowed"
-	if strings.Contains(lower, "0x921") ||
-		strings.Contains(lower, "lockout") ||
-		strings.Contains(lower, "da protection") {
+	// === LOCKOUT ERRORS (checked first - most severe) ===
+	// TPM_RC_LOCKOUT (0x921) - Dictionary Attack lockout active
+	// "tpm:warn(2):authorizations for objects subject to DA protection are not allowed"
+	// Also check for 0x923 (TPM_RC_BAD_AUTH as warning)
+	if hasErrorCode("0x921") ||
+		hasErrorCode("0x923") ||
+		strings.Contains(lower, "da protection") ||
+		strings.Contains(lower, "in lockout") ||
+		strings.Contains(lower, "dictionary attack") {
 		return TPMErrorLockout
 	}
 
-	// Invalid parameter / value out of range (TPM_RC_VALUE)
-	// tpm2_rc_decode 0x1c4: "tpm:parameter(1):value is out of range or is not correct for the context"
-	if strings.Contains(lower, "0x1c4") ||
+	// === AUTHORIZATION/PIN ERRORS (retryable) ===
+	// TPM_RC_AUTH_FAIL variants (FMT1 with session info)
+	// 0x98e: "tpm:session(1):the authorization HMAC check failed and DA counter incremented"
+	// 0x984: TPM_RC_AUTH_UNTESTED
+	// 0x985: Auth fail variant
+	// 0x9a2: TPM_RC_BAD_AUTH (FMT1)
+	// 0x22e: TPM_RC_BAD_AUTH (base code)
+	if hasErrorCode("0x98e") ||
+		hasErrorCode("0x984") ||
+		hasErrorCode("0x985") ||
+		hasErrorCode("0x9a2") ||
+		hasErrorCode("0x22e") ||
+		strings.Contains(lower, "authorization hmac check failed") ||
+		strings.Contains(lower, "da counter incremented") ||
+		strings.Contains(lower, "authorization failed") ||
+		strings.Contains(lower, "bad auth") ||
+		strings.Contains(lower, "bad pin") ||
+		strings.Contains(lower, "auth fail") {
+		return TPMErrorWrongPIN
+	}
+
+	// === PCR POLICY ERRORS (not retryable) ===
+	// TPM_RC_POLICY_FAIL (FMT1 with session)
+	// 0x99d: "tpm:session(1):a policy check failed"
+	// 0x98d: Alternate policy fail code
+	// 0x2c4: TPM_RC_POLICY_CC (command code policy)
+	// 0x2c5: TPM_RC_POLICY_RC (response code policy)
+	if hasErrorCode("0x99d") ||
+		hasErrorCode("0x98d") ||
+		hasErrorCode("0x2c4") ||
+		hasErrorCode("0x2c5") ||
+		strings.Contains(lower, "policy check failed") ||
+		strings.Contains(lower, "policy digest mismatch") ||
+		strings.Contains(lower, "pcr mismatch") ||
+		strings.Contains(lower, "policy authorization failed") {
+		return TPMErrorPCRMismatch
+	}
+
+	// === HANDLE/SESSION ERRORS ===
+	// 0x902: TPM_RC_HANDLE (FMT1) - invalid handle or session
+	// May indicate stale session or handle not found
+	if hasErrorCode("0x902") ||
+		strings.Contains(lower, "handle") && strings.Contains(lower, "invalid") ||
+		strings.Contains(lower, "session") && strings.Contains(lower, "invalid") {
+		return TPMErrorHandleInvalid
+	}
+
+	// === INVALID PARAMETER ERRORS ===
+	// TPM_RC_VALUE (0x1c4) - parameter out of range
+	// TPM_RC_HIERARCHY (0x1c5) - invalid hierarchy
+	// TPM_RC_KEY_SIZE (0x1c6) - bad key size
+	// TPM_RC_MGF (0x1d5) - invalid MGF
+	if hasErrorCode("0x1c4") ||
+		hasErrorCode("0x1c5") ||
+		hasErrorCode("0x1c6") ||
+		hasErrorCode("0x1d5") ||
 		strings.Contains(lower, "value is out of range") ||
-		strings.Contains(lower, "not correct for the context") {
+		strings.Contains(lower, "not correct for the context") ||
+		strings.Contains(lower, "invalid parameter") {
 		return TPMErrorInvalidParam
+	}
+
+	// === TSS2 LAYER ERRORS (communication/protocol) ===
+	// Only check for TSS2 errors if no specific TPM response code was found above.
+	// ESAPI errors (0x70000 range)
+	// TCTI errors (0xA0000 range) - transport/communication
+	// SYS errors (0x80000 range)
+	// FAPI errors (0x60000 range)
+	// Check for hex error codes in TSS2 layer ranges (must be 6+ digits to avoid matching line numbers)
+	tss2Pattern := regexp.MustCompile(`0x[0-9a-fA-F]{6,}`)
+	for _, match := range tss2Pattern.FindAllString(lower, -1) {
+		if hexVal, err := strconv.ParseInt(match, 0, 64); err == nil {
+			// Check layer bits (bits 16-23 indicate the layer)
+			layer := (hexVal >> 16) & 0xFF
+			switch layer {
+			case 0x06: // FAPI layer
+				return TPMErrorCommunication
+			case 0x07: // ESAPI layer
+				return TPMErrorCommunication
+			case 0x08: // SYS layer
+				return TPMErrorCommunication
+			case 0x0A: // TCTI layer
+				return TPMErrorCommunication
+			}
+		}
+	}
+	// Check for actual communication failure patterns (not source file paths)
+	// These indicate transport/connection issues, not TPM command failures
+	if strings.Contains(lower, "tcti") && (strings.Contains(lower, "io error") ||
+		strings.Contains(lower, "no connection") ||
+		strings.Contains(lower, "connection refused")) ||
+		strings.Contains(lower, "communication") && strings.Contains(lower, "failed") ||
+		strings.Contains(lower, "device not found") && strings.Contains(lower, "tpm") {
+		return TPMErrorCommunication
+	}
+
+	// === CRYPTSETUP SPECIFIC ERRORS ===
+	// These come from libcryptsetup's token plugin interface
+	if strings.Contains(lower, "token failed") ||
+		strings.Contains(lower, "tpm2 token") && strings.Contains(lower, "fail") ||
+		strings.Contains(lower, "plugin failed") {
+		// Check if it's a specific TPM error wrapped by cryptsetup
+		if strings.Contains(lower, "pin") || strings.Contains(lower, "password") {
+			return TPMErrorWrongPIN
+		}
+		if strings.Contains(lower, "pcr") {
+			return TPMErrorPCRMismatch
+		}
+	}
+
+	// === GENERAL TPM FAILURE ===
+	// TPM_RC_FAILURE (0x184) - nonspecific failure
+	if strings.Contains(lower, "0x184") ||
+		strings.Contains(lower, "tpm failure") ||
+		strings.Contains(lower, "command failed") {
+		return TPMErrorUnknown
 	}
 
 	return TPMErrorUnknown
@@ -97,13 +237,17 @@ func classifyTPMError(stderr string) TPMErrorType {
 
 // isRetryableTPMError returns true if the error type allows retry
 // For PIN mode, we retry on wrong PIN and unknown errors (give user benefit of doubt)
-// Only PCR mismatch, lockout, and invalid param are definitely non-retryable
+// Non-retryable: PCR mismatch (system changed), lockout (wait required),
+//   invalid param (config error), unavailable (TPM missing)
+// Retryable: Wrong PIN (try again), communication (transient), handle (may resolve)
 func isRetryableTPMError(errType TPMErrorType) bool {
 	switch errType {
 	case TPMErrorPCRMismatch, TPMErrorLockout, TPMErrorInvalidParam, TPMErrorUnavailable:
 		return false
+	case TPMErrorWrongPIN, TPMErrorCommunication, TPMErrorHandleInvalid, TPMErrorBadAuth, TPMErrorUnknown:
+		return true
 	default:
-		return true // WrongPIN and Unknown are retryable
+		return true
 	}
 }
 
@@ -331,6 +475,12 @@ func unlockDevice(cs string, dev LUKSDevice) error {
 					msg = "TPM policy mismatch - use recovery passphrase"
 				case TPMErrorInvalidParam:
 					msg = "TPM configuration error - use recovery passphrase"
+				case TPMErrorCommunication:
+					msg = "TPM communication error - use recovery passphrase"
+				case TPMErrorHandleInvalid:
+					msg = "TPM session error - use recovery passphrase"
+				case TPMErrorBadAuth:
+					msg = "TPM authorization failed - use recovery passphrase"
 				default:
 					msg = fmt.Sprintf("TPM unlock failed: %v", err)
 				}
@@ -627,6 +777,12 @@ func unlockWithTokenPIN(cs string, dev LUKSDevice) error {
 			userMsg = "TPM policy configuration error"
 		case TPMErrorLockout:
 			userMsg = "TPM locked - too many failed attempts"
+		case TPMErrorCommunication:
+			userMsg = "TPM communication error - check device connection"
+		case TPMErrorHandleInvalid:
+			userMsg = "TPM session error - retrying may help"
+		case TPMErrorBadAuth:
+			userMsg = fmt.Sprintf("TPM authorization failed (attempt %d of %d)", attempt, maxPINAttempts)
 		default:
 			userMsg = "TPM unlock failed"
 		}
@@ -880,7 +1036,9 @@ func ensureMapperNode(name string) error {
 	dmsetupPaths := []string{"/usr/sbin/dmsetup", "/sbin/dmsetup"}
 	for _, dmPath := range dmsetupPaths {
 		if _, err := os.Stat(dmPath); err == nil {
-			exec.Command(dmPath, "mknodes").Run()
+			if err := exec.Command(dmPath, "mknodes").Run(); err != nil {
+				Debug("cryptsetup: dmsetup mknodes failed: %v\n", err)
+			}
 			break
 		}
 	}

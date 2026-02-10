@@ -51,9 +51,11 @@ func Configure() error {
 		cfg.Font = overrides.Font
 	}
 
-	// Apply keymap if specified
+	// Apply keymap if specified (skip if keymap files not in initramfs)
 	if cfg.Keymap != "" {
-		if err := loadKeymap(cfg.Keymap); err != nil {
+		if !keymapFilesExist() {
+			Debug("vconsole: keymap %s requested but keymap files not in initramfs, skipping\n", cfg.Keymap)
+		} else if err := loadKeymap(cfg.Keymap); err != nil {
 			Debug("vconsole: failed to load keymap %s: %v\n", cfg.Keymap, err)
 		} else {
 			Debug("vconsole: loaded keymap %s\n", cfg.Keymap)
@@ -62,7 +64,9 @@ func Configure() error {
 
 	// Apply toggle keymap if specified
 	if cfg.KeymapToggle != "" {
-		if err := loadKeymap(cfg.KeymapToggle); err != nil {
+		if !keymapFilesExist() {
+			Debug("vconsole: keymap toggle %s requested but keymap files not in initramfs, skipping\n", cfg.KeymapToggle)
+		} else if err := loadKeymap(cfg.KeymapToggle); err != nil {
 			Debug("vconsole: failed to load toggle keymap %s: %v\n", cfg.KeymapToggle, err)
 		}
 	}
@@ -162,11 +166,33 @@ func parseCmdlineOverrides() *Config {
 	return cfg
 }
 
+// keymapDirs are the directories where keymap files are stored
+var keymapDirs = []string{
+	"/usr/share/kbd/keymaps",
+	"/lib/kbd/keymaps",
+	"/usr/lib/kbd/keymaps",
+}
+
+// keymapFilesExist checks if keymap data files are available in the initramfs
+func keymapFilesExist() bool {
+	for _, dir := range keymapDirs {
+		if _, err := os.Stat(dir); err == nil {
+			return true
+		}
+	}
+	return false
+}
+
 // loadKeymap loads a keyboard layout using loadkeys
 func loadKeymap(keymap string) error {
 	binary := findBinary(loadkeysPaths)
 	if binary == "" {
 		return fmt.Errorf("loadkeys binary not found")
+	}
+
+	// Skip if keymap files aren't included in initramfs
+	if !keymapFilesExist() {
+		return fmt.Errorf("keymap files not found in initramfs")
 	}
 
 	cmd := exec.Command(binary, keymap)

@@ -5,6 +5,8 @@
 # Embedded init binaries (built by make)
 cmd/vanguard/embed/init
 cmd/vanguard/embed/init-debug
+cmd/vanguard/embed/init-strict
+cmd/vanguard/embed/init-debug-strict
 
 # Test directory
 test/
@@ -14,10 +16,25 @@ tmp/
 *.tmp
 
 # IDE
+.idea
 .idea/
+.vscode
 .vscode/
 *.swp
 
 # OS
 .DS_Store
 .claude/
+
+# Shell dotfiles (user home dir artifacts)
+.bash_profile
+.bashrc
+.profile
+.zshrc
+.zprofile
+
+# User config files
+.gitconfig
+.ripgreprc
+.mcp.json
+.gitmodules

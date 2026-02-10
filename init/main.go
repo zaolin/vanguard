@@ -122,15 +122,9 @@ func main() {
 	udev.Trigger()
 	udev.Settle(10 * time.Second)
 
-	// 9. Load TPM modules explicitly before cryptsetup
+	// 9. Load TPM modules explicitly before cryptsetup (only if needed)
 	tui.UpdateStage(tui.StageTPM)
-	buildtags.Debug("vanguard: loading TPM modules\n")
-	tpmModules := []string{"tpm_crb", "tpm_tis", "tpm_tis_core"}
-	for _, mod := range tpmModules {
-		if err := modules.LoadByName(mod); err != nil {
-			buildtags.Debug("vanguard: tpm module %s: %v\n", mod, err)
-		}
-	}
+	loadTPMModulesIfNeeded()
 	tui.StageDone(tui.StageTPM)
 
 	// 10. Setup pcrlock (needed before LUKS unlock if using pcrlock policy)
@@ -339,5 +333,38 @@ func halt() {
 	console.Print("vanguard: press Ctrl+Alt+Del to reboot\n")
 	for {
 		time.Sleep(time.Hour)
+	}
+}
+
+// loadTPMModulesIfNeeded loads TPM driver modules if TPM device doesn't exist
+// and modules are available in the initramfs. Skips silently if modules aren't
+// included or TPM is already available (e.g., built into kernel or loaded by udev).
+func loadTPMModulesIfNeeded() {
+	// Check if TPM device already exists (module already loaded or built-in)
+	if _, err := os.Stat("/dev/tpmrm0"); err == nil {
+		buildtags.Debug("vanguard: TPM device already available, skipping module load\n")
+		return
+	}
+	if _, err := os.Stat("/dev/tpm0"); err == nil {
+		buildtags.Debug("vanguard: TPM device already available, skipping module load\n")
+		return
+	}
+
+	// Check if modules are available in the initramfs
+	if _, err := os.Stat("/lib/modules"); os.IsNotExist(err) {
+		buildtags.Debug("vanguard: /lib/modules not found, skipping TPM module load\n")
+		return
+	}
+
+	// Try to load TPM driver modules
+	buildtags.Debug("vanguard: loading TPM modules\n")
+	tpmModules := []string{"tpm_crb", "tpm_tis", "tpm_tis_core"}
+	for _, mod := range tpmModules {
+		if err := modules.LoadByName(mod); err != nil {
+			// Only log debug, don't print errors for modules not in initramfs
+			buildtags.Debug("vanguard: tpm module %s not loaded: %v\n", mod, err)
+		} else {
+			buildtags.Debug("vanguard: tpm module %s loaded\n", mod)
+		}
 	}
 }
