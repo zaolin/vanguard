@@ -67,6 +67,7 @@ vanguard generate -o /boot/initramfs-linux.img [options]
 | `-m, --modules` | Comma-separated kernel modules |
 | `-c, --compression` | `zstd`, `gzip`, or `none` (default: zstd) |
 | `-d, --debug` | Enable verbose boot output |
+| `-s, --strict` | Strict mode: token-only unlock, no passphrase fallback |
 | `--config` | Path to TOML config file |
 
 ### update-tpm-policy
@@ -81,8 +82,29 @@ vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi [options]
 |--------|-------------|
 | `-u, --uki-path` | Path to UKI file (required) |
 | `-p, --policy-output` | Output path for policy JSON |
-| `--luks-device` | LUKS device for token verification |
+| `-l, --luks-device` | LUKS device for token verification (enables GPT binding) |
+| `--no-gpt` | Disable GPT partition table binding (PCR 5) |
 | `--no-verify` | Skip policy verification |
+| `-v, --verbose` | Show verbose output from pcrlock tools |
+| `-c, --cleanup` | Remove old unused pcrlock NV indices from TPM |
+
+### verify-pcrlock-setup
+
+Verify TPM2 pcrlock setup (PCRs, NV Index, LUKS token):
+
+```bash
+vanguard verify-pcrlock-setup -p /boot/pcrlock.json [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-p, --policy-path` | Path to pcrlock.json policy file (required) |
+| `-l, --luks-device` | LUKS device to verify (optional) |
+
+This checks:
+1. NV Index synchronization (TPM matches policy file)
+2. Current PCR values against policy expectations
+3. LUKS token validation (when `-l` specified)
 
 ## Configuration File
 
@@ -149,23 +171,30 @@ See [docs/kernel-parameters.md](docs/kernel-parameters.md) for all supported par
 ## Boot Sequence Overview
 
 ```
-┌─────────────────────────────────────────────────────────────┐
-│  1. Console Setup          Set up early console I/O        │
-│  2. Mount Filesystems      /proc, /sys, /dev, /run         │
-│  3. Vconsole Config        Load keyboard layout/font       │
-│  4. Mount /boot            Mount boot partition for policy │
-│  5. Init Boot Log          Start logging to /boot          │
-│  6. Start udevd            Device discovery daemon         │
-│  7. Load Modules           Kernel modules from image       │
-│  8. Load TPM Modules       tpm_crb, tpm_tis, tpm_tis_core  │
-│  9. Setup PCRLock          Copy pcrlock.json for TPM2      │
-│ 10. Unlock LUKS            TPM2 → PIN → Passphrase         │
-│ 11. Activate LVM           Scan and activate volumes       │
-│ 12. Try Resume             Hibernate resume from swap      │
-│ 13. fsck                   Check root filesystem           │
-│ 14. Mount Root             Mount to /sysroot               │
-│ 15. Switch Root            Hand off to init                │
-└─────────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│   1. Console Setup          Set up early console I/O            │
+│   2. Mount Filesystems      /proc, /sys, /dev, /run             │
+│   3. Vconsole Config        Load keyboard layout/font           │
+│   4. Mount /boot            Mount boot partition for policy     │
+│   5. Init Boot Log          Start logging to /boot              │
+│   6. Start udevd            Device discovery daemon             │
+│   7. Load Modules           Kernel modules from image           │
+│   8. Trigger udev Events    Firmware loading                    │
+│   9. Load TPM Modules       tpm_crb, tpm_tis, tpm_tis_core     │
+│  10. Setup PCRLock          Copy pcrlock.json for TPM2          │
+│  11. Unlock LUKS            TPM2 → PIN → Passphrase             │
+│ 11a. Trigger udev           Process dm-crypt devices            │
+│  12. Activate LVM           Scan and activate volumes           │
+│ 12a. Trigger udev           Process LVM devices                 │
+│  13. Try Resume             Hibernate resume from swap          │
+│  14. Find Root Device       cmdline → fstab → GPT autodiscovery │
+│  15. fsck                   Check root filesystem               │
+│  16. Mount Root             Mount to /sysroot                   │
+│ 16a. LVM Symlinks           Create symlinks in /sysroot/dev     │
+│  17. Cleanup udev           Settle, cleanup DB, stop daemon     │
+│  18. Close Boot Log         Close log, unmount /boot            │
+│  19. Switch Root            Hand off to real init               │
+└──────────────────────────────────────────────────────────────────┘
 ```
 
 See [docs/boot-flow.md](docs/boot-flow.md) for detailed documentation.
@@ -200,7 +229,8 @@ See [docs/boot-flow.md](docs/boot-flow.md) for detailed documentation.
 - TPM2 sealed keys with PCR policy binding (PCR 4 for UKI, PCR 7 for Secure Boot)
 - PCRLock for predictable boot measurement validation
 - PIN protection for TPM2 tokens
-- Passphrase fallback when TPM2 fails (3 attempts before halt)
+- Strict mode (`-s`): disables passphrase fallback when TPM2 token is present, halting if TPM2 unlock fails
+- Passphrase fallback when TPM2 fails (3 attempts before halt, unless strict mode)
 - Kernel message suppression during password entry
 - Static Go binary init (no dynamic linking vulnerabilities in init)
 - Minimal attack surface (only essential binaries included)

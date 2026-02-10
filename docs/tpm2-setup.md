@@ -138,15 +138,47 @@ sudo vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi -l /dev/sda2 --no-
 Vanguard uses **PCRLock Policy** via `systemd-pcrlock` to handle dynamic firmware/kernel measurements:
 
 - **PCR 4**: Boot loader code (UKI/kernel)
+- **PCR 5**: GPT partition table (auto-enabled with `--luks-device`)
 - **PCR 7**: Secure Boot state
 
 The policy is stored in a TPM NV index and validated at unlock time.
+
+#### Three-Variant UKI Locking
+
+For PCR 4 (boot loader code), Vanguard creates three prediction variants in `/etc/pcrlock.d/510-uki.pcrlock.d/`:
+
+| Variant | Method | Purpose |
+|---------|--------|---------|
+| `pe.pcrlock` | `lock-pe` | Primary - more reliable for PCR 4 with sd-stub LoadImage |
+| `uki.pcrlock` | `lock-uki` | Fallback - includes PCR 11 measurements |
+| `eventlog.pcrlock` | Event log extraction | Captures current boot's PCR 4 from UEFI event log |
+
+The event log variant handles the case where the kernel file has been replaced on disk but the currently booted kernel still needs to unlock. Using a variant directory allows `systemd-pcrlock` to accept any of the three predictions.
+
+#### Masked Policies
+
+Vanguard masks policies for PCRs that change during boot or are not relevant to early unlock:
+
+```
+200-firmware-code, 220-firmware-config, 250-firmware-code-early,
+250-firmware-config-early, 750-enter-initrd, 800-leave-initrd,
+820-machine-id, 830-root-file-system, 850-sysinit, 900-ready,
+940-machine-id, 940-machine-id-null, 950-root-file-system,
+950-root-file-system-null, 950-shutdown, 990-final
+```
+
+**Note:** `600-gpt.pcrlock` is conditionally masked - it is only masked when `--luks-device` is NOT specified (i.e., GPT binding is disabled).
 
 ### Setup PCRLock Policy
 
 ```mermaid
 flowchart TD
-    A[1. Generate Policy] --> B[2. Enroll with Policy]
+    A[1. Generate Policy] --> A1[Mask noisy PCRs]
+    A1 --> A2[Lock Secure Boot - PCR 7]
+    A2 --> A3[Lock GPT - PCR 5 if -l specified]
+    A3 --> A4[Lock UKI - 3 variants in 510-uki.pcrlock.d/]
+    A4 --> A5[Generate policy with recovery PIN]
+    A5 --> B[2. Enroll with Policy]
     B --> C[3. Copy to ESP]
     C --> D[4. Generate Initramfs]
     D --> E[5. Reboot and Test]
@@ -165,6 +197,20 @@ sudo vanguard update-tpm-policy \
 ```
 
 This creates the pcrlock policy file (e.g., `/boot/EFI/Linux/kernel.pcrlock.json`) with predicted PCR values.
+
+#### NV Index Cleanup
+
+When `--cleanup` (`-c`) is specified, Vanguard removes old unused pcrlock NV indices from the TPM:
+
+1. Collects the current policy NV index and LUKS token NV index as a "keep" set
+2. Scans TPM NV indices in the pcrlock range (`0x01800000`-`0x01BFFFFF`)
+3. Identifies old pcrlock indices by their characteristics (size: 34 bytes, policywrite + ownerread attributes)
+4. Removes indices not in the "keep" set
+
+```bash
+# Update policy and clean up old NV indices
+sudo vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi -l /dev/sda2 -c
+```
 
 #### Step 2: Enroll with PCRLock
 
@@ -203,6 +249,39 @@ The system should:
 2. Copy pcrlock.json to initramfs
 3. Validate PCRs against policy
 4. Unlock LUKS automatically
+
+### Native Go TPM Stack
+
+The codebase contains two LUKS unlock implementations:
+
+| Package | Method | Status |
+|---------|--------|--------|
+| `init/cryptsetup/` | Shells out to `cryptsetup` binary | **Current default** (used by `init/main.go`) |
+| `init/luks/` + `internal/tpm/` | Native Go using `anatol/luks.go` + `google/go-tpm` (tpmdirect API) | Available but not yet default |
+
+The native Go stack (`internal/tpm/`) provides:
+- Direct TPM2 communication via `google/go-tpm`'s tpmdirect API
+- LUKS2 token parsing and key unsealing
+- PBKDF2-HMAC-SHA256 PIN derivation (1 iteration, matching systemd's `tpm2_util_pbkdf2_hmac_sha256`)
+  - Salt is provided in the LUKS token JSON as `tpm2-salt`
+  - Falls back to SHA256 hash when no salt is available
+
+### Verify PCRLock Setup
+
+After enrollment, verify that the TPM, NV index, and LUKS token are in sync:
+
+```bash
+# Basic verification (NV Index + PCR values)
+sudo vanguard verify-pcrlock-setup -p /boot/pcrlock.json
+
+# With LUKS token validation
+sudo vanguard verify-pcrlock-setup -p /boot/pcrlock.json -l /dev/sda2
+```
+
+This performs three checks:
+1. **NV Index synchronization** - Verifies the TPM NV index auth policy and size match the policy file
+2. **PCR value validation** - Reads current PCR values and compares against policy expectations
+3. **LUKS token validation** (when `-l` specified) - Confirms the LUKS token references the correct NV index and enforces pcrlock
 
 ## Updating Kernel/UKI
 
@@ -261,7 +340,7 @@ cryptsetup: current PCR values:
   PCR 7: 0xABC123...
 ```
 
-This information is also written to the boot log at `/boot/.vanguard.log` with events:
+This information is also written to the boot log at `/boot/.vanguard.log` (look for the `CRYPTINT BOOT LOG` header) with events:
 - `TPM_PCR_MISMATCH` - Shows which PCRs were enrolled
 - `TPM_PCR_VALUE` - Shows current value of each enrolled PCR
 

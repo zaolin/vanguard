@@ -21,6 +21,7 @@ vanguard generate [options]
 | `--modules` | `-m` | string | | Comma-separated list of kernel modules to include |
 | `--compression` | `-c` | string | `zstd` | Compression algorithm: `zstd`, `gzip`, or `none` |
 | `--debug` | `-d` | bool | `false` | Enable verbose debug output in init |
+| `--strict` | `-s` | bool | `false` | Strict mode: enforce token-only unlock (no passphrase fallback) |
 | `--config` | | string | | Path to TOML configuration file |
 
 #### Examples
@@ -57,8 +58,7 @@ vanguard update-tpm-policy [options]
 | Option | Short | Type | Default | Description |
 |--------|-------|------|---------|-------------|
 | `--uki-path` | `-u` | string | *required* | Path to the Unified Kernel Image (UKI) |
-| `--policy-output` | `-p` | string | `/etc/boot-bundle/pcrlock.json` | Output path for policy JSON |
-| `--bundle-dir` | | string | `/etc/boot-bundle` | Directory for policy files |
+| `--policy-output` | `-p` | string | `<uki-path>.pcrlock.json` | Output path for policy JSON |
 | `--luks-device` | `-l` | string | | LUKS device for token verification (enables GPT binding) |
 | `--no-gpt` | | bool | `false` | Disable GPT partition table binding (PCR 5) |
 | `--no-verify` | | bool | `false` | Skip policy verification step |
@@ -108,6 +108,9 @@ compression = "zstd"
 # Enable debug output in init binary
 debug = false
 
+# Strict mode: enforce token-only unlock (no passphrase fallback)
+strict_mode = false
+
 # Firmware files to include (relative to /lib/firmware/)
 firmware = [
     "amd/amd_sev.fw",
@@ -148,6 +151,11 @@ modules = [
 - **Default:** `false`
 - **Description:** When enabled, the init binary outputs verbose messages during boot. Useful for debugging boot issues.
 
+#### strict_mode
+- **Type:** bool
+- **Default:** `false`
+- **Description:** When enabled with a TPM2 token present, disables passphrase fallback. Boot halts if TPM2 unlock fails.
+
 #### firmware
 - **Type:** array of strings
 - **Default:** `[]`
@@ -170,6 +178,7 @@ The generator automatically includes these binaries and their library dependenci
 | `systemd-udevd` | Device event daemon | Yes |
 | `udevadm` | udev administration | Yes |
 | `tpm2_pcrread` | TPM PCR debugging (shows values on unlock failure) | Optional |
+| `tpm2_pcrextend` | TPM PCR extension (LUKS header measurement) | Optional |
 | `loadkeys` | Keyboard layout loading | Optional |
 | `setfont` | Console font loading | Optional |
 | `fsck` | Generic filesystem check wrapper | Optional |
