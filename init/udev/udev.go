@@ -90,6 +90,28 @@ func Trigger() error {
 	return nil
 }
 
+// TriggerGraphics triggers udev events for graphics and DRM subsystems.
+// This ensures /dev/dri/card* and /dev/dri/renderD* devices are created
+// with proper permissions before switch_root.
+func TriggerGraphics() error {
+	udevadm := findBinary(udevadmPaths)
+	if udevadm == "" {
+		return nil
+	}
+
+	console.DebugPrint("udev: triggering graphics and DRM subsystems\n")
+
+	// Trigger DRM subsystem (creates /dev/dri/card* with proper permissions)
+	cmd := exec.Command(udevadm, "trigger", "--subsystem-match=drm", "--action=add")
+	cmd.Run()
+
+	// Trigger graphics subsystem (for framebuffer devices)
+	cmd = exec.Command(udevadm, "trigger", "--subsystem-match=graphics", "--action=add")
+	cmd.Run()
+
+	return nil
+}
+
 // Settle waits for udev event queue to empty
 func Settle(timeout time.Duration) error {
 	udevadm := findBinary(udevadmPaths)

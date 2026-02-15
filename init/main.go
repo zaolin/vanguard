@@ -10,7 +10,7 @@ import (
 	"github.com/zaolin/vanguard/init/bootlog"
 	"github.com/zaolin/vanguard/init/buildtags"
 	"github.com/zaolin/vanguard/init/console"
-	"github.com/zaolin/vanguard/init/cryptsetup"
+initluks "github.com/zaolin/vanguard/init/luks"
 	"github.com/zaolin/vanguard/init/fsck"
 	"github.com/zaolin/vanguard/init/gpt"
 	"github.com/zaolin/vanguard/init/lvm"
@@ -38,15 +38,15 @@ func main() {
 	buildtags.Debug("vanguard: starting init\n")
 
 	// Pass debug function to packages
-	cryptsetup.Debug = buildtags.Debug
-	cryptsetup.StrictMode = buildtags.StrictMode
+	initluks.Debug = buildtags.Debug
+	initluks.StrictMode = buildtags.StrictMode
 	vconsole.Debug = buildtags.Debug
 	resume.Debug = buildtags.Debug
 	fsck.Debug = buildtags.Debug
 	gpt.Debug = buildtags.Debug
 
-	// Pass boot logging function to cryptsetup package
-	cryptsetup.LogFunc = func(event string, kvPairs ...string) {
+	// Pass boot logging function to luks package
+	initluks.LogFunc = func(event string, kvPairs ...string) {
 		bootlog.Log(bootlog.Event(event), kvPairs...)
 	}
 
@@ -68,7 +68,8 @@ func main() {
 		if err := tui.Start(); err != nil {
 			buildtags.Debug("vanguard: TUI start failed: %v\n", err)
 		}
-		defer tui.Quit()
+		// Note: We quit the TUI explicitly before switch_root, not via defer
+		// This ensures proper cleanup of the terminal before exec()
 	}
 
 	// 4. Mount /boot early for logging (before anything else)
@@ -144,7 +145,7 @@ func main() {
 	// 11. Unlock encrypted devices (required - halt if none found)
 	tui.UpdateStage(tui.StageLUKS)
 	buildtags.Debug("vanguard: unlocking encrypted devices\n")
-	unlocked, err := cryptsetup.UnlockDevices()
+	unlocked, err := initluks.UnlockDevices()
 	if err != nil {
 		tui.StageError(tui.StageLUKS, err)
 		bootlog.Log(bootlog.EventLUKSFail, "error", err.Error())
@@ -256,6 +257,12 @@ func main() {
 	buildtags.Debug("vanguard: waiting for udev events to settle\n")
 	udev.Settle(5 * time.Second)
 
+	// Trigger graphics and DRM subsystems to ensure /dev/dri/card* has proper permissions
+	// This is critical for Wayland compositors (Hyprland, sway, etc.) to work after boot
+	buildtags.Debug("vanguard: triggering graphics and DRM subsystems\n")
+	udev.TriggerGraphics()
+	udev.Settle(2 * time.Second)
+
 	// Clean up udev database - dm devices with db_persist flag will survive
 	buildtags.Debug("vanguard: cleaning up udev database\n")
 	if err := udev.CleanupDB(); err != nil {
@@ -276,8 +283,16 @@ func main() {
 		}
 	}
 
+	// CRITICAL: Stop TUI and reset TTY before switch_root
+	// This releases DRM master lock and restores normal terminal state
+	// The TUI uses alternate screen buffer which must be cleaned up before
+	// exec() to new init, otherwise systemd inherits a broken terminal
+	if tui.IsEnabled() {
+		tui.Quit()
+		tui.ForceReset()
+	}
+
 	// 19. Switch root to init
-	tui.UpdateStage(tui.StageSwitchroot)
 	buildtags.Debug("vanguard: switching root to /sysroot\n")
 	initPaths := []string{
 		"/usr/lib/systemd/systemd",
@@ -301,6 +316,11 @@ func main() {
 // discoverModules scans /lib/modules for available kernel modules in the image
 func discoverModules() []string {
 	var mods []string
+
+	// Check if /lib/modules exists before walking
+	if _, err := os.Stat("/lib/modules"); os.IsNotExist(err) {
+		return mods
+	}
 
 	filepath.Walk("/lib/modules", func(path string, info os.FileInfo, err error) error {
 		if err != nil {

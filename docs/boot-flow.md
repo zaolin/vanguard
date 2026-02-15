@@ -158,9 +158,9 @@ flowchart TD
     D -->|No| K
 
     E --> F{Token needs PIN?}
-    F -->|No| G[cryptsetup open --token-only]
+    F -->|No| G[Native Go TPM Unseal]
     F -->|Yes| H[Prompt for PIN]
-    H --> I[cryptsetup open with PIN]
+    H --> I[Native Go TPM Unseal with PIN]
 
     G --> J{Success?}
     I --> J

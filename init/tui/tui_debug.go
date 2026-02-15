@@ -60,6 +60,9 @@ func ShowTPMError(message string) {}
 // Quit is a no-op in debug mode
 func Quit() {}
 
+// ForceReset is a no-op in debug mode
+func ForceReset() {}
+
 // IsEnabled returns false in debug mode
 func IsEnabled() bool {
 	return false

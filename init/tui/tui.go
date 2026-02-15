@@ -503,14 +503,46 @@ func ShowTPMError(message string) {
 	}
 }
 
-// Quit stops the TUI
+// Quit stops the TUI and waits for it to fully terminate
 func Quit() {
 	if Program != nil {
+		// Send quit message
 		Program.Send(QuitMsg{})
-		// Restore console output and kernel messages after TUI exits
+
+		// Wait for program to exit with timeout
+		// This ensures alternate screen is restored and TTY is released
+		done := make(chan struct{})
+		go func() {
+			Program.Wait()
+			close(done)
+		}()
+		select {
+		case <-done:
+			// Program exited cleanly
+		case <-time.After(500 * time.Millisecond):
+			// Timeout - force continue to avoid blocking boot
+		}
+
+		Program = nil
 		console.TUIActive = false
 		restoreKernelMessages()
 	}
+}
+
+// ForceReset sends terminal reset sequences to restore TTY state.
+// Call this after Quit() to ensure clean handover to new init.
+// This handles edge cases where the TUI cleanup didn't fully restore the terminal.
+func ForceReset() {
+	// Reset terminal to sane state
+	// - Exit alternate screen buffer (if still in it)
+	// - Show cursor
+	// - Reset attributes
+	// - Clear screen
+	fmt.Print("\033[?1049l") // Exit alternate screen
+	fmt.Print("\033[?25h")   // Show cursor
+	fmt.Print("\033[0m")     // Reset attributes
+	fmt.Print("\033[2J")     // Clear entire screen
+	fmt.Print("\033[H")      // Move cursor to home position
 }
 
 // IsEnabled returns true when TUI is available

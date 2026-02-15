@@ -206,7 +206,6 @@ See [docs/boot-flow.md](docs/boot-flow.md) for detailed documentation.
 - make
 
 **Runtime Dependencies (included in initramfs):**
-- cryptsetup
 - lvm2
 - systemd-udevd
 - tpm2-tools (optional, for PCR debugging)

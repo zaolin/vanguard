@@ -1,9 +1,12 @@
 package main
 
 import (
+	"bufio"
 	"fmt"
 	"os"
 	"path/filepath"
+	"regexp"
+	"strings"
 
 	"github.com/zaolin/vanguard/cmd/vanguard/embed"
 	"github.com/zaolin/vanguard/internal/compress"
@@ -45,6 +48,120 @@ func (c *GenerateCmd) Run() error {
 	}
 
 	return runGenerate(cfg)
+}
+
+// extractGroupsFromRule parses a udev rule file and extracts GROUP and OWNER values.
+// Returns two slices: groups and owners found in the rule.
+func extractGroupsFromRule(rulePath string) ([]string, []string) {
+	file, err := os.Open(rulePath)
+	if err != nil {
+		return nil, nil
+	}
+	defer file.Close()
+
+	var groups, owners []string
+	// Regex patterns to match GROUP="value" and OWNER="value"
+	groupRe := regexp.MustCompile(`GROUP="([^"]+)"`)
+	ownerRe := regexp.MustCompile(`OWNER="([^"]+)"`)
+
+	scanner := bufio.NewScanner(file)
+	for scanner.Scan() {
+		line := scanner.Text()
+		// Skip comments
+		if strings.TrimSpace(line) == "" || strings.HasPrefix(strings.TrimSpace(line), "#") {
+			continue
+		}
+
+		// Find GROUP matches
+		matches := groupRe.FindAllStringSubmatch(line, -1)
+		for _, match := range matches {
+			if len(match) > 1 {
+				groups = append(groups, match[1])
+			}
+		}
+
+		// Find OWNER matches
+		matches = ownerRe.FindAllStringSubmatch(line, -1)
+		for _, match := range matches {
+			if len(match) > 1 {
+				owners = append(owners, match[1])
+			}
+		}
+	}
+
+	return groups, owners
+}
+
+// copyGroupEntries copies specified group entries from host /etc/group to initramfs.
+func copyGroupEntries(archive *intcpio.Archive, groups []string) int {
+	groupFile, err := os.Open("/etc/group")
+	if err != nil {
+		return 0
+	}
+	defer groupFile.Close()
+
+	groupSet := make(map[string]bool)
+	for _, g := range groups {
+		groupSet[g] = true
+	}
+
+	var entries []string
+	scanner := bufio.NewScanner(groupFile)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, ":")
+		if len(parts) >= 4 && groupSet[parts[0]] {
+			entries = append(entries, line)
+		}
+	}
+
+	if len(entries) == 0 {
+		return 0
+	}
+
+	content := strings.Join(entries, "\n") + "\n"
+	if err := archive.AddFile("etc/group", []byte(content), 0644); err != nil {
+		fmt.Printf("  warning: failed to add /etc/group: %v\n", err)
+		return 0
+	}
+
+	return len(entries)
+}
+
+// copyPasswdEntries copies specified user entries from host /etc/passwd to initramfs.
+func copyPasswdEntries(archive *intcpio.Archive, users []string) int {
+	passwdFile, err := os.Open("/etc/passwd")
+	if err != nil {
+		return 0
+	}
+	defer passwdFile.Close()
+
+	userSet := make(map[string]bool)
+	for _, u := range users {
+		userSet[u] = true
+	}
+
+	var entries []string
+	scanner := bufio.NewScanner(passwdFile)
+	for scanner.Scan() {
+		line := scanner.Text()
+		parts := strings.Split(line, ":")
+		if len(parts) >= 7 && userSet[parts[0]] {
+			entries = append(entries, line)
+		}
+	}
+
+	if len(entries) == 0 {
+		return 0
+	}
+
+	content := strings.Join(entries, "\n") + "\n"
+	if err := archive.AddFile("etc/passwd", []byte(content), 0644); err != nil {
+		fmt.Printf("  warning: failed to add /etc/passwd: %v\n", err)
+		return 0
+	}
+
+	return len(entries)
 }
 
 func runGenerate(cfg *config.Config) error {
@@ -180,13 +297,10 @@ func runGenerate(cfg *config.Config) error {
 
 	// Find binaries - search multiple paths for each
 	binarySearchPaths := map[string][]string{
-		"cryptsetup":     {"/usr/bin/cryptsetup", "/usr/sbin/cryptsetup", "/sbin/cryptsetup", "/bin/cryptsetup"},
-		"lvm":            {"/usr/sbin/lvm", "/sbin/lvm"},
-		"dmsetup":        {"/sbin/dmsetup", "/usr/sbin/dmsetup", "/usr/bin/dmsetup"}, // Required by udev dm rules at /sbin/dmsetup
-		"systemd-udevd":  {"/usr/lib/systemd/systemd-udevd", "/lib/systemd/systemd-udevd", "/sbin/udevd"},
-		"udevadm":        {"/usr/bin/udevadm", "/sbin/udevadm", "/bin/udevadm"},
-		"tpm2_pcrread":   {"/usr/bin/tpm2_pcrread", "/bin/tpm2_pcrread"},     // For TPM PCR debug output
-		"tpm2_pcrextend": {"/usr/bin/tpm2_pcrextend", "/bin/tpm2_pcrextend"}, // For extending PCRs (e.g. LUKS header)
+		"lvm":        {"/usr/sbin/lvm", "/sbin/lvm"},
+		"dmsetup":    {"/sbin/dmsetup", "/usr/sbin/dmsetup", "/usr/bin/dmsetup"}, // Required by udev dm rules at /sbin/dmsetup
+		"systemd-udevd": {"/usr/lib/systemd/systemd-udevd", "/lib/systemd/systemd-udevd", "/sbin/udevd"},
+		"udevadm":       {"/usr/bin/udevadm", "/sbin/udevadm", "/bin/udevadm"},
 		// Vconsole support
 		"loadkeys": {"/usr/bin/loadkeys", "/bin/loadkeys"}, // For keyboard layout
 		"setfont":  {"/usr/bin/setfont", "/bin/setfont"},   // For console font
@@ -220,9 +334,6 @@ func runGenerate(cfg *config.Config) error {
 		allLibs = append(allLibs, binLibs...)
 	}
 
-	// Add dlopen libraries (TPM2 token handler)
-	dlopenLibs, _ := libs.ResolveDlopenDependencies()
-	allLibs = append(allLibs, dlopenLibs...)
 	fmt.Printf("  resolved %d libraries\n", len(allLibs))
 
 	// === MAIN CPIO (compressed) ===
@@ -244,7 +355,7 @@ func runGenerate(cfg *config.Config) error {
 		"bin", "sbin", "lib", "lib64", "lib/firmware",
 		"dev", "proc", "sys", "run", "sysroot", "etc",
 		"usr", "usr/bin", "usr/sbin", "usr/lib", "usr/lib64",
-		"usr/lib64/cryptsetup", "var", "var/lib", "var/lib/systemd",
+		"var", "var/lib", "var/lib/systemd",
 		"run/udev", "run/udev/data", "run/udev/tags",
 		"usr/lib/udev", "usr/lib/udev/rules.d",
 		"usr/lib/systemd",
@@ -380,17 +491,24 @@ func runGenerate(cfg *config.Config) error {
 		"/usr/lib/udev/rules.d",
 		"/lib/udev/rules.d",
 	}
-	// Minimal set of udev rules for device-mapper support.
+	// Minimal set of udev rules for device-mapper and DRM support.
 	// We only include rules that:
 	// 1. Are required for dm device creation and db_persist
-	// 2. Don't call external programs we don't have (ata_id, scsi_id, systemd-sysctl, etc.)
+	// 2. Set up DRM device permissions for graphics/Wayland support
+	// 3. Don't call external programs we don't have (ata_id, scsi_id, systemd-sysctl, etc.)
 	essentialRules := []string{
+		// Device-mapper rules (required for LUKS/LVM)
 		"10-dm.rules",        // Core device-mapper rules (uses dmsetup - we have it)
 		"11-dm-lvm.rules",    // LVM symlinks in /dev/<vg>/<lv> (uses dmsetup splitname)
 		"13-dm-disk.rules",   // DM disk symlinks (no external programs)
 		"95-dm-notify.rules", // CRITICAL: calls dmsetup udevcomplete to signal completion
+		// DRM/Graphics rules (required for Wayland compositors like Hyprland)
+		"50-udev-default.rules", // Default device permissions and GROUP= settings
+		"60-drm.rules",          // DRM device rules (TAG+=uaccess, TAG+=seat)
+		"70-uaccess.rules",      // User access control via logind
+		"71-seat.rules",         // Multi-seat device handling
+		"73-seat-late.rules",    // Late seat assignment
 		// NOTE: The following are intentionally NOT included:
-		// - 50-udev-default.rules: not needed for dm
 		// - 60-persistent-storage.rules: calls ata_id, scsi_id we don't have
 		// - 63-md-raid-arrays.rules: not needed
 		// - 64-btrfs.rules: not needed
@@ -432,6 +550,57 @@ LABEL="dm_persist_end"
 	}
 
 	fmt.Printf("  added %d udev rules\n", rulesAdded)
+
+	// Extract GROUP/OWNER from installed udev rules and copy from host /etc/group, /etc/passwd
+	// This ensures DRM devices get proper permissions (video, render groups)
+	var allGroups, allOwners []string
+	for _, ruleDir := range udevRulesDirs {
+		for _, rule := range essentialRules {
+			srcPath := filepath.Join(ruleDir, rule)
+			if _, err := os.Stat(srcPath); err == nil {
+				groups, owners := extractGroupsFromRule(srcPath)
+				allGroups = append(allGroups, groups...)
+				allOwners = append(allOwners, owners...)
+			}
+		}
+	}
+
+	// Also check if host has video/render groups (common for DRM devices)
+	commonGroups := []string{"video", "render", "input", "tty", "disk", "kvm"}
+	allGroups = append(allGroups, commonGroups...)
+
+	// Deduplicate
+	groupSet := make(map[string]bool)
+	var uniqueGroups []string
+	for _, g := range allGroups {
+		if !groupSet[g] {
+			groupSet[g] = true
+			uniqueGroups = append(uniqueGroups, g)
+		}
+	}
+
+	ownerSet := make(map[string]bool)
+	var uniqueOwners []string
+	for _, o := range allOwners {
+		if !ownerSet[o] {
+			ownerSet[o] = true
+			uniqueOwners = append(uniqueOwners, o)
+		}
+	}
+
+	// Copy entries to initramfs
+	if len(uniqueGroups) > 0 {
+		groupCount := copyGroupEntries(archive, uniqueGroups)
+		if groupCount > 0 {
+			fmt.Printf("  added %d groups from /etc/group\n", groupCount)
+		}
+	}
+	if len(uniqueOwners) > 0 {
+		userCount := copyPasswdEntries(archive, uniqueOwners)
+		if userCount > 0 {
+			fmt.Printf("  added %d users from /etc/passwd\n", userCount)
+		}
+	}
 
 	// Add udev hwdb (optional but helpful)
 	hwdbPaths := []string{"/usr/lib/udev/hwdb.bin", "/lib/udev/hwdb.bin"}
