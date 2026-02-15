@@ -33,6 +33,9 @@ mkfs.vfat -F 32 -n ESP "$BOOT_PART"
 echo -n "${LUKS_PASS}" | cryptsetup luksFormat --type luks2 "$LUKS_PART" -
 echo -n "${LUKS_PASS}" | cryptsetup open "$LUKS_PART" test-crypt -
 
+# Remove old vg0 if it exists (from previous test runs)
+vgremove -f vg0 2>/dev/null || true
+
 pvcreate /dev/mapper/test-crypt
 vgcreate vg0 /dev/mapper/test-crypt
 lvcreate -l 100%FREE -n root vg0

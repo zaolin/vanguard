@@ -290,16 +290,23 @@ func (d *Device) UnlockWithTPM2() error {
 		return err
 	}
 
-	if token.NeedsPIN {
-		return d.unlockWithTPM2PIN(tpmClient, token)
+	// Detect TPM2 token strategy to determine if we should skip policy hash verification
+	detection, _ := DetectTPM2TokenStrategy(d.Path)
+	skipPolicy := detection != nil && detection.Strategy == StrategyPINOnly
+	if detection != nil {
+		Debug("luks: TPM2 token strategy: %v\n", detection.Strategy)
 	}
 
-	return d.unlockWithTPM2NoPIN(tpmClient, token)
+	if token.NeedsPIN {
+		return d.unlockWithTPM2PIN(tpmClient, token, skipPolicy)
+	}
+
+	return d.unlockWithTPM2NoPIN(tpmClient, token, skipPolicy)
 }
 
 // unlockWithTPM2NoPIN attempts TPM2 unlock without PIN.
-func (d *Device) unlockWithTPM2NoPIN(tpmClient *intpm.Client, token *TPM2Token) error {
-	password, err := token.Unseal(tpmClient, nil)
+func (d *Device) unlockWithTPM2NoPIN(tpmClient *intpm.Client, token *TPM2Token, skipPolicyHashVerify bool) error {
+	password, err := token.Unseal(tpmClient, nil, skipPolicyHashVerify)
 	if err != nil {
 		d.logPCRDebug(token)
 		return err
@@ -310,7 +317,7 @@ func (d *Device) unlockWithTPM2NoPIN(tpmClient *intpm.Client, token *TPM2Token) 
 }
 
 // unlockWithTPM2PIN attempts TPM2 unlock with PIN and retry logic.
-func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token) error {
+func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, skipPolicyHashVerify bool) error {
 	var lastError error
 	var pin string
 	var err error
@@ -333,7 +340,7 @@ func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token) er
 		}
 
 		// Unseal with PIN using native TPM implementation
-		password, unsealErr := token.Unseal(tpmClient, []byte(pin))
+		password, unsealErr := token.Unseal(tpmClient, []byte(pin), skipPolicyHashVerify)
 		if unsealErr == nil {
 			// Success - unlock with password
 			if tui.IsEnabled() {

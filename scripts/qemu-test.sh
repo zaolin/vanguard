@@ -85,8 +85,25 @@ check_swtpm_deps() {
 init_swtpm_state() {
     info "Initializing swtpm state..."
     mkdir -p "${TPM_DIR}"
-    rm -rf "${TPM_DIR:?}"/*
-    command -v swtpm_setup &>/dev/null && swtpm_setup --tpmstate "${TPM_DIR}" --tpm2 --createek
+    # For PCRLock we need to preserve NV indexes - use --not-overwrite
+    # Only clear TPM state if explicitly requested via environment variable
+    if [ "${CLEAR_TPM_STATE:-1}" = "1" ]; then
+        info "Clearing existing TPM state (CLEAR_TPM_STATE=1)..."
+        rm -rf "${TPM_DIR:?}"/*
+    else
+        info "Preserving existing TPM state..."
+    fi
+    # Use custom profile for TPM 2.0 with PolicyAuthorizeNV (required for PCRLock)
+    # default-v1 doesn't include PolicyAuthorizeNV (command 0x12A = 298)
+    # The 'custom' profile allows enabling additional commands
+    # Remove --not-overwrite to ensure fresh state with correct profile
+    if command -v swtpm_setup &>/dev/null; then
+        # Try custom profile first - this allows adding commands
+        swtpm_setup --tpmstate "${TPM_DIR}" --tpm2 --createek --profile-name custom 2>&1 && return 0
+        # Fall back to default if custom fails
+        warn "Custom profile failed, trying default..."
+        swtpm_setup --tpmstate "${TPM_DIR}" --tpm2 --createek
+    fi
 }
 
 start_swtpm() {
@@ -98,11 +115,13 @@ start_swtpm() {
     rm -f "${TPM_SOCKET}" "${TPM_SOCKET}.ctrl" 2>/dev/null || true
 
     info "Starting swtpm..."
+    # Use startup-none to preserve NV indexes (PCRLock requirement)
+    # The NV index created during enrollment must persist for unlock
     swtpm socket \
         --tpmstate dir="${TPM_DIR}" \
         --ctrl type=unixio,path="${TPM_SOCKET}" \
         --tpm2 \
-        --flags not-need-init \
+        --flags startup-none,not-need-init \
         --log level=5 >> "${TPM_DIR}/swtpm.log" 2>&1 &
 
     sleep 1
@@ -113,7 +132,18 @@ start_swtpm() {
 start_swtpm_for_enrollment() {
     info "Starting swtpm for enrollment..."
     rm -f "${TPM_SOCKET}" "${TPM_SOCKET}.ctrl" 2>/dev/null || true
-
+    
+    # Check if TPM state exists with NV indexes or persistent state
+    # Only check for NVChip - tpm2-00.permall exists even in fresh TPM (for EK)
+    if [ -f "${TPM_DIR}/NVChip" ]; then
+        info "Using existing TPM state with NV indexes..."
+    else
+        info "No TPM state found, initializing..."
+        init_swtpm_state
+    fi
+    
+    # Use startup-clear to ensure clean TPM state during enrollment
+    # After enrollment, we'll preserve the state for unlock tests
     swtpm socket \
         --tpmstate dir="${TPM_DIR}" \
         --server type=unixio,path="${TPM_SOCKET}" \
@@ -212,14 +242,35 @@ generate_pcrlock() {
     [ -z "$pcrlock_bin" ] && { warn "systemd-pcrlock not found"; return; }
 
     info "Generating pcrlock policy..."
-    if sudo SYSTEMD_TPM2_DEVICE="swtpm:path=${TPM_SOCKET}" \
-        "${pcrlock_bin}" make-policy --policy="${TEST_DIR}/pcrlock.json" --force; then
+    info "Using TPM_SOCKET: ${TPM_SOCKET}"
+    info "Testing swtpm connection..."
+    
+    # Test swtpm is accessible
+    if [ -S "${TPM_SOCKET}" ]; then
+        info "swtpm socket exists: ${TPM_SOCKET}"
+    else
+        warn "swtpm socket NOT found: ${TPM_SOCKET}"
+    fi
+    
+    info "Running systemd-pcrlock with SYSTEMD_TPM2_DEVICE=swtpm:path=${TPM_SOCKET}..."
+    
+    # Capture both stdout and stderr
+    local output
+    local exit_code
+    # Use --pcr=23 to simplify testing - only lock to PCR 23
+    output=$(sudo SYSTEMD_TPM2_DEVICE="swtpm:path=${TPM_SOCKET}" \
+        "${pcrlock_bin}" make-policy --policy="${TEST_DIR}/pcrlock.json" --pcr=23 --force 2>&1) 
+    exit_code=$?
+    
+    info "systemd-pcrlock output:"
+    info "${output}"
+    
+    if [ $exit_code -eq 0 ]; then
         sudo chown "$(id -u):$(id -g)" "${TEST_DIR}/pcrlock.json"
-        info "pcrlock policy created"
-        # Copy pcrlock.json to /boot on the test disk
+        info "pcrlock policy created successfully"
         copy_pcrlock_to_boot
     else
-        warn "pcrlock generation failed"
+        warn "pcrlock generation failed with exit code: ${exit_code}"
     fi
 }
 
@@ -257,6 +308,29 @@ copy_pcrlock_to_boot() {
     info "pcrlock.json copied to /boot"
 }
 
+# Export TPM token from the test disk for debugging
+export_token() {
+    [ -f "${DISK_IMG}" ] || error "Disk not found. Run: $0 disk"
+    local tmpraw
+    tmpraw=$(mktemp)
+    qemu-img convert -f qcow2 -O raw "${DISK_IMG}" "${tmpraw}"
+    local loop
+    loop=$(sudo losetup -f --show "${tmpraw}")
+    sudo partprobe "${loop}"; sleep 1
+    local luks_part="${loop}p2"
+    echo "Unlocking LUKS device..."
+    echo "${LUKS_PASS}" | sudo cryptsetup open "${luks_part}" testluks -
+    echo ""
+    echo "=== TPM Token Export ==="
+    sudo cryptsetup token export /dev/mapper/testluks --token-id 0 2>/dev/null || \
+        sudo cryptsetup token export "${luks_part}" --token-id 0 2>/dev/null || \
+        echo "No token found or export failed"
+    echo ""
+    sudo cryptsetup close testluks 2>/dev/null || true
+    sudo losetup -d "${loop}"
+    rm -f "${tmpraw}"
+}
+
 #=============================================================================
 # Disk Functions
 #=============================================================================
@@ -289,13 +363,11 @@ enroll_tpm() {
     init_swtpm_state
     start_swtpm_for_enrollment
 
+    # Generate pcrlock policy on swtpm (this creates the NV index in swtpm!)
+    generate_pcrlock
+
     info "Enrolling TPM2 token (no PIN)..."
-    local pcrlock_arg=""
-    if [ -f "${TEST_DIR}/pcrlock.json" ]; then
-        pcrlock_arg="${TEST_DIR}/pcrlock.json"
-        info "Using pcrlock policy: ${pcrlock_arg}"
-    fi
-    sudo "${SCRIPT_DIR}/helpers/enroll-tpm.sh" "${DISK_IMG}" "${DISK_RAW}" "${TPM_SOCKET}" "${LUKS_PASS}" "${pcrlock_arg}" ""
+    sudo "${SCRIPT_DIR}/helpers/enroll-tpm.sh" "${DISK_IMG}" "${DISK_RAW}" "${TPM_SOCKET}" "${LUKS_PASS}" "${TEST_DIR}/pcrlock.json" ""
 
     stop_swtpm
     info "TPM enrollment complete (no PIN)"
@@ -306,16 +378,79 @@ enroll_tpm_pin() {
     init_swtpm_state
     start_swtpm_for_enrollment
 
+    # Generate pcrlock policy on swtpm (this creates the NV index in swtpm!)
+    generate_pcrlock
+
     info "Enrolling TPM2 token with PIN: ${TPM_PIN}..."
-    local pcrlock_arg=""
-    if [ -f "${TEST_DIR}/pcrlock.json" ]; then
-        pcrlock_arg="${TEST_DIR}/pcrlock.json"
-        info "Using pcrlock policy: ${pcrlock_arg}"
-    fi
-    sudo "${SCRIPT_DIR}/helpers/enroll-tpm.sh" "${DISK_IMG}" "${DISK_RAW}" "${TPM_SOCKET}" "${LUKS_PASS}" "${pcrlock_arg}" "${TPM_PIN}"
+    sudo "${SCRIPT_DIR}/helpers/enroll-tpm.sh" "${DISK_IMG}" "${DISK_RAW}" "${TPM_SOCKET}" "${LUKS_PASS}" "${TEST_DIR}/pcrlock.json" "${TPM_PIN}"
 
     stop_swtpm
     info "TPM enrollment complete with PIN"
+}
+
+enroll_tpm_pin_pcr() {
+    check_swtpm_deps
+    
+    # For PCRLock we need fresh TPM state with PolicyAuthorizeNV support
+    # Always reinitialize to ensure correct profile is applied
+    info "Initializing fresh TPM state for PCRLock..."
+    init_swtpm_state
+    
+    # Check if disk already has TPM token - if so, skip enrollment
+    if [ -f "${DISK_IMG}" ]; then
+        info "Checking if disk already has TPM token..."
+        local tmpraw=$(mktemp)
+        qemu-img convert -f qcow2 -O raw "${DISK_IMG}" "${tmpraw}"
+        local loop=$(sudo losetup -f --show "${tmpraw}")
+        sudo partprobe "$loop" 2>/dev/null || true
+        sleep 1
+        local PART="${loop}p2"; [ -e "$PART" ] || PART="${loop}p1"
+        
+        # Check if token exists using cryptsetup
+        if sudo cryptsetup luksDump "${PART}" 2>/dev/null | grep -q "systemd-tpm2"; then
+            info "Disk already has TPM token, skipping enrollment..."
+            sudo losetup -d "$loop" 2>/dev/null || true
+            rm -f "${tmpraw}"
+            return 0
+        fi
+        sudo losetup -d "$loop" 2>/dev/null || true
+        rm -f "${tmpraw}"
+    fi
+    
+    start_swtpm_for_enrollment
+
+    # Generate pcrlock policy on swtpm (this creates the NV index in swtpm!)
+    generate_pcrlock
+
+    info "Enrolling TPM2 token with PIN + PCR23: ${TPM_PIN}..."
+
+    # Convert disk for enrollment
+    local tmpraw=$(mktemp)
+    qemu-img convert -f qcow2 -O raw "${DISK_IMG}" "${tmpraw}"
+    local loop=$(sudo losetup -f --show "${tmpraw}")
+    sudo partprobe "$loop"; sleep 1
+    local PART="${loop}p2"; [ -e "$PART" ] || PART="${loop}p1"
+
+    local PASSFILE=$(mktemp)
+    echo -n "${LUKS_PASS}" > "$PASSFILE"
+
+    # Enroll with PIN + PCRLock (pcrlock handles PCR policy internally)
+    # Note: --tpm2-pcrs should NOT be used with --tpm2-pcrlock
+    sudo systemd-cryptenroll \
+        --tpm2-device="swtpm:path=${TPM_SOCKET}" \
+        --tpm2-with-pin=yes \
+        --wipe-slot=tpm2 \
+        --unlock-key-file="$PASSFILE" \
+        --tpm2-pcrlock="${TEST_DIR}/pcrlock.json" \
+        "$PART"
+
+    rm -f "$PASSFILE"
+    sudo losetup -d "$loop"
+    qemu-img convert -f raw -O qcow2 "${tmpraw}" "${DISK_IMG}"
+    rm -f "${tmpraw}"
+
+    stop_swtpm
+    info "TPM enrollment complete with PIN + PCR23"
 }
 
 #=============================================================================
@@ -468,6 +603,16 @@ case "${1:-}" in
         check_deps; setup_test_dir; create_test_disk; enroll_tpm_pin
         start_swtpm_for_enrollment; generate_pcrlock; stop_swtpm
         build_initramfs_tui; run_qemu_tpm "${2:-}" ;;
+    enroll-tpm-pin-pcr)
+        check_deps; setup_test_dir; enroll_tpm_pin_pcr ;;
+    all-tpm-pin-pcr)
+        check_deps; setup_test_dir; create_test_disk; enroll_tpm_pin_pcr
+        build_initramfs; run_qemu_tpm "${2:-}" ;;
+    all-tpm-pin-pcr-tui)
+        check_deps; setup_test_dir; create_test_disk; enroll_tpm_pin_pcr
+        build_initramfs_tui; run_qemu_tpm "${2:-}" ;;
+    export-token)
+        export_token ;;
     clean)
         clean ;;
     *)
@@ -488,15 +633,21 @@ Run Commands:
   all [kernel]       Full test: build, disk, run (debug mode)
   all-tui [kernel]   Full test: build-tui, disk, run (TUI mode)
 
-TPM Commands:
+    TPM Commands:
   tpm [kernel]       Run QEMU with swtpm (debug mode)
-  tpm-tui [kernel]   Run QEMU with swtpm (TUI mode, use build-tui first)
-  enroll-tpm         Enroll TPM2 token (no PIN)
-  enroll-tpm-pin     Enroll TPM2 token with PIN (default: 1234)
+  tpm-tui [kernel]  Run QEMU with swtpm (TUI mode, use build-tui first)
+  enroll-tpm         Enroll TPM2 token (no PIN, no PCRs)
+  enroll-tpm-pin     Enroll TPM2 token with PIN (no PCRs)
+  enroll-tpm-pin-pcr Enroll TPM2 token with PIN + PCR23
   all-tpm [kernel]   Full TPM test: disk, enroll, build, run (debug mode)
   all-tpm-tui [kernel] Full TPM test with TUI mode
   all-tpm-pin [kernel] Full TPM test with PIN (debug mode)
   all-tpm-pin-tui [kernel] Full TPM test with PIN and TUI mode
+  all-tpm-pin-pcr [kernel] Full TPM test with PIN + PCR23 (debug mode)
+  all-tpm-pin-pcr-tui [kernel] Full TPM test with PIN + PCR23 and TUI mode
+
+Debug Commands:
+  export-token       Export TPM token from test disk and sleep 2s for capture
 
 Maintenance:
   clean              Remove all test files

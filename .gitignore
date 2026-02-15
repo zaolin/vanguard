@@ -3,10 +3,8 @@
 *.exe
 
 # Embedded init binaries (built by make)
-cmd/vanguard/embed/init
-cmd/vanguard/embed/init-debug
-cmd/vanguard/embed/init-strict
-cmd/vanguard/embed/init-debug-strict
+cmd/vanguard/embed/init*
+
 
 # Test directory
 test/

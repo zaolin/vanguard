@@ -21,12 +21,11 @@ echo -n "${LUKS_PASS}" > "$PASSFILE"
 # Build cryptenroll arguments
 ENROLL_ARGS=(
     --tpm2-device="swtpm:path=${TPM_SOCKET}"
-    --tpm2-pcrs=
     --wipe-slot=tpm2
     --unlock-key-file="$PASSFILE"
 )
 
-# Add pcrlock policy if provided
+# Add pcrlock policy if provided (this handles PCR policy internally)
 if [ -n "$PCRLOCK_JSON" ] && [ -f "$PCRLOCK_JSON" ]; then
     ENROLL_ARGS+=(--tpm2-pcrlock="$PCRLOCK_JSON")
     echo "Enrolling with pcrlock policy: $PCRLOCK_JSON"
