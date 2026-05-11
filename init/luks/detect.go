@@ -9,6 +9,7 @@ import (
 	"os"
 
 	"github.com/zaolin/vanguard/init/buildtags"
+	intpm "github.com/zaolin/vanguard/internal/tpm"
 )
 
 // TPM2TokenStrategy represents the type of TPM2 token strategy.
@@ -23,11 +24,12 @@ const (
 
 // TokenDetectionResult contains the detection result for TPM2 token strategy.
 type TokenDetectionResult struct {
-	Strategy     TPM2TokenStrategy
-	Token        *TPM2Token
-	PCRLockPath  string
-	HasPCRLockNV bool
-	HasPCRPolicy bool
+	Strategy      TPM2TokenStrategy
+	Token         *TPM2Token
+	PCRLockPath   string
+	PCRLockPolicy *intpm.PCRLockPolicy
+	HasPCRLockNV  bool
+	HasPCRPolicy  bool
 }
 
 // DetectTPM2TokenStrategy analyzes the LUKS2 header to determine the correct unseal strategy.
@@ -74,6 +76,19 @@ func DetectTPM2TokenStrategy(devicePath string) (*TokenDetectionResult, error) {
 		result.PCRLockPath = pcrlockPath
 		result.Strategy = StrategyPCRLock
 		buildtags.Debug("luks: detected PCRLock strategy (pcrlock.json found at %s)\n", pcrlockPath)
+
+		policyData, err := os.ReadFile(pcrlockPath)
+		if err == nil {
+			policy, parseErr := intpm.ParsePCRLockJSON(policyData)
+			if parseErr == nil {
+				result.PCRLockPolicy = policy
+				buildtags.Debug("luks: parsed pcrlock.json - NV=0x%x, %d PCR predictions\n",
+					policy.NVIndex, len(policy.PCRPredictions))
+			} else {
+				buildtags.Debug("luks: failed to parse pcrlock.json: %v\n", parseErr)
+			}
+		}
+
 		return result, nil
 	}
 

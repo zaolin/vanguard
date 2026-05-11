@@ -67,7 +67,33 @@ func Start() error {
 	// Wait briefly for daemon to initialize
 	time.Sleep(100 * time.Millisecond)
 
+	// Write db_persist udev rule for DM devices so they survive switch_root.
+	// This matches dracut-ng's modules.d/70dm/11-dm.rules behavior.
+	// Without db_persist, initrd-udevadm-cleanup-db.service deletes all
+	// DM device database entries during switch_root, causing /dev/mapper/*
+	// and /dev/<vg>/<lv> symlinks to disappear in the real system.
+	if err := writeDBPersistRule(); err != nil {
+		console.DebugPrint("udev: db_persist rule write failed: %v\n", err)
+	}
+
+	// Reload udev rules so the db_persist rule takes effect
+	reloadCmd := exec.Command(udevadmPaths[0], "control", "--reload")
+	reloadCmd.Run()
+
 	return nil
+}
+
+func writeDBPersistRule() error {
+	if err := os.MkdirAll("/run/udev/rules.d", 0755); err != nil {
+		return err
+	}
+	return os.WriteFile("/run/udev/rules.d/99-dm-persist.rules", []byte(
+		"SUBSYSTEM!=\"block\", GOTO=\"dm_persist_end\"\n"+
+			"KERNEL!=\"dm-[0-9]*\", GOTO=\"dm_persist_end\"\n"+
+			"ACTION!=\"add|change\", GOTO=\"dm_persist_end\"\n"+
+			"OPTIONS+=\"db_persist\"\n"+
+			"LABEL=\"dm_persist_end\"\n",
+	), 0644)
 }
 
 // Trigger triggers udev events for existing devices
@@ -124,27 +150,12 @@ func Settle(timeout time.Duration) error {
 	return cmd.Run()
 }
 
-// CleanupDB cleans up the udev database before switch_root.
-// Device-mapper devices with db_persist flag will survive this cleanup,
-// allowing systemd on the real root to see them.
+// CleanupDB is no longer needed - db_persist udev rule (99-dm-persist.rules)
+// automatically preserves DM device database entries across switch_root.
+// The cleanup happens implicitly when udevd stops gracefully.
 func CleanupDB() error {
-	udevadm := findBinary(udevadmPaths)
-	if udevadm == "" {
-		return nil
-	}
-
-	console.DebugPrint("udev: cleaning up database (db_persist devices will survive)\n")
-	cmd := exec.Command(udevadm, "info", "--cleanup-db")
-
-	// Redirect output to /dev/null to avoid TUI interference
-	devNull, _ := os.OpenFile("/dev/null", os.O_WRONLY, 0)
-	if devNull != nil {
-		cmd.Stdout = devNull
-		cmd.Stderr = devNull
-		defer devNull.Close()
-	}
-
-	return cmd.Run()
+	console.DebugPrint("udev: db_persist rule handles DM device persistence\n")
+	return nil
 }
 
 // Stop terminates udevd daemon gracefully using SIGTERM.

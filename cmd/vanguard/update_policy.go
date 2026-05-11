@@ -108,8 +108,11 @@ func (c *UpdatePolicyCmd) Run() error {
 	fmt.Println("[4/5] Verifying policy...")
 
 	if !c.NoVerify {
-		// Require PCR 4 (boot loader) and PCR 7 (secure boot)
-		requiredPCRs := []int{4, 7}
+		// Require PCR 7 (Secure Boot) as minimum binding
+		// PCR 4 (boot loader) is ideal but firmware-specific events
+		// (e.g. "Returning from EFI Application from Boot Option")
+		// often prevent systemd-pcrlock from predicting it reliably.
+		requiredPCRs := []int{7}
 
 		if err := pcrlock.VerifyPolicy(c.PolicyOutput, requiredPCRs); err != nil {
 			return fmt.Errorf("policy verification failed: %w", err)

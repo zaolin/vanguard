@@ -3,6 +3,7 @@ package main
 import (
 	"bufio"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -297,8 +298,8 @@ func runGenerate(cfg *config.Config) error {
 
 	// Find binaries - search multiple paths for each
 	binarySearchPaths := map[string][]string{
-		"lvm":        {"/usr/sbin/lvm", "/sbin/lvm"},
-		"dmsetup":    {"/sbin/dmsetup", "/usr/sbin/dmsetup", "/usr/bin/dmsetup"}, // Required by udev dm rules at /sbin/dmsetup
+		"lvm":           {"/usr/sbin/lvm", "/sbin/lvm"},
+		"dmsetup":       {"/sbin/dmsetup", "/usr/sbin/dmsetup", "/usr/bin/dmsetup"}, // Required by udev dm rules at /sbin/dmsetup
 		"systemd-udevd": {"/usr/lib/systemd/systemd-udevd", "/lib/systemd/systemd-udevd", "/sbin/udevd"},
 		"udevadm":       {"/usr/bin/udevadm", "/sbin/udevadm", "/bin/udevadm"},
 		// Vconsole support
@@ -630,6 +631,18 @@ LABEL="dm_persist_end"
 		}
 	}
 
+	// Add keymap data files so loadkeys can set the keyboard layout in the initramfs
+	keymapDataDirs := []string{"/usr/share/kbd/keymaps", "/lib/kbd/keymaps", "/usr/lib/kbd/keymaps"}
+	for _, dir := range keymapDataDirs {
+		if _, err := os.Stat(dir); err == nil {
+			keymapCount := addKeymapFiles(archive, dir)
+			if keymapCount > 0 {
+				fmt.Printf("  added %d keymap files from %s\n", keymapCount, dir)
+			}
+			break
+		}
+	}
+
 	// Add essential device nodes
 	if err := archive.AddDeviceNode("dev/console", 0600, 'c', 5, 1); err != nil {
 		fmt.Printf("  warning: failed to add /dev/console: %v\n", err)
@@ -658,4 +671,26 @@ LABEL="dm_persist_end"
 	fmt.Printf("vanguard: generated %s (%d bytes)\n", cfg.Output, info.Size())
 
 	return nil
+}
+
+// addKeymapFiles recursively adds keymap data files from the given directory to the archive.
+// It walks the directory tree and adds each .map, .map.gz, .map.bz2, and .kmap file.
+func addKeymapFiles(archive *intcpio.Archive, rootDir string) int {
+	count := 0
+	filepath.WalkDir(rootDir, func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return nil
+		}
+		name := d.Name()
+		if strings.HasSuffix(name, ".map") || strings.HasSuffix(name, ".map.gz") ||
+			strings.HasSuffix(name, ".map.bz2") || strings.HasSuffix(name, ".kmap") ||
+			strings.HasSuffix(name, ".kmap.gz") {
+			dstPath := path[1:] // strip leading /
+			if err := archive.AddFileFromDisk(path, dstPath); err == nil {
+				count++
+			}
+		}
+		return nil
+	})
+	return count
 }

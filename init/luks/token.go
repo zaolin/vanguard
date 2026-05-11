@@ -8,7 +8,7 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/anatol/luks.go"
+	lk "github.com/zaolin/vanguard/internal/luks"
 	"github.com/zaolin/vanguard/init/buildtags"
 	intpm "github.com/zaolin/vanguard/internal/tpm"
 )
@@ -35,6 +35,8 @@ type TPM2Token struct {
 	PCRLockNV uint32
 	// SRKHandle is a persistent SRK handle (0 = create transient SRK).
 	SRKHandle uint32
+	// SRKData is the serialized SRK public data (tpm2_srk from systemd v255+).
+	SRKData []byte
 	// Keyslots are the LUKS keyslots this token unlocks.
 	Keyslots []int
 }
@@ -59,7 +61,7 @@ type systemdTPM2TokenPayload struct {
 }
 
 // ParseTPM2Token parses a luks.Token into a TPM2Token.
-func ParseTPM2Token(token luks.Token) (*TPM2Token, error) {
+func ParseTPM2Token(token lk.Token) (*TPM2Token, error) {
 	if token.Type != "systemd-tpm2" {
 		return nil, errors.New("not a systemd-tpm2 token")
 	}
@@ -146,9 +148,17 @@ func ParseTPM2Token(token luks.Token) (*TPM2Token, error) {
 		buildtags.Debug("tpm2 token: PIN-only mode (no PCRs)\n")
 	}
 
-	// Note: tpm2_srk in systemd v255+ is not a handle but SRK public data
-	// For now, we only support the tpm2-srk handle variant (hyphen format)
+	// Note: tpm2_srk in systemd v255+ is base64-encoded SRK public data
+	// Earlier versions use numeric handle (tpm2-srk)
 	srkHandle := payload.SRKHandle
+	var srkData []byte
+	if payload.SRKDataAlt != "" {
+		srkData, err = base64.StdEncoding.DecodeString(payload.SRKDataAlt)
+		if err != nil {
+			return nil, fmt.Errorf("failed to decode SRK data: %w", err)
+		}
+		buildtags.Debug("  srk data decoded: %d bytes\n", len(srkData))
+	}
 
 	return &TPM2Token{
 		Blob:       blob,
@@ -161,6 +171,7 @@ func ParseTPM2Token(token luks.Token) (*TPM2Token, error) {
 		UsePCRLock: usePCRLock,
 		PCRLockNV:  pcrlockNV,
 		SRKHandle:  srkHandle,
+		SRKData:    srkData,
 		Keyslots:   token.Slots,
 	}, nil
 }
@@ -168,7 +179,8 @@ func ParseTPM2Token(token luks.Token) (*TPM2Token, error) {
 // Unseal uses the TPM to unseal the LUKS password.
 // If PIN is required, it should be provided as a hashed value.
 // skipPolicyHashVerify should be true for PIN-only tokens (no PCRs).
-func (t *TPM2Token) Unseal(tpmClient *intpm.Client, pin []byte, skipPolicyHashVerify bool) ([]byte, error) {
+// pcrlockPolicy contains PCR predictions from pcrlock.json (nil if not available).
+func (t *TPM2Token) Unseal(tpmClient *intpm.Client, pin []byte, skipPolicyHashVerify bool, pcrlockPolicy *intpm.PCRLockPolicy) ([]byte, error) {
 	// Parse the blob to extract private and public key material
 	private, public, err := intpm.ParseBlob(t.Blob)
 	if err != nil {
@@ -188,12 +200,6 @@ func (t *TPM2Token) Unseal(tpmClient *intpm.Client, pin []byte, skipPolicyHashVe
 	}
 
 	buildtags.Debug("tpm token debug: PIN received (len=%d), Salt (len=%d)\n", len(pin), len(t.Salt))
-	if len(pin) > 0 {
-		buildtags.Debug("tpm token debug: PIN value (hex): %x\n", pin)
-	}
-	if len(t.Salt) > 0 {
-		buildtags.Debug("tpm token debug: Salt value (hex): %x\n", t.Salt)
-	}
 
 	// Build unseal options
 	opts := intpm.UnsealOpts{
@@ -203,14 +209,32 @@ func (t *TPM2Token) Unseal(tpmClient *intpm.Client, pin []byte, skipPolicyHashVe
 		Bank:                 bank,
 		PolicyHash:           t.PolicyHash,
 		AuthValue:            authValue,
-		Salt:                 t.Salt, // For PBKDF2 PIN derivation
+		Salt:                 t.Salt,
 		PrimaryAlg:           t.PrimaryAlg,
 		UsePCRLock:           t.UsePCRLock,
 		PCRLockNV:            t.PCRLockNV,
 		SRKHandle:            t.SRKHandle,
+		SRKData:              t.SRKData,
 		SkipPolicyHashVerify: skipPolicyHashVerify,
 	}
 
-	// Call TPM unseal - returns the raw password bytes
-	return tpmClient.UnsealWithOpts(opts)
+	if pcrlockPolicy != nil {
+		opts.PCRPredictions = pcrlockPolicy.PCRPredictions
+		if pcrlockPolicy.NVIndex != 0 && opts.PCRLockNV == 0 {
+			opts.PCRLockNV = pcrlockPolicy.NVIndex
+		}
+		opts.Bank = pcrlockPolicy.Bank
+	}
+
+	result, err := tpmClient.UnsealWithOpts(opts)
+	if err != nil {
+		return nil, err
+	}
+
+	// systemd-cryptenroll stores the TPM-sealed secret base64-encoded as the LUKS2 passphrase.
+	// The unlock path must base64-encode the unsealed secret before passing it to LUKS2.
+	// See: src/cryptsetup/cryptsetup-token-systemd-tpm2.c in the systemd repo.
+	encoded := base64.StdEncoding.EncodeToString(result)
+	buildtags.Debug("tpm token: unsealed %d bytes, base64-encoded to %d chars for LUKS2\n", len(result), len(encoded))
+	return []byte(encoded), nil
 }

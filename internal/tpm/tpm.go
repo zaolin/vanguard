@@ -43,20 +43,28 @@ const (
 	AlgSHA512 = tpm2.TPMAlgSHA512
 )
 
+// PCRPrediction represents a predicted PCR value with one or more variants.
+type PCRPrediction struct {
+	PCR    int      // PCR index (0-23)
+	Values [][]byte // Predicted PCR digest values (hex-decoded)
+}
+
 // UnsealOpts contains options for unsealing a TPM-protected secret.
 type UnsealOpts struct {
-	Public               []byte        // TPM public blob
-	Private              []byte        // TPM private blob
-	PCRs                 []int         // PCR indices (empty for pcrlock)
-	Bank                 HashAlgorithm // PCR hash algorithm
-	PolicyHash           []byte        // Expected policy hash
-	AuthValue            []byte        // PIN/password (raw)
-	Salt                 []byte        // Salt for PBKDF2 (systemd uses this)
-	PrimaryAlg           string        // "ecc" or "rsa"
-	UsePCRLock           bool          // True for pcrlock-based tokens
-	PCRLockNV            uint32        // NV index for pcrlock (0 = default 0x01c20000)
-	SRKHandle            uint32        // Persistent SRK handle (0 = create transient)
-	SkipPolicyHashVerify bool          // Skip policy hash verification (for PIN-only tokens)
+	Public               []byte          // TPM public blob
+	Private              []byte          // TPM private blob
+	PCRs                 []int           // PCR indices (empty for pcrlock)
+	Bank                 HashAlgorithm   // PCR hash algorithm
+	PolicyHash           []byte          // Expected policy hash
+	AuthValue            []byte          // PIN/password (raw)
+	Salt                 []byte          // Salt for PBKDF2 (systemd uses this) - ONLY for enrollment
+	PrimaryAlg           string          // "ecc" or "rsa"
+	UsePCRLock           bool            // True for pcrlock-based tokens
+	PCRLockNV            uint32          // NV index for pcrlock (0 = default 0x01c20000)
+	SRKHandle            uint32          // Persistent SRK handle (0 = create transient)
+	SRKData              []byte          // Serialized SRK public data (tpm2_srk from systemd v255+)
+	SkipPolicyHashVerify bool            // Skip policy hash verification (for PIN-only tokens)
+	PCRPredictions       []PCRPrediction // Predicted PCR values for pcrlock super-PCR policy
 }
 
 // LockoutStatus contains TPM dictionary attack lockout information.
@@ -244,6 +252,14 @@ func (c *Client) Unseal(public, private []byte, pcrs []int, bank HashAlgorithm, 
 // UnsealWithOpts unseals data using the TPM with the given options.
 // This is the main entry point for unsealing systemd-tpm2 tokens.
 func (c *Client) UnsealWithOpts(opts UnsealOpts) ([]byte, error) {
+	buildtags.Debug("tpm: === UnsealWithOpts starting ===\n")
+	buildtags.Debug("tpm: UsePCRLock: %v\n", opts.UsePCRLock)
+	buildtags.Debug("tpm: Needs auth: %v\n", len(opts.AuthValue) > 0)
+	buildtags.Debug("tpm: PCRLockNV: 0x%x\n", opts.PCRLockNV)
+	buildtags.Debug("tpm: PolicyHash: %x\n", opts.PolicyHash)
+	buildtags.Debug("tpm: SRKData length: %d\n", len(opts.SRKData))
+	buildtags.Debug("tpm: SRKHandle: 0x%x\n", opts.SRKHandle)
+
 	tpm, err := c.openTPM()
 	if err != nil {
 		return nil, err
@@ -254,8 +270,17 @@ func (c *Client) UnsealWithOpts(opts UnsealOpts) ([]byte, error) {
 	var srk tpm2.AuthHandle
 	var srkCleanup func()
 
-	if opts.SRKHandle != 0 {
+	// Priority: SRKData (tpm2_srk) > SRKHandle > create transient
+	if len(opts.SRKData) > 0 {
+		// Load SRK from public data (systemd v255+ format)
+		buildtags.Debug("tpm: SRK source: tpm2_srk data (%d bytes)\n", len(opts.SRKData))
+		srk, srkCleanup, err = c.loadExternalSRK(tpm, opts.SRKData)
+		if err != nil {
+			return nil, fmt.Errorf("failed to load SRK from data: %w", err)
+		}
+	} else if opts.SRKHandle != 0 {
 		// Use persistent SRK - read its name for AuthHandle
+		buildtags.Debug("tpm: SRK source: persistent handle 0x%x\n", opts.SRKHandle)
 		pubRsp, err := tpm2.ReadPublic{ObjectHandle: tpm2.TPMHandle(opts.SRKHandle)}.Execute(tpm)
 		if err != nil {
 			return nil, fmt.Errorf("failed to read persistent SRK: %w", err)
@@ -268,18 +293,21 @@ func (c *Client) UnsealWithOpts(opts UnsealOpts) ([]byte, error) {
 		srkCleanup = func() {}
 	} else {
 		// Create transient SRK matching the algorithm used during enrollment
+		buildtags.Debug("tpm: SRK source: transient (PrimaryAlg=%s)\n", opts.PrimaryAlg)
 		srk, srkCleanup, err = c.createSRK(tpm, opts.PrimaryAlg)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create primary: %w", err)
 		}
 	}
 	defer srkCleanup()
+	buildtags.Debug("tpm: SRK handle: 0x%x, name: %x\n", srk.Handle, srk.Name)
 
 	// Parse the systemd blob format
 	pub, priv, err := parseSystemdBlob(opts.Public, opts.Private)
 	if err != nil {
 		return nil, fmt.Errorf("failed to parse blob: %w", err)
 	}
+	buildtags.Debug("tpm: Blob parsed - public: %d bytes, private: %d bytes\n", len(pub), len(priv))
 
 	// Load the sealed object
 	loadRsp, err := tpm2.Load{
@@ -291,8 +319,10 @@ func (c *Client) UnsealWithOpts(opts UnsealOpts) ([]byte, error) {
 		return nil, fmt.Errorf("failed to load object: %w", err)
 	}
 	defer tpm2.FlushContext{FlushHandle: loadRsp.ObjectHandle}.Execute(tpm)
+	buildtags.Debug("tpm: Sealed object loaded - handle: 0x%x, name: %x\n", loadRsp.ObjectHandle, loadRsp.Name)
 
 	needsAuth := len(opts.AuthValue) > 0
+	buildtags.Debug("tpm: Calling unseal function - UsePCRLock=%v, needsAuth=%v\n", opts.UsePCRLock, needsAuth)
 
 	// For pcrlock tokens, use PolicyAuthorizeNV
 	if opts.UsePCRLock {
@@ -311,98 +341,102 @@ func parseSystemdBlob(public, private []byte) ([]byte, []byte, error) {
 	return public, private, nil
 }
 
+// isValidNVIndex checks if an NV index is in a valid range for owner or platform hierarchy.
+// NV index ranges:
+//   - Owner hierarchy: 0x01800000 - 0x01FFFFFF
+//   - Platform hierarchy: 0x02000000 - 0x02FFFFFF
+//   - 0x18188a3 is an invalid NV index (falls outside valid ranges)
+func isValidNVIndex(index uint32) bool {
+	if index == 0 {
+		return false
+	}
+	// Check owner hierarchy range (0x01800000 - 0x01FFFFFF)
+	if index >= 0x01800000 && index <= 0x01FFFFFF {
+		return true
+	}
+	// Check platform hierarchy range (0x02000000 - 0x02FFFFFF)
+	if index >= 0x02000000 && index <= 0x02FFFFFF {
+		return true
+	}
+	return false
+}
+
 // unsealWithPCRLock handles pcrlock-based tokens (systemd v255+)
-// This uses PolicyAuthorizeNV which is natively supported by google/go-tpm.
+// The correct sequence is:
+//  1. Build super-PCR policy on the session (PolicyPCR + PolicyOR for multi-value PCRs)
+//  2. Call PolicyAuthorizeNV (which checks session digest matches NV index contents)
+//  3. Call PolicyAuthValue if PIN is needed
+//  4. Unseal
 func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse, opts UnsealOpts, needsAuth bool) ([]byte, error) {
 	nvIndex := opts.PCRLockNV
 
-	// If NV index is not provided or looks invalid, try to find it in the TPM
-	if nvIndex == 0 || nvIndex == 0x18188a3 {
+	if !isValidNVIndex(nvIndex) {
 		buildtags.Debug("tpm: NV index from token (0x%x) looks invalid, searching TPM...\n", nvIndex)
 		foundIndex, err := c.FindPCRLockNVIndex()
 		if err != nil {
 			buildtags.Debug("tpm: failed to find PCRLock NV index: %v\n", err)
 		} else if foundIndex != 0 {
 			nvIndex = foundIndex
-			buildtags.Debug("tpm: using found NV index: 0x%x\n", nvIndex)
 		} else {
-			// Fall back to default
 			nvIndex = DefaultPCRLockNV
-			buildtags.Debug("tpm: using default NV index: 0x%x\n", nvIndex)
 		}
+		buildtags.Debug("tpm: using NV index: 0x%x\n", nvIndex)
 	}
 
-	// Debug: Show current PCR values
-	buildtags.Debug("tpm: Reading current PCR values from TPM...\n")
-	pcrValues, err := c.ReadAllPCRValues(AlgSHA256)
+	buildtags.Debug("tpm: Reading NV public for index 0x%x...\n", nvIndex)
+	nvReadPublicRsp, err := tpm2.NVReadPublic{
+		NVIndex: tpm2.TPMHandle(nvIndex),
+	}.Execute(tpm)
 	if err != nil {
-		buildtags.Debug("tpm: Failed to read PCR values: %v\n", err)
-	} else {
-		buildtags.Debug("tpm: Current PCR values (sha256):\n")
-		for pcr, val := range pcrValues {
-			buildtags.Debug("tpm:   PCR %d: %x\n", pcr, val)
+		return nil, fmt.Errorf("NVReadPublic failed for 0x%x: %w", nvIndex, err)
+	}
+	buildtags.Debug("tpm: NV index 0x%x, NV Name (%d bytes): %x\n", nvIndex, len(nvReadPublicRsp.NVName.Buffer), nvReadPublicRsp.NVName.Buffer)
+
+	hasPredictions := len(opts.PCRPredictions) > 0
+	if hasPredictions {
+		buildtags.Debug("tpm: have %d PCR predictions from pcrlock.json\n", len(opts.PCRPredictions))
+		for _, pred := range opts.PCRPredictions {
+			buildtags.Debug("tpm:   PCR %d: %d variant(s)\n", pred.PCR, len(pred.Values))
 		}
+	} else {
+		buildtags.Debug("tpm: WARNING: no PCR predictions provided, PolicyAuthorizeNV will likely fail\n")
 	}
 
-	// Try different auth value formats
 	authVariants := []struct {
 		value []byte
 		name  string
 	}{{nil, "none"}}
 
 	if needsAuth && len(opts.AuthValue) > 0 {
-		// When salt is available, use PBKDF2-HMAC-SHA256 (systemd's method)
-		// systemd's exact auth derivation:
-		// 1. PIN + Salt → PBKDF2 → salted_pin (32 bytes)
-		// 2. salted_pin → Base64 encode → b64_string
-		// 3. b64_string → SHA256 → hash
-		// 4. hash → trim trailing zeros → auth_value
+		var authValue []byte
+		var authName string
 		if len(opts.Salt) > 0 {
-			pbkdf2Key := DeriveAuthValue(string(opts.AuthValue), opts.Salt)
-			b64String := base64.StdEncoding.EncodeToString(pbkdf2Key)
-			authValue := computeAuthValue([]byte(b64String))
-
-			// Debug output for auth derivation
-			buildtags.Debug("tpm: Auth derivation - PIN: %s\n", opts.AuthValue)
-			buildtags.Debug("tpm: Auth derivation - Salt: %x\n", opts.Salt)
-			buildtags.Debug("tpm: Auth derivation - PBKDF2 key: %x\n", pbkdf2Key)
-			buildtags.Debug("tpm: Auth derivation - B64 string: %s\n", b64String)
-			buildtags.Debug("tpm: Auth derivation - Final auth value: %x\n", authValue)
-
-			authVariants = []struct {
-				value []byte
-				name  string
-			}{
-				{authValue, "pbkdf2+b64+sha256+trim"},
-				{nil, "empty"},
-			}
+			authValue = DerivePinAuthSalted(string(opts.AuthValue), opts.Salt)
+			authName = "pbkdf2+b64+sha256+trim"
+			buildtags.Debug("tpm: PIN auth value length=%d (%s, salt=%d bytes)\n", len(authValue), authName, len(opts.Salt))
 		} else {
-			// No salt - try legacy methods
-			hashedPIN := HashPIN(string(opts.AuthValue))
-			buildtags.Debug("tpm: Auth derivation (no salt) - PIN: %s\n", opts.AuthValue)
-			buildtags.Debug("tpm: Auth derivation (no salt) - SHA256 hash: %x\n", hashedPIN)
-			authVariants = []struct {
-				value []byte
-				name  string
-			}{
-				{hashedPIN, "sha256-hashed"},
-				{opts.AuthValue, "raw"},
-			}
+			authValue = DerivePinAuthUnseal(string(opts.AuthValue))
+			authName = "sha256+trim"
+			buildtags.Debug("tpm: PIN auth value length=%d (%s, no salt)\n", len(authValue), authName)
+		}
+
+		authVariants = []struct {
+			value []byte
+			name  string
+		}{
+			{authValue, authName},
+			{nil, "empty"},
 		}
 	}
 
 	var lastErr error
 	for _, auth := range authVariants {
-		// Create policy session with auth value BOUND to the loaded object
-		// When using PolicyAuthValue, the auth value must be bound to the entity
 		var sess tpm2.Session
 		var cleanup func() error
 		var err error
 
 		if needsAuth && len(auth.value) > 0 {
-			// Bound() ties the auth value to the specific object we're unsealing
-			sess, cleanup, err = tpm2.PolicySession(tpm, tpm2.TPMAlgSHA256, 16,
-				tpm2.Bound(loadRsp.ObjectHandle, loadRsp.Name, auth.value))
+			sess, cleanup, err = newFixedAuthPolicySession(tpm, auth.value)
 		} else {
 			sess, cleanup, err = tpm2.PolicySession(tpm, tpm2.TPMAlgSHA256, 16)
 		}
@@ -410,48 +444,28 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 			return nil, fmt.Errorf("failed to create policy session: %w", err)
 		}
 
-		buildtags.Debug("tpm: Policy session created - handle: 0x%x, bound: %v, auth.value: %s\n",
-			sess.Handle(), len(auth.value) > 0, auth.name)
+		buildtags.Debug("tpm: policy session 0x%x created (auth=%s)\n", sess.Handle(), auth.name)
 
-		// PolicyAuthorizeNV is the key command for pcrlock
-		// According to systemd's research, the policy hash is computed as:
-		// SHA256(TPM2_CC_PolicyAuthorizeNV || NV_Index_Name)
-		// So we call PolicyAuthorizeNV FIRST to extend the policy digest
-		// Then call PolicyAuthValue if needed for PIN
+		// Step 1: Build super-PCR policy on the session
+		// This makes the session digest match what's stored in the NV index
+		if hasPredictions {
+			buildtags.Debug("tpm: building super-PCR policy on session...\n")
+			if err := buildSuperPCRPolicySession(tpm, opts.Bank, opts.PCRPredictions, sess); err != nil {
+				cleanup()
+				lastErr = fmt.Errorf("build super-PCR policy: %w", err)
+				continue
+			}
 
-		// First, read the NV index to get its Name (required for PolicyAuthorizeNV)
-		buildtags.Debug("tpm: PolicyAuthorizeNV - using NV index: 0x%x\n", nvIndex)
-		nvReadPublicRsp, err := tpm2.NVReadPublic{
-			NVIndex: tpm2.TPMHandle(nvIndex),
-		}.Execute(tpm)
-		if err != nil {
-			cleanup()
-			lastErr = fmt.Errorf("NVReadPublic failed: %w", err)
-			continue
-		}
-
-		buildtags.Debug("tpm: PolicyAuthorizeNV - NV Name: %x\n", nvReadPublicRsp.NVName)
-		buildtags.Debug("tpm: PolicyAuthorizeNV - NV Public: %x\n", nvReadPublicRsp.NVPublic)
-		buildtags.Debug("tpm: PolicyAuthorizeNV - Policy session handle: 0x%x\n", sess.Handle())
-		buildtags.Debug("tpm: PolicyAuthorizeNV - Auth name: %s\n", auth.name)
-
-		// Debug: Get current policy digest in session
-		digestRsp, err := tpm2.PolicyGetDigest{PolicySession: sess.Handle()}.Execute(tpm)
-		if err == nil {
-			buildtags.Debug("tpm: Policy digest before PolicyAuthorizeNV: %x\n", digestRsp.PolicyDigest.Buffer)
-
-			// Debug: Compare token policy-hash with computed policy digest
-			if len(opts.PolicyHash) > 0 {
-				buildtags.Debug("tpm: Policy comparison - token hash: %x\n", opts.PolicyHash)
-				buildtags.Debug("tpm: Policy comparison - computed digest: %x\n", digestRsp.PolicyDigest.Buffer)
-				buildtags.Debug("tpm: Policy comparison - match: %v\n",
-					bytes.Equal(digestRsp.PolicyDigest.Buffer, opts.PolicyHash))
+			digestRsp, debugErr := tpm2.PolicyGetDigest{PolicySession: sess.Handle()}.Execute(tpm)
+			if debugErr == nil {
+				buildtags.Debug("tpm: session digest after super-PCR policy: %x\n", digestRsp.PolicyDigest.Buffer)
 			}
 		}
 
-		// Use owner auth for authorization (empty password)
-		// The NVIndex must be a NamedHandle with the Name from NV_ReadPublic
-		buildtags.Debug("tpm: Calling PolicyAuthorizeNV...\n")
+		// Step 2: PolicyAuthorizeNV
+		// The TPM reads the NV index contents and compares with the current session digest.
+		// If they match, the session digest is replaced with Hash(0 || CC_PolicyAuthorizeNV || NV_Name)
+		buildtags.Debug("tpm: calling PolicyAuthorizeNV with NV index 0x%x...\n", nvIndex)
 		_, err = tpm2.PolicyAuthorizeNV{
 			AuthHandle:    tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
 			NVIndex:       tpm2.NamedHandle{Handle: tpm2.TPMHandle(nvIndex), Name: nvReadPublicRsp.NVName},
@@ -463,42 +477,60 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 			continue
 		}
 
-		// After PolicyAuthorizeNV, call PolicyAuthValue if PIN is needed
-		// This matches systemd's sequence: PolicyAuthorizeNV -> PolicyAuthValue
+		buildtags.Debug("tpm: PolicyAuthorizeNV succeeded\n")
+
+		digestAfterAuthNV, debugErr := tpm2.PolicyGetDigest{PolicySession: sess.Handle()}.Execute(tpm)
+		if debugErr == nil {
+			buildtags.Debug("tpm: session digest after PolicyAuthorizeNV: %x\n", digestAfterAuthNV.PolicyDigest.Buffer)
+		} else {
+			buildtags.Debug("tpm: PolicyGetDigest after PolicyAuthorizeNV failed: %v\n", debugErr)
+		}
+
+		// Step 3: PolicyAuthValue if PIN is needed
 		if needsAuth && len(auth.value) > 0 {
-			buildtags.Debug("tpm: Calling PolicyAuthValue after PolicyAuthorizeNV for session 0x%x\n", sess.Handle())
 			_, err := tpm2.PolicyAuthValue{PolicySession: sess.Handle()}.Execute(tpm)
 			if err != nil {
 				cleanup()
-				lastErr = fmt.Errorf("PolicyAuthValue (after PolicyAuthorizeNV) failed: %w", err)
+				lastErr = fmt.Errorf("PolicyAuthValue failed: %w", err)
 				continue
+			}
+			buildtags.Debug("tpm: PolicyAuthValue succeeded\n")
+
+			digestAfterAuthVal, debugErr2 := tpm2.PolicyGetDigest{PolicySession: sess.Handle()}.Execute(tpm)
+			if debugErr2 == nil {
+				buildtags.Debug("tpm: session digest after PolicyAuthValue: %x\n", digestAfterAuthVal.PolicyDigest.Buffer)
+				buildtags.Debug("tpm: expected authPolicy: %x\n", opts.PolicyHash)
+			} else {
+				buildtags.Debug("tpm: PolicyGetDigest after PolicyAuthValue failed: %v\n", debugErr2)
 			}
 		}
 
-		// For pcrlock mode, skip policy-hash verification
-		// The TPM validates the policy via PolicyAuthorizeNV, so we don't need to verify
-		// The stored policy-hash was computed differently by systemd
-		if len(opts.PolicyHash) > 0 {
-			buildtags.Debug("tpm: Skipping policy-hash verification for pcrlock mode (TPM validated via PolicyAuthorizeNV)\n")
-			// Skip the verification - the TPM has already validated the policy
-		}
-
-		// Create handle with policy session as Auth
-		// The session carries the auth value for HMAC computation
+		// Step 4: Unseal
+		// Note: We do NOT pass an extra HMAC session for encryption.
+		// Unseal has no command parameters that require decryption, and
+		// an extra session with Encrypt attribute causes TPM_RC_ATTRIBUTES.
+		// The policy session handles authorization; the TPM returns OutData directly.
 		loadedHandle := tpm2.AuthHandle{
 			Handle: loadRsp.ObjectHandle,
 			Name:   loadRsp.Name,
 			Auth:   sess,
 		}
 
-		// Unseal - session is passed via AuthHandle.Auth, not to Execute()
+		buildtags.Debug("tpm: calling Unseal...\n")
 		unsealRsp, err := tpm2.Unseal{ItemHandle: loadedHandle}.Execute(tpm)
 		cleanup()
 
 		if err == nil {
-			return unsealRsp.OutData.Buffer, nil
+			data := unsealRsp.OutData.Buffer
+			if len(data) > 0 {
+				buildtags.Debug("tpm: Unseal returned %d bytes (first: 0x%02x, last: 0x%02x)\n", len(data), data[0], data[len(data)-1])
+			} else {
+				buildtags.Debug("tpm: Unseal returned 0 bytes (empty)\n")
+			}
+			return data, nil
 		}
 
+		buildtags.Debug("tpm: Unseal failed (auth=%s): %v\n", auth.name, err)
 		lastErr = classifyUnsealError(err)
 		if errors.Is(lastErr, ErrTPMLockout) {
 			return nil, lastErr
@@ -516,36 +548,25 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 }
 
 // unsealWithPCRPolicy handles traditional PCR-bound tokens
-// Following systemd's approach: HMAC session for PIN + Policy session for PCR.
+// unsealWithPCRPolicy handles traditional PCR-bound tokens.
+// Uses a policy session for authorization. No extra HMAC session is needed
+// for Unseal (the TPM returns OutData directly; an extra HMAC session with
+// Encrypt attribute causes TPM_RC_ATTRIBUTES).
 func (c *Client) unsealWithPCRPolicy(tpm transport.TPM, loadRsp *tpm2.LoadResponse, opts UnsealOpts, needsAuth bool) ([]byte, error) {
-	// Determine auth value - systemd uses ONLY ONE variant based on salt:
-	// - If salt exists: PBKDF2-HMAC-SHA256 derived key
-	// - If no salt: raw PIN
 	var authValue []byte
 	var authName string
 
 	if needsAuth && len(opts.AuthValue) > 0 {
 		if len(opts.Salt) > 0 {
-			pbkdf2Key := DeriveAuthValue(string(opts.AuthValue), opts.Salt)
-			// systemd's approach:
-			// 1. PIN + Salt → PBKDF2 → salted_pin (32 bytes)
-			// 2. salted_pin → Base64 encode → b64_string
-			// 3. b64_string → SHA256 → hash
-			// 4. hash → trim trailing zeros → auth value (what the TPM expects)
-			b64String := base64.StdEncoding.EncodeToString(pbkdf2Key)
-			authValue = computeAuthValue([]byte(b64String))
-			authName = "pbkdf2"
-			buildtags.Debug("tpm debug: PIN len=%d, salt len=%d, using PBKDF2+base64+SHA256+trim\n", len(opts.AuthValue), len(opts.Salt))
-			buildtags.Debug("tpm debug: PIN value (hex): %x\n", opts.AuthValue)
-			buildtags.Debug("tpm debug: salt value (hex): %x\n", opts.Salt)
-			buildtags.Debug("tpm debug: pbkdf2 output (len=%d): %x\n", len(pbkdf2Key), pbkdf2Key)
-			buildtags.Debug("tpm debug: b64 string: %s\n", b64String)
-			buildtags.Debug("tpm debug: auth value (len=%d): %x\n", len(authValue), authValue)
+			authValue = DerivePinAuthSalted(string(opts.AuthValue), opts.Salt)
+			authName = "pbkdf2+b64+sha256+trim"
+			buildtags.Debug("tpm debug: PIN len=%d, using %s (salt=%d bytes)\n", len(opts.AuthValue), authName, len(opts.Salt))
 		} else {
-			authValue = opts.AuthValue
-			authName = "raw"
-			buildtags.Debug("tpm debug: PIN len=%d, no salt, using raw\n", len(opts.AuthValue))
+			authValue = DerivePinAuthUnseal(string(opts.AuthValue))
+			authName = "sha256+trim"
+			buildtags.Debug("tpm debug: PIN len=%d, using %s (no salt)\n", len(opts.AuthValue), authName)
 		}
+		buildtags.Debug("tpm debug: auth value length=%d\n", len(authValue))
 	}
 
 	buildtags.Debug("tpm debug: trying auth '%s'\n", authName)
@@ -557,8 +578,7 @@ func (c *Client) unsealWithPCRPolicy(tpm transport.TPM, loadRsp *tpm2.LoadRespon
 	var err error
 
 	if needsAuth && len(authValue) > 0 {
-		// Create Policy session
-		policySess, policyCleanup, err = tpm2.PolicySession(tpm, tpm2.TPMAlgSHA256, 16)
+		policySess, policyCleanup, err = newFixedAuthPolicySession(tpm, authValue)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create policy session: %w", err)
 		}
@@ -572,27 +592,45 @@ func (c *Client) unsealWithPCRPolicy(tpm transport.TPM, loadRsp *tpm2.LoadRespon
 		}
 
 		buildtags.Debug("tpm debug: Policy session with PolicyAuthValue\n")
+
+		digestRsp, debugErr := tpm2.PolicyGetDigest{PolicySession: policySess.Handle()}.Execute(tpm)
+		if debugErr == nil {
+			buildtags.Debug("tpm debug: session digest after PolicyAuthValue: %x\n", digestRsp.PolicyDigest.Buffer)
+			buildtags.Debug("tpm debug: expected authPolicy: %x\n", opts.PolicyHash)
+		}
 	}
 
 	// Create handle with Policy session for authorization
+	auth := policySess
+	if auth == nil {
+		auth = tpm2.PasswordAuth(nil)
+	}
 	loadedHandle := tpm2.AuthHandle{
 		Handle: loadRsp.ObjectHandle,
 		Name:   loadRsp.Name,
-		Auth:   policySess,
+		Auth:   auth,
 	}
 
-	// Unseal with Policy session
+	// Unseal with policy session only (no extra HMAC session).
+	// Unseal has no command parameters that require decryption, and
+	// an extra session with Encrypt attribute causes TPM_RC_ATTRIBUTES.
+	buildtags.Debug("tpm debug: Calling Unseal with policy session (auth, no extra session)\n")
 	var unsealRsp *tpm2.UnsealResponse
 	unsealRsp, err = tpm2.Unseal{ItemHandle: loadedHandle}.Execute(tpm)
 
-	// Cleanup session
+	// Cleanup sessions
 	if policyCleanup != nil {
 		policyCleanup()
 	}
 
 	if err == nil {
-		buildtags.Debug("tpm debug: unseal succeeded with '%s'\n", authName)
-		return unsealRsp.OutData.Buffer, nil
+		data := unsealRsp.OutData.Buffer
+		if len(data) > 0 {
+			buildtags.Debug("tpm debug: Unseal returned %d bytes (first: 0x%02x, last: 0x%02x)\n", len(data), data[0], data[len(data)-1])
+		} else {
+			buildtags.Debug("tpm debug: Unseal returned 0 bytes (empty)\n")
+		}
+		return data, nil
 	}
 
 	buildtags.Debug("tpm debug: unseal failed with '%s': %v\n", authName, err)
@@ -803,21 +841,12 @@ func (c *Client) ReadPCRValues(bank HashAlgorithm, pcrs []uint) (map[uint][]byte
 		alg = tpm2.TPMAlgSHA256
 	}
 
-	// Build PCR selection
-	var pcrSelectionIn tpm2.TPMLPCRSelection
-	for _, pcr := range pcrs {
-		sel := make([]byte, 8)
-		if pcr < 8 {
-			sel[0] = 1 << uint(pcr)
-		} else if pcr < 16 {
-			sel[1] = 1 << uint(pcr-8)
-		} else if pcr < 24 {
-			sel[2] = 1 << uint(pcr-16)
-		}
-		pcrSelectionIn.PCRSelections = append(pcrSelectionIn.PCRSelections, tpm2.TPMSPCRSelection{
+	// Build PCR selection - use single TPMSPCRSelection with bitmap of all PCRs
+	pcrSelectionIn := tpm2.TPMLPCRSelection{
+		PCRSelections: []tpm2.TPMSPCRSelection{{
 			Hash:      alg,
-			PCRSelect: sel,
-		})
+			PCRSelect: pcrsToBitmapInt(pcrs),
+		}},
 	}
 
 	rsp, err := tpm2.PCRRead{
@@ -838,6 +867,17 @@ func (c *Client) ReadPCRValues(bank HashAlgorithm, pcrs []uint) (map[uint][]byte
 	}
 
 	return result, nil
+}
+
+// pcrsToBitmapInt converts a list of PCR indices to a PCR select bitmap (3 bytes for PCRs 0-23).
+func pcrsToBitmapInt(pcrs []uint) []byte {
+	bitmap := make([]byte, 3)
+	for _, pcr := range pcrs {
+		if pcr < 24 {
+			bitmap[pcr/8] |= 1 << (pcr % 8)
+		}
+	}
+	return bitmap
 }
 
 // ReadAllPCRValues reads all PCR values for a specific bank.
@@ -978,4 +1018,241 @@ func computeAuthValue(saltedPin []byte) []byte {
 	hash := sha256.Sum256(saltedPin)
 	// Trim trailing zeros per TPM spec
 	return bytes.TrimRight(hash[:], "\x00")
+}
+
+// trimAuthValue trims trailing zeros from auth value per TPM spec.
+// This is used for SHA256-based auth values.
+func trimAuthValue(auth []byte) []byte {
+	return bytes.TrimRight(auth, "\x00")
+}
+
+// DerivePinAuthUnseal derives the auth value for unsealing when no salt is present.
+// systemd's tpm2_auth_value_from_pin: PIN -> SHA256 -> trim_zeros
+// Use DerivePinAuthSalted when the token has a tpm2_salt field.
+func DerivePinAuthUnseal(pin string) []byte {
+	// systemd's tpm2_auth_value_from_pin:
+	// PIN -> SHA256 -> trim_zeros
+	hash := sha256.Sum256([]byte(pin))
+	return trimAuthValue(hash[:])
+}
+
+// DerivePinAuthSalted derives the auth value when a salt is present.
+// systemd uses PBKDF2(pin, salt) → base64 → SHA256 → trim_zeros for both
+// enrollment AND unseal when the token has a tpm2_salt field.
+func DerivePinAuthSalted(pin string, salt []byte) []byte {
+	// systemd's tpm2_util_pbkdf2_hmac_sha256 for enrollment:
+	// PIN + Salt -> PBKDF2 -> salted_pin (32 bytes)
+	// salted_pin -> base64 encode -> b64_string
+	// b64_string -> SHA256 -> hash
+	// hash -> trim trailing zeros -> auth_value
+	pbkdf2Key := pbkdf2.Key([]byte(pin), salt, 10000, sha256.Size, sha256.New)
+	b64String := base64.StdEncoding.EncodeToString(pbkdf2Key)
+	return computeAuthValue([]byte(b64String))
+}
+
+// parseESYS_TR_SRK extracts the SRK handle and public area from systemd's serialized format.
+// systemd's tpm2_srk format (ESYS_TR serialization):
+//
+//	[4-byte esys_handle][TPM2B_NAME][ESYS_TR metadata][TPM2B_PUBLIC]
+//
+// The ESYS_TR metadata between NAME and PUBLIC varies by tpm2-tss version.
+// Typical layout observed in the wild:
+//
+//	[4-byte handle=0x81000001]
+//	[2-byte name_size=0x0022][2-byte nameAlg=0x000b][32-byte name_digest]  (TPM2B_NAME)
+//	[4-byte esys_metadata]                                                 (e.g. 0x00000001)
+//	[2-byte pub_size][TPMT_PUBLIC]                                         (TPM2B_PUBLIC)
+//
+// Returns the extracted SRK handle and the raw TPMT_PUBLIC data (without TPM2B prefix).
+func parseESYS_TR_SRK(srkData []byte) (handle uint32, publicData []byte, err error) {
+	if len(srkData) < 8 {
+		return 0, nil, fmt.Errorf("ESYS_TR SRK data too short: %d bytes", len(srkData))
+	}
+
+	buildtags.Debug("tpm: parsing ESYS_TR SRK format (total %d bytes)\n", len(srkData))
+
+	offset := 0
+
+	handle = binary.BigEndian.Uint32(srkData[offset : offset+4])
+	buildtags.Debug("tpm:   ESYS_TR handle: 0x%08x\n", handle)
+	offset += 4
+
+	if handle != 0x81000001 && handle != 0x81000000 {
+		buildtags.Debug("tpm:   warning: unexpected SRK handle 0x%x\n", handle)
+	}
+
+	if offset+2 > len(srkData) {
+		return 0, nil, fmt.Errorf("ESYS_TR SRK data truncated")
+	}
+
+	nameSizeField := binary.BigEndian.Uint16(srkData[offset : offset+2])
+	buildtags.Debug("tpm:   TPM2B_NAME size field: 0x%04x (%d)\n", nameSizeField, nameSizeField)
+	offset += 2
+
+	if nameSizeField == 0x000B || nameSizeField == 0x0004 || nameSizeField == 0x0023 {
+		nameSize := int(nameSizeField)
+		if offset+nameSize > len(srkData) {
+			nameSize = len(srkData) - offset
+		}
+		offset += nameSize
+		buildtags.Debug("tpm:   skipped bare name (%d bytes, alg 0x%04x)\n", nameSize, nameSizeField)
+	} else {
+		nameContentSize := int(nameSizeField)
+		if offset+nameContentSize > len(srkData) {
+			nameContentSize = len(srkData) - offset
+		}
+		offset += nameContentSize
+		buildtags.Debug("tpm:   skipped TPM2B_NAME content (%d bytes)\n", nameContentSize)
+	}
+
+	if offset >= len(srkData) {
+		return handle, nil, fmt.Errorf("no public data remaining after name")
+	}
+
+	pubOffset, pubSize := findTPM2BPublic(srkData, offset)
+	if pubOffset < 0 {
+		return handle, nil, fmt.Errorf("could not locate TPM2B_PUBLIC in ESYS_TR data after offset %d", offset)
+	}
+
+	if pubOffset+2+pubSize > len(srkData) {
+		return handle, nil, fmt.Errorf("TPM2B_PUBLIC truncated: need %d bytes at offset %d, have %d", 2+pubSize, pubOffset, len(srkData)-pubOffset)
+	}
+
+	publicData = srkData[pubOffset+2 : pubOffset+2+pubSize]
+	buildtags.Debug("tpm:   found TPM2B_PUBLIC at offset %d, size=%d, extracted TPMT_PUBLIC (%d bytes)\n", pubOffset, pubSize, len(publicData))
+
+	return handle, publicData, nil
+}
+
+// knownTPMObjectTypes are valid TPMI_ALG_PUBLIC type values used in TPMT_PUBLIC.
+var knownTPMObjectTypes = map[uint16]bool{
+	0x0001: true, // TPM_ALG_RSA
+	0x0008: true, // TPM_ALG_KEYEDHASH
+	0x0023: true, // TPM_ALG_ECC
+	0x0025: true, // TPM_ALG_SYMCIPHER
+}
+
+// findTPM2BPublic scans srkData from startOffset looking for a valid TPM2B_PUBLIC pattern.
+// A valid TPM2B_PUBLIC starts with [2-byte size] where size points to data whose first
+// 2 bytes are a known TPMI_ALG_PUBLIC type.
+// Returns (offset of TPM2B_PUBLIC, size field value) or (-1, 0) if not found.
+func findTPM2BPublic(data []byte, startOffset int) (int, int) {
+	for i := startOffset; i+4 <= len(data); i++ {
+		pubSize := int(binary.BigEndian.Uint16(data[i : i+2]))
+		if pubSize < 2 || i+2+2 > len(data) {
+			continue
+		}
+		objType := binary.BigEndian.Uint16(data[i+2 : i+4])
+		if knownTPMObjectTypes[objType] && i+2+pubSize <= len(data) {
+			return i, pubSize
+		}
+	}
+	return -1, 0
+}
+
+// loadExternalSRK loads an SRK from public data for use as a parent in TPM2_Load.
+// This handles the tpm2_srk field from systemd v255+ tokens which contains
+// ESYS_TR serialized data (not raw TPMT_PUBLIC).
+//
+// When ESYS_TR data provides a persistent SRK handle (e.g., 0x81000001), we
+// MUST use ReadPublic on that persistent handle rather than LoadExternal.
+// The transient object from LoadExternal lacks proper auth properties needed
+// by TPM2_Load, causing TPM_RC_AUTH_UNAVAILABLE. The persistent handle has
+// the correct auth and hierarchy association.
+//
+// LoadExternal is only used as a fallback when no persistent handle is available
+// (e.g., raw TPMT_PUBLIC data without ESYS_TR metadata).
+func (c *Client) loadExternalSRK(tpm transport.TPM, publicData []byte) (tpm2.AuthHandle, func(), error) {
+	buildtags.Debug("tpm: Loading SRK from tpm2_srk public data (%d bytes)\n", len(publicData))
+
+	if len(publicData) >= 16 {
+		buildtags.Debug("tpm: SRK public data hex (first 16 bytes): %x\n", publicData[:16])
+	}
+
+	loadData := publicData
+	extractedHandle := uint32(0)
+
+	if isESYS_TR_Format(publicData) {
+		buildtags.Debug("tpm: detected ESYS_TR format, extracting TPMT_PUBLIC\n")
+		handle, pubData, err := parseESYS_TR_SRK(publicData)
+		if err != nil {
+			buildtags.Debug("tpm: failed to parse ESYS_TR format: %v, trying raw format\n", err)
+		} else {
+			extractedHandle = handle
+			loadData = pubData
+			buildtags.Debug("tpm: extracted SRK handle from ESYS_TR: 0x%08x\n", handle)
+		}
+	}
+
+	// When we have a persistent SRK handle from ESYS_TR data, always use
+	// ReadPublic on that handle. The transient SRK from LoadExternal lacks
+	// auth properties needed by TPM2_Load (causes TPM_RC_AUTH_UNAVAILABLE).
+	if extractedHandle != 0 && isPersistentHandle(extractedHandle) {
+		buildtags.Debug("tpm: Using persistent SRK handle 0x%08x via ReadPublic (transient LoadExternal SRK lacks auth)\n", extractedHandle)
+
+		pubRsp, err := tpm2.ReadPublic{ObjectHandle: tpm2.TPMHandle(extractedHandle)}.Execute(tpm)
+		if err != nil {
+			return tpm2.AuthHandle{}, nil, fmt.Errorf("ReadPublic for persistent SRK 0x%x failed: %w", extractedHandle, err)
+		}
+
+		buildtags.Debug("tpm: ReadPublic succeeded for handle 0x%08x, name: %x\n", extractedHandle, pubRsp.Name)
+
+		srk := tpm2.AuthHandle{
+			Handle: tpm2.TPMHandle(extractedHandle),
+			Name:   pubRsp.Name,
+			Auth:   tpm2.PasswordAuth(nil),
+		}
+
+		return srk, func() {}, nil
+	}
+
+	// Fallback: use LoadExternal for raw TPMT_PUBLIC data or transient handles
+	loadCmd := tpm2.LoadExternal{
+		InPublic:  tpm2.BytesAs2B[tpm2.TPMTPublic](loadData),
+		Hierarchy: tpm2.TPMRHOwner,
+	}
+
+	rsp, err := loadCmd.Execute(tpm)
+	if err != nil {
+		return tpm2.AuthHandle{}, nil, fmt.Errorf("LoadExternal failed: %w", err)
+	}
+
+	buildtags.Debug("tpm: SRK loaded via LoadExternal, handle: 0x%x\n", rsp.ObjectHandle)
+
+	srk := tpm2.AuthHandle{
+		Handle: rsp.ObjectHandle,
+		Name:   rsp.Name,
+		Auth:   tpm2.PasswordAuth(nil),
+	}
+
+	cleanup := func() {
+		tpm2.FlushContext{FlushHandle: rsp.ObjectHandle}.Execute(tpm)
+	}
+
+	return srk, cleanup, nil
+}
+
+// isPersistentHandle checks if a TPM handle is in the persistent handle range
+// (0x81000000 - 0x81FFFFFF per TPM 2.0 Spec Part 1, Table 5).
+func isPersistentHandle(handle uint32) bool {
+	return handle >= 0x81000000 && handle <= 0x81FFFFFF
+}
+
+// isESYS_TR_Format checks if the SRK data appears to be in ESYS_TR serialized format.
+// ESYS_TR format starts with a TPM handle (0x81XXXXXX) followed by size fields.
+func isESYS_TR_Format(data []byte) bool {
+	if len(data) < 6 {
+		return false
+	}
+
+	if data[0] != 0x81 {
+		return false
+	}
+
+	handle := binary.BigEndian.Uint32(data[:4])
+	if handle != 0x81000001 && handle != 0x81000000 {
+		return false
+	}
+
+	return true
 }

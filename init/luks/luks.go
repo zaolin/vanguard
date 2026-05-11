@@ -11,7 +11,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/anatol/luks.go"
+	lk "github.com/zaolin/vanguard/internal/luks"
 	"github.com/zaolin/vanguard/init/console"
 	"github.com/zaolin/vanguard/init/tui"
 	intpm "github.com/zaolin/vanguard/internal/tpm"
@@ -22,7 +22,7 @@ type Device struct {
 	Path string
 	Name string // Mapped name (e.g., "luks-sda3")
 	UUID string
-	dev  luks.Device
+	dev  lk.Device
 }
 
 // Debug is set by main.go based on build tags.
@@ -149,7 +149,7 @@ func isLUKS(path string) bool {
 
 // Open opens a LUKS device for inspection and unlocking.
 func Open(path string) (*Device, error) {
-	dev, err := luks.Open(path)
+	dev, err := lk.Open(path)
 	if err != nil {
 		return nil, err
 	}
@@ -293,31 +293,32 @@ func (d *Device) UnlockWithTPM2() error {
 	// Detect TPM2 token strategy to determine if we should skip policy hash verification
 	detection, _ := DetectTPM2TokenStrategy(d.Path)
 	skipPolicy := detection != nil && detection.Strategy == StrategyPINOnly
+	var pcrlockPolicy *intpm.PCRLockPolicy
 	if detection != nil {
 		Debug("luks: TPM2 token strategy: %v\n", detection.Strategy)
+		pcrlockPolicy = detection.PCRLockPolicy
 	}
 
 	if token.NeedsPIN {
-		return d.unlockWithTPM2PIN(tpmClient, token, skipPolicy)
+		return d.unlockWithTPM2PIN(tpmClient, token, skipPolicy, pcrlockPolicy)
 	}
 
-	return d.unlockWithTPM2NoPIN(tpmClient, token, skipPolicy)
+	return d.unlockWithTPM2NoPIN(tpmClient, token, skipPolicy, pcrlockPolicy)
 }
 
 // unlockWithTPM2NoPIN attempts TPM2 unlock without PIN.
-func (d *Device) unlockWithTPM2NoPIN(tpmClient *intpm.Client, token *TPM2Token, skipPolicyHashVerify bool) error {
-	password, err := token.Unseal(tpmClient, nil, skipPolicyHashVerify)
+func (d *Device) unlockWithTPM2NoPIN(tpmClient *intpm.Client, token *TPM2Token, skipPolicyHashVerify bool, pcrlockPolicy *intpm.PCRLockPolicy) error {
+	password, err := token.Unseal(tpmClient, nil, skipPolicyHashVerify, pcrlockPolicy)
 	if err != nil {
 		d.logPCRDebug(token)
 		return err
 	}
 
-	// Unlock with recovered password
-	return d.unlockWithKey(password)
+	return d.unlockWithKeyForToken(password, token)
 }
 
 // unlockWithTPM2PIN attempts TPM2 unlock with PIN and retry logic.
-func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, skipPolicyHashVerify bool) error {
+func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, skipPolicyHashVerify bool, pcrlockPolicy *intpm.PCRLockPolicy) error {
 	var lastError error
 	var pin string
 	var err error
@@ -340,13 +341,13 @@ func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, sk
 		}
 
 		// Unseal with PIN using native TPM implementation
-		password, unsealErr := token.Unseal(tpmClient, []byte(pin), skipPolicyHashVerify)
+		password, unsealErr := token.Unseal(tpmClient, []byte(pin), skipPolicyHashVerify, pcrlockPolicy)
 		if unsealErr == nil {
 			// Success - unlock with password
 			if tui.IsEnabled() {
 				tui.PasswordPromptDone()
 			}
-			return d.unlockWithKey(password)
+			return d.unlockWithKeyForToken(password, token)
 		}
 
 		// Classify error
@@ -400,15 +401,16 @@ func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, sk
 
 // unlockWithKey unlocks the device with a decrypted key/password.
 func (d *Device) unlockWithKey(key []byte) error {
-	// Try each keyslot with the key
 	slots := d.dev.Slots()
+	Debug("luks: unlockWithKey: %d keyslots available, key length=%d\n", len(slots), len(key))
 	for _, slot := range slots {
 		volume, err := d.dev.UnsealVolume(slot, key)
 		if err != nil {
+			Debug("luks: keyslot %d: UnsealVolume failed: %v\n", slot, err)
 			continue
 		}
+		Debug("luks: keyslot %d: UnsealVolume succeeded\n", slot)
 
-		// Setup dm-crypt
 		if err := d.setupDMCrypt(volume); err != nil {
 			return err
 		}
@@ -418,8 +420,36 @@ func (d *Device) unlockWithKey(key []byte) error {
 	return errors.New("key did not match any keyslot")
 }
 
+// unlockWithKeyForToken unlocks the device using only the keyslots assigned to a specific TPM2 token.
+func (d *Device) unlockWithKeyForToken(key []byte, token *TPM2Token) error {
+	slots := token.Keyslots
+	if len(slots) == 0 {
+		// Fallback: try all slots if token doesn't specify which keyslots
+		Debug("luks: token has no keyslots, trying all %d available\n", len(d.dev.Slots()))
+		slots = d.dev.Slots()
+	}
+	Debug("luks: unlockWithKeyForToken: %d token keyslots (%v), key length=%d\n", len(slots), slots, len(key))
+	for _, slot := range slots {
+		volume, err := d.dev.UnsealVolume(slot, key)
+		if err != nil {
+			Debug("luks: keyslot %d: UnsealVolume failed: %v\n", slot, err)
+			continue
+		}
+		Debug("luks: keyslot %d: UnsealVolume succeeded\n", slot)
+
+		if err := d.setupDMCrypt(volume); err != nil {
+			return err
+		}
+		return nil
+	}
+
+	return fmt.Errorf("key did not match any of the token's keyslots %v", slots)
+}
+
 // UnlockWithPassphrase prompts for a passphrase and unlocks the device.
 func (d *Device) UnlockWithPassphrase() error {
+	logKeymapStatus()
+
 	for attempts := 0; attempts < 3; attempts++ {
 		var passphrase string
 		var err error
@@ -433,13 +463,19 @@ func (d *Device) UnlockWithPassphrase() error {
 			return err
 		}
 
+		Debug("passphrase: entered %d bytes, first: 0x%02x, last: 0x%02x\n",
+			len(passphrase), passphrase[0], passphrase[len(passphrase)-1])
+
 		// Try each keyslot with the passphrase
 		slots := d.dev.Slots()
+		Debug("passphrase: trying %d keyslots\n", len(slots))
 		for _, slot := range slots {
 			volume, err := d.dev.UnsealVolume(slot, []byte(passphrase))
 			if err != nil {
+				Debug("passphrase: keyslot %d failed: %v\n", slot, err)
 				continue
 			}
+			Debug("passphrase: keyslot %d succeeded\n", slot)
 
 			// Setup dm-crypt
 			if err := d.setupDMCrypt(volume); err != nil {
@@ -463,7 +499,7 @@ func (d *Device) UnlockWithPassphrase() error {
 }
 
 // setupDMCrypt creates the dm-crypt device mapping.
-func (d *Device) setupDMCrypt(volume *luks.Volume) error {
+func (d *Device) setupDMCrypt(volume *lk.Volume) error {
 	// Use dmsetup to create the mapping
 	Debug("luks: setting up dm-crypt for %s as %s\n", d.Path, d.Name)
 
@@ -473,6 +509,43 @@ func (d *Device) setupDMCrypt(volume *luks.Volume) error {
 	}
 
 	return ensureMapperNode(d.Name)
+}
+
+// logKeymapStatus logs the current keyboard layout status for diagnosing
+// passphrase failures. Checks /etc/vconsole.conf for the configured keymap
+// and whether the loadkeys binary exists in the initramfs.
+func logKeymapStatus() {
+	keymap := ""
+	if data, err := os.ReadFile("/etc/vconsole.conf"); err == nil {
+		for _, line := range strings.Split(string(data), "\n") {
+			if strings.HasPrefix(line, "KEYMAP=") {
+				keymap = strings.Trim(strings.TrimPrefix(line, "KEYMAP="), "\"'")
+				break
+			}
+		}
+	}
+
+	loadkeysExists := false
+	for _, p := range []string{"/usr/bin/loadkeys", "/bin/loadkeys"} {
+		if _, err := os.Stat(p); err == nil {
+			loadkeysExists = true
+			break
+		}
+	}
+
+	keymapDirExists := false
+	for _, d := range []string{"/usr/share/kbd/keymaps", "/lib/kbd/keymaps", "/usr/lib/kbd/keymaps"} {
+		if _, err := os.Stat(d); err == nil {
+			keymapDirExists = true
+			break
+		}
+	}
+
+	Debug("passphrase: keymap status: configured=%q, loadkeys=%v, keymap_dir=%v\n",
+		keymap, loadkeysExists, keymapDirExists)
+	LogFunc("KEYMAP_STATUS", "configured", keymap,
+		"loadkeys", fmt.Sprintf("%v", loadkeysExists),
+		"keymap_dir", fmt.Sprintf("%v", keymapDirExists))
 }
 
 // logPCRDebug logs PCR values for debugging TPM unlock failures.
