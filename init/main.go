@@ -163,12 +163,6 @@ func main() {
 	tui.StageDone(tui.StageLUKS)
 	// Note: Per-device LUKS_UNLOCK events are logged by cryptsetup package
 
-	// 11a. Trigger udev to process dm-crypt device (for db_persist)
-	// Since we use DM_DISABLE_UDEV=1, we need to manually trigger udev
-	buildtags.Debug("vanguard: triggering udev for dm-crypt devices\n")
-	udev.Trigger()
-	udev.Settle(5 * time.Second)
-
 	// 12. Scan and activate LVM
 	tui.UpdateStage(tui.StageLVM)
 	buildtags.Debug("vanguard: activating LVM volumes\n")
@@ -179,11 +173,6 @@ func main() {
 		bootlog.Log(bootlog.EventLVMActivate, "status", "ok")
 	}
 	tui.StageDone(tui.StageLVM)
-
-	// 12a. Trigger udev to process LVM devices (for db_persist)
-	buildtags.Debug("vanguard: triggering udev for LVM devices\n")
-	udev.Trigger()
-	udev.Settle(5 * time.Second)
 
 	// 13. Try hibernate resume (swap is now accessible after LUKS+LVM)
 	// This must happen BEFORE mounting root read-write
@@ -246,7 +235,16 @@ func main() {
 	tui.StageDone(tui.StageRoot)
 	bootlog.Log(bootlog.EventRootMounted, "target", "/sysroot", "device", rootDev, "status", "ok")
 
-	// 16a. Create LVM symlinks in /sysroot/dev for persistence after switch_root
+	// 16a. Mount non-root filesystems from fstab into /sysroot.
+	// Since the devices already exist (LVM is active, symlinks are created),
+	// mounting them now means systemd finds them already mounted after
+	// switch_root and doesn't try to wait for device nodes from udev.
+	buildtags.Debug("vanguard: mounting non-root filesystems from fstab\n")
+	if err := mount.MountNonRootFromFstab("/sysroot"); err != nil {
+		buildtags.Debug("vanguard: warning: non-root fstab mounts: %v\n", err)
+	}
+
+	// 16b. Create LVM symlinks in /sysroot/dev for persistence after switch_root
 	buildtags.Debug("vanguard: creating LVM symlinks in sysroot\n")
 	if err := lvm.CreateSymlinksForSysroot("/sysroot"); err != nil {
 		buildtags.Debug("vanguard: warning: failed to create sysroot LVM symlinks: %v\n", err)
@@ -272,6 +270,15 @@ func main() {
 	// Stop udevd gracefully
 	buildtags.Debug("vanguard: stopping udevd\n")
 	udev.Stop()
+
+	// Ensure LVM symlinks exist in /dev before switch_root.
+	// switch_root moves the entire initramfs /dev (devtmpfs) to /sysroot/dev
+	// via MS_MOVE, so symlinks created here survive and are visible to the
+	// real system. This is critical for systemd to find non-root LVs in fstab.
+	buildtags.Debug("vanguard: ensuring LVM symlinks in /dev\n")
+	if err := lvm.EnsureDevSymlinks(); err != nil {
+		buildtags.Debug("vanguard: warning: LVM dev symlinks: %v\n", err)
+	}
 
 	// 18. Close boot log and unmount /boot before switchroot
 	bootlog.Log(bootlog.EventSwitchroot, "target", "/sysroot")

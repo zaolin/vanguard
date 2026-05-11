@@ -372,6 +372,80 @@ func MountBoot(sysroot string) (bool, error) {
 	return true, nil
 }
 
+// MountNonRootFromFstab reads the real root's /etc/fstab and mounts non-root
+// filesystems into the sysroot before switch_root. This avoids udev database
+// corruption issues that prevent systemd from finding non-root logical volumes
+// after switch_root, because the filesystems are already mounted and visible
+// when systemd starts.
+func MountNonRootFromFstab(sysroot string) error {
+	fstabPath := filepath.Join(sysroot, "etc/fstab")
+	entries, err := fstab.Parse(fstabPath)
+	if err != nil {
+		return err
+	}
+
+	for _, e := range entries {
+		if e.Mountpoint == "/" {
+			continue
+		}
+		if isPseudoFS(e.FSType) {
+			continue
+		}
+		if hasOption(e.Options, "noauto") {
+			console.DebugPrint("vanguard: %s has noauto, skipping\n", e.Mountpoint)
+			continue
+		}
+
+		device := normalizeLVMPath(e.Device)
+		if _, err := os.Stat(device); err != nil {
+			console.DebugPrint("vanguard: device %s not found, skipping %s\n", device, e.Mountpoint)
+			continue
+		}
+
+		mntPath := filepath.Join(sysroot, e.Mountpoint)
+		if IsMounted(mntPath) {
+			console.DebugPrint("vanguard: %s already mounted, skipping\n", mntPath)
+			continue
+		}
+
+		if err := os.MkdirAll(mntPath, 0755); err != nil {
+			console.DebugPrint("vanguard: failed to create %s: %v\n", mntPath, err)
+			continue
+		}
+
+		fstype := e.FSType
+		if fstype == "" {
+			fstype, _ = detectFSType(device)
+		}
+		if err := unix.Mount(device, mntPath, fstype, 0, ""); err != nil {
+			console.DebugPrint("vanguard: failed to mount %s on %s: %v\n", device, mntPath, err)
+			continue
+		}
+		console.DebugPrint("vanguard: mounted %s on %s\n", device, mntPath)
+	}
+	return nil
+}
+
+func isPseudoFS(fstype string) bool {
+	switch fstype {
+	case "proc", "sysfs", "devtmpfs", "devpts", "tmpfs",
+		"securityfs", "efivarfs", "cgroup", "cgroup2",
+		"pstore", "bpf", "debugfs", "tracefs", "fusectl",
+		"configfs", "hugetlbfs", "mqueue", "swap", "none", "auto":
+		return true
+	}
+	return false
+}
+
+func hasOption(options string, target string) bool {
+	for _, o := range strings.Split(options, ",") {
+		if strings.TrimSpace(o) == target {
+			return true
+		}
+	}
+	return false
+}
+
 // UnmountBoot unmounts /boot partition
 func UnmountBoot(sysroot string) error {
 	bootPath := filepath.Join(sysroot, "boot")

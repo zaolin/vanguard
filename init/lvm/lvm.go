@@ -361,6 +361,65 @@ func unescapeLVMName(name string) string {
 	return strings.ReplaceAll(name, "--", "-")
 }
 
+// EnsureDevSymlinks creates /dev/<vg>/<lv> symlinks in the initramfs devtmpfs
+// just before switch_root. This is critical because switch_root moves the initramfs
+// /dev (devtmpfs) to /sysroot/dev via MS_MOVE, so any symlinks created here
+// survive and are visible to the real system. systemd relies on /dev/<vg>/<lv>
+// paths to activate .device units for non-root logical volumes in fstab.
+func EnsureDevSymlinks() error {
+	lvm := findLVM()
+	if lvm == "" {
+		return nil
+	}
+
+	output, err := runLVMOutput(lvm, "lvs", "--noheadings", "--separator", "|",
+		"-o", "vg_name,lv_name")
+	if err != nil {
+		return err
+	}
+
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+
+		parts := strings.Split(line, "|")
+		if len(parts) < 2 {
+			continue
+		}
+
+		vg := strings.TrimSpace(parts[0])
+		lv := strings.TrimSpace(parts[1])
+
+		if vg == "" || lv == "" {
+			continue
+		}
+
+		vgDir := filepath.Join("/dev", vg)
+		if err := os.MkdirAll(vgDir, 0755); err != nil {
+			console.DebugPrint("lvm: failed to create /dev/%s: %v\n", vg, err)
+			continue
+		}
+
+		lvPath := filepath.Join(vgDir, lv)
+		mapperName := vg + "-" + lv
+		target := filepath.Join("/dev/mapper", mapperName)
+
+		if _, err := os.Lstat(lvPath); err == nil {
+			os.Remove(lvPath)
+		}
+
+		if err := os.Symlink(target, lvPath); err != nil {
+			console.DebugPrint("lvm: failed to create /dev/%s/%s: %v\n", vg, lv, err)
+		} else {
+			console.DebugPrint("lvm: created /dev/%s/%s -> %s\n", vg, lv, target)
+		}
+	}
+
+	return nil
+}
+
 // CreateSymlinksForSysroot creates /dev/<vg>/<lv> symlinks in the sysroot
 // that will persist after switch_root. This is needed because symlinks created
 // in the initramfs /dev are lost when switch_root replaces it with the real root's /dev.
@@ -404,16 +463,12 @@ func CreateSymlinksForSysroot(sysroot string) error {
 			continue
 		}
 
-		// Create symlink using absolute path to dm-X device
-		// /dev/dm-X persists across switch_root since it's on devtmpfs
+		// Create symlink to the dm-crypt mapper device
 		lvPath := filepath.Join(vgDir, lv)
-		dmDevice := filepath.Base(dmPath) // e.g., "dm-4"
-		target := filepath.Join("/dev", dmDevice)
+		target := dmPath // /dev/mapper/gentoo-home, persists across switch_root
 
-		// Skip if already exists
 		if _, err := os.Lstat(lvPath); err == nil {
-			console.DebugPrint("lvm: sysroot symlink %s already exists\n", lvPath)
-			continue
+			os.Remove(lvPath) // Replace stale/broken symlink from previous boot
 		}
 
 		if err := os.Symlink(target, lvPath); err != nil {

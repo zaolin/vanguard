@@ -5,6 +5,7 @@ type CLI struct {
 	Generate      GenerateCmd      `cmd:"" help:"Generate initramfs image"`
 	UpdatePolicy  UpdatePolicyCmd  `cmd:"" name:"update-tpm-policy" help:"Update TPM2 pcrlock policy"`
 	VerifyPCRLock VerifyPCRLockCmd `cmd:"" name:"verify-pcrlock-setup" help:"Verify TPM2 pcrlock setup (PCRs, NV Index, LUKS)"`
+	Status        StatusCmd        `cmd:"" help:"Show system protection status"`
 }
 
 // GenerateCmd generates a new initramfs image
