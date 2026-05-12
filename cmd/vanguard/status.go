@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strings"
 
@@ -267,19 +268,25 @@ func base64DecodeInto(dst, src []byte) (int, error) {
 	return writeIdx, nil
 }
 
-func collectPCRLockStatus(data *statusData) {
-	searchPaths := []string{
+func findPCRLockPolicy() string {
+	matches, _ := filepath.Glob("/boot/EFI/*/*.pcrlock.json")
+	if len(matches) > 0 {
+		return matches[0]
+	}
+	for _, p := range []string{
 		"/var/lib/systemd/pcrlock.json",
 		"/boot/pcrlock.json",
 		"/run/systemd/pcrlock.json",
-	}
-	var policyPath string
-	for _, p := range searchPaths {
+	} {
 		if _, err := os.Stat(p); err == nil {
-			policyPath = p
-			break
+			return p
 		}
 	}
+	return ""
+}
+
+func collectPCRLockStatus(data *statusData) {
+	policyPath := findPCRLockPolicy()
 	if policyPath == "" {
 		return
 	}

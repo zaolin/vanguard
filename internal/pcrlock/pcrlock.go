@@ -15,8 +15,6 @@ import (
 )
 
 const (
-	// PCRLockBin is the path to the systemd-pcrlock binary
-	PCRLockBin = "/usr/lib/systemd/systemd-pcrlock"
 	// PCRLockDir is the directory for pcrlock policy files
 	PCRLockDir = "/etc/pcrlock.d"
 
@@ -25,6 +23,20 @@ const (
 	nvIndexMin = 0x01800000
 	nvIndexMax = 0x01BFFFFF
 )
+
+// PCRLockBinPath returns the path to the systemd-pcrlock binary,
+// auto-detecting between Gentoo (/lib) and standard (/usr/lib) paths.
+func PCRLockBinPath() string {
+	for _, p := range []string{
+		"/lib/systemd/systemd-pcrlock",
+		"/usr/lib/systemd/systemd-pcrlock",
+	} {
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+	}
+	return "/usr/lib/systemd/systemd-pcrlock"
+}
 
 // Verbose controls whether command output is shown
 var Verbose bool
@@ -151,7 +163,7 @@ func LockSecureBoot() error {
 	stdout, stderr := cmdOutput()
 
 	// Lock secureboot policy
-	cmd := exec.Command(PCRLockBin, "lock-secureboot-policy")
+	cmd := exec.Command(PCRLockBinPath(), "lock-secureboot-policy")
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
@@ -159,7 +171,7 @@ func LockSecureBoot() error {
 	}
 
 	// Lock secureboot authority
-	cmd = exec.Command(PCRLockBin, "lock-secureboot-authority")
+	cmd = exec.Command(PCRLockBinPath(), "lock-secureboot-authority")
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
@@ -243,7 +255,7 @@ func LockGPT(device string) error {
 	if device != "" {
 		args = append(args, device)
 	}
-	cmd := exec.Command(PCRLockBin, args...)
+	cmd := exec.Command(PCRLockBinPath(), args...)
 
 	if Verbose {
 		// In verbose mode, we still need to capture output to detect GPT errors
@@ -275,7 +287,7 @@ func LockGPT(device string) error {
 // LockUKI locks PCR 4 for the given UKI path (single file mode)
 func LockUKI(ukiPath string) error {
 	stdout, stderr := cmdOutput()
-	cmd := exec.Command(PCRLockBin, "lock-uki", ukiPath)
+	cmd := exec.Command(PCRLockBinPath(), "lock-uki", ukiPath)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
@@ -299,7 +311,7 @@ func LockUKIVariant(ukiPath string, variantName string) error {
 
 	pcrLockPath := filepath.Join(variantDir, variantName+".pcrlock")
 
-	cmd := exec.Command(PCRLockBin, "lock-uki", ukiPath, "--pcrlock="+pcrLockPath)
+	cmd := exec.Command(PCRLockBinPath(), "lock-uki", ukiPath, "--pcrlock="+pcrLockPath)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
@@ -324,7 +336,7 @@ func LockUKIWithVariants(newUKIPath string) error {
 
 	// Create new variant from specified UKI file
 	newPath := filepath.Join(variantDir, "new.pcrlock")
-	cmd := exec.Command(PCRLockBin, "lock-uki", newUKIPath, "--pcrlock="+newPath)
+	cmd := exec.Command(PCRLockBinPath(), "lock-uki", newUKIPath, "--pcrlock="+newPath)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
@@ -337,7 +349,7 @@ func LockUKIWithVariants(newUKIPath string) error {
 // LockMachineID locks PCR 15 for machine ID
 func LockMachineID() error {
 	stdout, stderr := cmdOutput()
-	cmd := exec.Command(PCRLockBin, "lock-machine-id")
+	cmd := exec.Command(PCRLockBinPath(), "lock-machine-id")
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
@@ -349,7 +361,7 @@ func LockMachineID() error {
 // LockFileSystem locks PCR 15 for root filesystem
 func LockFileSystem(path string) error {
 	stdout, stderr := cmdOutput()
-	cmd := exec.Command(PCRLockBin, "lock-file-system", path)
+	cmd := exec.Command(PCRLockBinPath(), "lock-file-system", path)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
@@ -401,7 +413,7 @@ func MakePolicy(outputPath string) error {
 	}
 	args = append(args, nvIndexArgs...)
 
-	cmd := exec.Command(PCRLockBin, args...)
+	cmd := exec.Command(PCRLockBinPath(), args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
@@ -463,7 +475,7 @@ func VerifyPolicy(policyPath string, requiredPCRs []int) error {
 
 // PredictJSON returns the raw JSON prediction output
 func PredictJSON(policyPath string) ([]byte, error) {
-	cmd := exec.Command(PCRLockBin, "predict",
+	cmd := exec.Command(PCRLockBinPath(), "predict",
 		"--policy="+policyPath,
 		"--json=pretty",
 	)
@@ -556,7 +568,7 @@ func ParsePolicyJSON(data []byte) (*PolicyInfo, error) {
 // This is more reliable than lock-uki for PCR4 measurements when sd-stub uses LoadImage
 func LockPE(pePath string) error {
 	stdout, stderr := cmdOutput()
-	cmd := exec.Command(PCRLockBin, "lock-pe", pePath)
+	cmd := exec.Command(PCRLockBinPath(), "lock-pe", pePath)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
@@ -574,7 +586,7 @@ func LockPEVariant(pePath string, variantName string) error {
 	}
 
 	pcrLockPath := filepath.Join(variantDir, variantName+".pcrlock")
-	cmd := exec.Command(PCRLockBin, "lock-pe", pePath, "--pcrlock="+pcrLockPath)
+	cmd := exec.Command(PCRLockBinPath(), "lock-pe", pePath, "--pcrlock="+pcrLockPath)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
@@ -608,7 +620,7 @@ func LockUKIWithPEFallback(ukiPath string) error {
 
 	// Variant 1: lock-pe for the specified UKI (more reliable for PCR4)
 	pePath := filepath.Join(variantDir, "pe.pcrlock")
-	cmd := exec.Command(PCRLockBin, "lock-pe", ukiPath, "--pcrlock="+pePath)
+	cmd := exec.Command(PCRLockBinPath(), "lock-pe", ukiPath, "--pcrlock="+pePath)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	if err := cmd.Run(); err != nil {
@@ -617,7 +629,7 @@ func LockUKIWithPEFallback(ukiPath string) error {
 
 	// Variant 2: lock-uki (includes PCR11 measurements)
 	ukiLockPath := filepath.Join(variantDir, "uki.pcrlock")
-	cmd = exec.Command(PCRLockBin, "lock-uki", ukiPath, "--pcrlock="+ukiLockPath)
+	cmd = exec.Command(PCRLockBinPath(), "lock-uki", ukiPath, "--pcrlock="+ukiLockPath)
 	cmd.Stdout = stdout
 	cmd.Stderr = stderr
 	// Ignore lock-uki errors - it's a fallback and may fail on some systems
@@ -644,7 +656,7 @@ func LockUKIWithPEFallback(ukiPath string) error {
 // systemd-pcrlock's firmware component matching.
 func lockCurrentBootPCR4(variantDir string) error {
 	// Read the event log in CEL-JSON format
-	cmd := exec.Command(PCRLockBin, "cel")
+	cmd := exec.Command(PCRLockBinPath(), "cel")
 	output, err := cmd.Output()
 	if err != nil {
 		return fmt.Errorf("failed to read event log: %w", err)

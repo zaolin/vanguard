@@ -31,8 +31,8 @@ func (c *UpdatePolicyCmd) Run() error {
 	}
 
 	// Check pcrlock binary exists
-	if _, err := os.Stat(pcrlock.PCRLockBin); err != nil {
-		return fmt.Errorf("systemd-pcrlock not found at %s", pcrlock.PCRLockBin)
+	if _, err := os.Stat(pcrlock.PCRLockBinPath()); err != nil {
+		return fmt.Errorf("systemd-pcrlock not found at %s", pcrlock.PCRLockBinPath())
 	}
 
 	// Phase 1: Configure PCR masks
