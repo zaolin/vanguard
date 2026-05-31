@@ -4,27 +4,30 @@
 
 # Vanguard
 
-A minimal, security-focused initramfs generator for Linux systems with full disk encryption. Written in Go, Vanguard creates lightweight boot images optimized for LUKS + LVM + TPM2 setups.
+A minimal, security-focused initramfs generator for Linux systems with full disk encryption. Written in Go, Vanguard creates lightweight boot images optimized for LUKS + LVM + TPM2 setups with PCRLock boot integrity enforcement.
 
 ## Features
 
-- **Full Disk Encryption** - LUKS2 with TPM2 automatic unlock via systemd-cryptenroll
-- **TPM2 Integration** - Automatic token detection, PIN support, PCRLock policy binding
-- **LVM Support** - Full LVM2 volume group and logical volume activation
-- **GPT Autodiscovery** - Automatic root partition detection using Discoverable Partitions Specification
-- **Hibernate/Resume** - Support for resuming from encrypted swap (inside LUKS+LVM)
-- **Filesystem Check** - Optional fsck before mounting root
-- **Vconsole Support** - Keyboard layout and console font configuration for password prompts
-- **Minimal Footprint** - Only includes binaries and modules needed for your configuration
-- **Fast Boot** - zstd compression, parallel device scanning
-- **Self-contained** - CLI embeds pre-built init binaries
+- **Full Disk Encryption** — LUKS2 with TPM2 automatic unlock via systemd-cryptenroll
+- **Native Go TPM2** — Zero external dependencies; uses `google/go-tpm` for sealed key unseal with traditional PCR policy and PolicyAuthorizeNV (pcrlock)
+- **Native Go LUKS** — LUKS v1/v2 header parsing, Argon2/PBKDF2 key derivation, and dm-crypt mapper setup via ioctl — no libcryptsetup required at runtime
+- **TPM2 Integration** — Automatic token detection, PIN support, PCRLock policy binding with multi-branch PCR prediction (PolicyOR)
+- **LVM Support** — Full LVM2 volume group and logical volume activation with persistent symlinks across switch_root
+- **Non-Root Filesystem Mounting** — Mounts `/home` and other non-root filesystems from fstab before switch_root, bypassing udev database corruption issues
+- **Boot TUI** — Bubble Tea-based terminal UI with spinner, stage progress, and password/PIN prompts during boot
+- **GPT Autodiscovery** — Automatic root partition detection using Discoverable Partitions Specification
+- **Hibernate/Resume** — Support for resuming from encrypted swap (inside LUKS+LVM)
+- **Filesystem Check** — Optional fsck before mounting root
+- **Vconsole Support** — Keyboard layout and console font configuration for password prompts
+- **Minimal Footprint** — Only includes binaries and modules needed for your configuration
+- **Fast Boot** — zstd compression, parallel device scanning
+- **Self-contained** — CLI embeds pre-built init binaries; no CGo in init
 
 ## Screens
 
 <p align="center">
   <img src="assets/ui_example.png" alt="Vanguard Boot TUI" width="600"/>
 </p>
-
 
 ## Quick Start
 
@@ -34,11 +37,17 @@ git clone https://github.com/zaolin/vanguard
 cd vanguard
 make
 
+# Check system protection status
+sudo ./vanguard status
+
 # Generate initramfs
 sudo ./vanguard generate -o /boot/initramfs-linux.img
 
 # With debug output enabled
 sudo ./vanguard generate -o /boot/initramfs-linux.img --debug
+
+# Strict mode — token-only unlock, no passphrase fallback
+sudo ./vanguard generate -o /boot/initramfs-linux.img -s
 ```
 
 ## Documentation
@@ -70,30 +79,30 @@ vanguard generate -o /boot/initramfs-linux.img [options]
 | `-s, --strict` | Strict mode: token-only unlock, no passphrase fallback |
 | `--config` | Path to TOML config file |
 
-### update-tpm-policy
+### update
 
 Update TPM2 PCRLock policy for secure boot:
 
 ```bash
-vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi [options]
+vanguard update -u /boot/EFI/Gentoo/kernel.efi [options]
 ```
 
 | Option | Description |
 |--------|-------------|
 | `-u, --uki-path` | Path to UKI file (required) |
-| `-p, --policy-output` | Output path for policy JSON |
-| `-l, --luks-device` | LUKS device for token verification (enables GPT binding) |
+| `-p, --policy-output` | Output path for policy JSON (default: `<uki-path>.pcrlock.json`) |
+| `-l, --luks-device` | LUKS device for token verification (enables GPT binding on PCR 5) |
 | `--no-gpt` | Disable GPT partition table binding (PCR 5) |
 | `--no-verify` | Skip policy verification |
 | `-v, --verbose` | Show verbose output from pcrlock tools |
 | `-c, --cleanup` | Remove old unused pcrlock NV indices from TPM |
 
-### verify-pcrlock-setup
+### verify
 
 Verify TPM2 pcrlock setup (PCRs, NV Index, LUKS token):
 
 ```bash
-vanguard verify-pcrlock-setup -p /boot/pcrlock.json [options]
+vanguard verify -p /boot/pcrlock.json [options]
 ```
 
 | Option | Description |
@@ -105,6 +114,42 @@ This checks:
 1. NV Index synchronization (TPM matches policy file)
 2. Current PCR values against policy expectations
 3. LUKS token validation (when `-l` specified)
+
+### status
+
+Show system protection status with security layering:
+
+```bash
+vanguard status [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--json` | Machine-readable JSON output |
+| `-v, --verbose` | Show full PCR hash values |
+
+Shows protection tier (HIGH/MEDIUM/LOW/WARNING), LUKS encryption status, TPM 2.0 presence and lockout state, PCRLock boot integrity with per-PCR classification (enforced/unbound), and Secure Boot (PCR 7) detection.
+
+## Architecture
+
+Vanguard has a **dual-binary design**:
+
+- **`cmd/vanguard/`** — CLI tool running on the build host, generates initramfs images
+- **`init/`** — Init binary running inside the initramfs at boot (19-step sequence)
+- **`internal/`** — Shared libraries: native Go TPM2 client, native Go LUKS implementation, CPIO archive writer, compression, pcrlock integration
+
+Build produces **4 init variants** via Go build tags from a single source tree:
+
+| Tag(s) | Binary | Behavior |
+|--------|--------|---------|
+| (none) | `init` | Release: minimal output, passphrase fallback |
+| `debug` | `init-debug` | Verbose output for troubleshooting |
+| `strict` | `init-strict` | Token-only unlock, no passphrase fallback |
+| `debug,strict` | `init-debug-strict` | Verbose + strict mode |
+
+The generator outputs a **chained CPIO**: an uncompressed early archive for firmware (available to built-in kernel drivers) followed by a zstd/gzip-compressed main archive. All init binaries are statically linked (`CGO_ENABLED=0`) with zero runtime dependencies.
+
+**No external binaries needed at boot** — LUKS unlock and TPM2 operations use native Go implementations. The only external binaries included in the initramfs are `lvm` (for LVM activation), `systemd-udevd`/`udevadm` (device management), and `dmsetup` (DM rules).
 
 ## Configuration File
 
@@ -131,69 +176,74 @@ modules = [
 ### 1. Partition Layout
 
 ```
-/dev/sda
-├── /dev/sda1  ESP (FAT32, ~512MB)     - EFI System Partition
-└── /dev/sda2  LUKS encrypted          - Contains LVM
+/dev/nvme0n1
+├── /dev/nvme0n1p1  ESP (FAT32, ~512MB)     — EFI System Partition
+└── /dev/nvme0n1p2  LUKS encrypted           — Contains LVM
     └── LVM PV
-        └── VG: vg0
+        └── VG: gentoo
             ├── LV: root (ext4/xfs)
+            ├── LV: home (ext4/xfs)
             └── LV: swap
 ```
 
 ### 2. Enroll TPM2
 
 ```bash
-# Basic enrollment
-systemd-cryptenroll --tpm2-device=auto /dev/sda2
+# Generate PCRLock policy (Secure Boot + UKI + GPT binding)
+sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2
 
-# With PIN
-systemd-cryptenroll --tpm2-device=auto --tpm2-with-pin=yes /dev/sda2
-
-# With PCRLock policy
-vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi
-systemd-cryptenroll --tpm2-device=auto --tpm2-pcrlock=/boot/pcrlock.json /dev/sda2
+# Enroll TPM2 token with pcrlock binding
+sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto \
+  --tpm2-with-pin=yes \
+  --tpm2-pcrlock=/boot/EFI/Gentoo/kernel.pcrlock.json \
+  /dev/nvme0n1p2
 ```
 
 ### 3. Generate Initramfs
 
 ```bash
-vanguard generate -o /boot/initramfs-linux.img
+sudo vanguard generate -o /boot/initramfs-linux.img
 ```
 
 ### 4. Kernel Command Line
 
 ```
-root=/dev/vg0/root resume=/dev/vg0/swap
+root=/dev/gentoo/root resume=/dev/gentoo/swap
 ```
 
 See [docs/kernel-parameters.md](docs/kernel-parameters.md) for all supported parameters.
+
+### 5. Verify Protection Status
+
+```bash
+sudo vanguard status
+```
 
 ## Boot Sequence Overview
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│   1. Console Setup          Set up early console I/O            │
-│   2. Mount Filesystems      /proc, /sys, /dev, /run             │
-│   3. Vconsole Config        Load keyboard layout/font           │
-│   4. Mount /boot            Mount boot partition for policy     │
-│   5. Init Boot Log          Start logging to /boot              │
-│   6. Start udevd            Device discovery daemon             │
-│   7. Load Modules           Kernel modules from image           │
-│   8. Trigger udev Events    Firmware loading                    │
-│   9. Load TPM Modules       tpm_crb, tpm_tis, tpm_tis_core     │
-│  10. Setup PCRLock          Copy pcrlock.json for TPM2          │
-│  11. Unlock LUKS            TPM2 → PIN → Passphrase             │
-│ 11a. Trigger udev           Process dm-crypt devices            │
-│  12. Activate LVM           Scan and activate volumes           │
-│ 12a. Trigger udev           Process LVM devices                 │
-│  13. Try Resume             Hibernate resume from swap          │
-│  14. Find Root Device       cmdline → fstab → GPT autodiscovery │
-│  15. fsck                   Check root filesystem               │
-│  16. Mount Root             Mount to /sysroot                   │
-│ 16a. LVM Symlinks           Create symlinks in /sysroot/dev     │
-│  17. Cleanup udev           Settle, cleanup DB, stop daemon     │
-│  18. Close Boot Log         Close log, unmount /boot            │
-│  19. Switch Root            Hand off to real init               │
+│   1. Console Setup          Set up early console I/O             │
+│   2. Mount Filesystems      /proc, /sys, /dev, /run              │
+│   3. Vconsole Config        Load keyboard layout/font            │
+│   4. Mount /boot            Mount boot partition for policy      │
+│   5. Init Boot Log          Start logging to /boot               │
+│   6. Start udevd            Device discovery daemon              │
+│   7. Load Modules           Kernel modules from image            │
+│   8. Trigger udev Events    Firmware loading                     │
+│   9. Load TPM Modules       tpm_crb, tpm_tis, tpm_tis_core      │
+│  10. Setup PCRLock          Copy pcrlock.json for TPM2           │
+│  11. Unlock LUKS            TPM2 → PIN → Passphrase              │
+│  12. Activate LVM           Scan and activate volumes            │
+│  13. Try Resume             Hibernate resume from swap           │
+│  14. Find Root Device       cmdline → fstab → GPT autodiscovery  │
+│  15. fsck                   Check root filesystem                │
+│  16. Mount Root             Mount to /sysroot                    │
+│ 16a. Mount Non-Root FS      Mount /home etc. from fstab          │
+│ 16b. LVM Symlinks           Create persistent symlinks           │
+│  17. Cleanup udev           Settle, trigger graphics, stop       │
+│  18. Close Boot Log         Close log, unmount /boot             │
+│  19. Switch Root            Hand off to real init                │
 └──────────────────────────────────────────────────────────────────┘
 ```
 
@@ -202,13 +252,15 @@ See [docs/boot-flow.md](docs/boot-flow.md) for detailed documentation.
 ## Requirements
 
 **Build Requirements:**
-- Go 1.21+
+- Go 1.25+
 - make
 
 **Runtime Dependencies (included in initramfs):**
 - lvm2
 - systemd-udevd
-- tpm2-tools (optional, for PCR debugging)
+- systemd-pcrlock (for policy generation only, not runtime)
+
+**No external TPM or LUKS dependencies** — Vanguard's init binary uses native Go implementations for all crypto and TPM2 operations.
 
 ## Testing
 
@@ -225,19 +277,38 @@ See [docs/boot-flow.md](docs/boot-flow.md) for detailed documentation.
 
 ## Security Features
 
-- TPM2 sealed keys with PCR policy binding (PCR 4 for UKI, PCR 7 for Secure Boot)
-- PCRLock for predictable boot measurement validation
-- PIN protection for TPM2 tokens
-- Strict mode (`-s`): disables passphrase fallback when TPM2 token is present, halting if TPM2 unlock fails
-- Passphrase fallback when TPM2 fails (3 attempts before halt, unless strict mode)
+### Protection Layers
+
+| Layer | Mechanism |
+|-------|-----------|
+| **Disk Encryption** | LUKS2 (aes-xts-plain64 or aes-xts-essiv:sha256) with Argon2id/PBKDF2 key derivation |
+| **TPM Binding** | Sealed keys bound to TPM with PCR policy enforcement |
+| **PIN Protection** | PBKDF2-derived authentication value for TPM2 tokens |
+| **Boot Integrity** | PCRLock with PolicyAuthorizeNV — enforces expected PCR values before unlock |
+| **Strict Mode** | Disables passphrase fallback when TPM2 token is present |
+| **Process Isolation** | Static Go binary init (`CGO_ENABLED=0`) — no dynamic linking vulnerabilities |
+| **Minimal Surface** | Only essential binaries and modules included; no interpreters or package managers |
+
+### PCR Coverage
+
+| PCR | Name | Enforcement |
+|-----|------|:-----------:|
+| 2 | external-code | ✓ Enforced |
+| 3 | external-config | ✓ Enforced |
+| 4 | boot-loader-code | ✓ Enforced (multi-branch PolicyOR) |
+| 5 | GPT partition table | Optional (`-l` flag) |
+| 7 | secure-boot-policy | ✓ Enforced |
+| 13 | sysexts | — Unbound (all-zeros) |
+| 14 | shim-policy | — Unbound (all-zeros) |
+
+- TPM dictionary attack lockout detection prevents brute-force PIN attacks
 - Kernel message suppression during password entry
-- Static Go binary init (no dynamic linking vulnerabilities in init)
-- Minimal attack surface (only essential binaries included)
+- Passphrase fallback with 3 attempts before halt (unless strict mode)
 - Boot logging to `/boot/.vanguard.log` for audit trail
 
 ## License
 
-MIT License - see [LICENSE](LICENSE) for details.
+MIT License — see [LICENSE](LICENSE) for details.
 
 ## Contributing
 

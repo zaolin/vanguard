@@ -3,8 +3,8 @@ package main
 // CLI defines the root command structure with subcommands
 type CLI struct {
 	Generate      GenerateCmd      `cmd:"" help:"Generate initramfs image"`
-	UpdatePolicy  UpdatePolicyCmd  `cmd:"" name:"update-tpm-policy" help:"Update TPM2 pcrlock policy"`
-	VerifyPCRLock VerifyPCRLockCmd `cmd:"" name:"verify-pcrlock-setup" help:"Verify TPM2 pcrlock setup (PCRs, NV Index, LUKS)"`
+	Update        UpdatePolicyCmd  `cmd:"" name:"update" help:"Update TPM2 pcrlock policy"`
+	Verify        VerifyPCRLockCmd `cmd:"" name:"verify" help:"Verify TPM2 pcrlock setup (PCRs, NV Index, LUKS)"`
 	Status        StatusCmd        `cmd:"" help:"Show system protection status"`
 }
 
