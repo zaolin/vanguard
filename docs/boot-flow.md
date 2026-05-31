@@ -4,7 +4,7 @@ This document describes the complete boot sequence executed by the Vanguard init
 
 ## Overview
 
-Vanguard's init process is designed for systems with encrypted root filesystems using LUKS + LVM, with TPM2-based automatic unlocking. The boot sequence is carefully ordered to handle dependencies between components.
+Vanguard's init process is designed for systems with encrypted root filesystems using LUKS + LVM, with TPM2-based automatic unlocking via PCRLock policy. The init binary is a **static Go binary** (`CGO_ENABLED=0`) with native Go LUKS and TPM2 implementations — no external crypto or TPM binaries are needed at runtime.
 
 ## Boot Sequence Overview
 
@@ -24,22 +24,21 @@ flowchart TD
         I --> J[10. Setup PCRLock]
     end
 
-    subgraph phase3["Phase 3: Unlock Storage (Steps 11-12a)"]
-        K[11. Unlock LUKS Devices] --> L[11a. Trigger udev for dm-crypt]
-        L --> M[12. Activate LVM]
-        M --> N[12a. Trigger udev for LVM]
+    subgraph phase3["Phase 3: Unlock Storage (Steps 11-12)"]
+        K[11. Unlock LUKS Devices] --> L[12. Activate LVM]
     end
 
-    subgraph phase4["Phase 4: Mount Root (Steps 13-16a)"]
-        O[13. Try Hibernate Resume] --> P[14. Find Root Device]
-        P --> Q[15. Filesystem Check]
-        Q --> R[16. Mount Root]
-        R --> S[16a. Create LVM Symlinks]
+    subgraph phase4["Phase 4: Mount Root (Steps 13-16b)"]
+        M[13. Try Hibernate Resume] --> N[14. Find Root Device]
+        N --> O[15. Filesystem Check]
+        O --> P[16. Mount Root to /sysroot]
+        P --> Q[16a. Mount Non-Root FS from fstab]
+        Q --> R[16b. Create LVM Symlinks]
     end
 
     subgraph phase5["Phase 5: Switch Root (Steps 17-19)"]
-        T[17. Cleanup udev] --> U[18. Close Boot Log]
-        U --> V[19. Switch Root to init]
+        S[17. Cleanup udev] --> T[18. Close Boot Log]
+        T --> U[19. Switch Root to init]
     end
 
     phase1 --> phase2
@@ -62,8 +61,8 @@ flowchart TD
 flowchart LR
     subgraph mounts["Essential Mounts"]
         A["/proc"] --> B["/sys"]
-        B --> C["/dev"]
-        C --> D["/run"]
+        B --> C["/dev (devtmpfs)"]
+        C --> D["/run (tmpfs)"]
     end
     
     subgraph optional["Optional Mounts"]
@@ -76,55 +75,38 @@ flowchart LR
 
 | Mount Point | Type | Purpose |
 |-------------|------|---------|
-| `/proc` | procfs | Process info, cmdline |
+| `/proc` | procfs | Process info, cmdline parsing |
 | `/sys` | sysfs | Device tree |
 | `/dev` | devtmpfs | Device nodes |
 | `/run` | tmpfs | Runtime data |
 
 ### Step 3: Vconsole Configuration
 
-```mermaid
-flowchart TD
-    A[Parse /etc/vconsole.conf] --> B{Keymap set?}
-    B -->|Yes| C[loadkeys KEYMAP]
-    B -->|No| D{Check cmdline}
-    D -->|vconsole.keymap=| C
-    D -->|No| E[Skip keymap]
-    
-    C --> F{Font set?}
-    E --> F
-    F -->|Yes| G[setfont FONT]
-    F -->|No| H[Done]
-    G --> H
-```
+Loads keyboard layout and console font from `/etc/vconsole.conf` or kernel cmdline parameters (`vconsole.keymap=`, `vconsole.font=`). **Must happen before any password prompts** for correct non-US keyboard input.
 
-**Critical:** Must happen before any password prompts for non-US keyboard support.
-
-**Note:** In non-debug mode, the Bubbletea TUI starts after Step 3 (vconsole), providing visual stage progression through 13 boot stages defined in `init/tui/tui.go`.
+In non-debug mode, the Bubble Tea **boot TUI** starts after this step, providing visual stage progression with spinner, password prompts, and TPM lockout display.
 
 ## Phase 2: Device Discovery
 
 ### Step 4: Mount /boot Early
 
-The boot partition is mounted early to access `pcrlock.json` (if present) before LUKS unlock.
+The boot partition is mounted early to access the PCRLock policy file (at the UKI-relative path derived from the `LoaderImageIdentifier` EFI variable) before LUKS unlock.
 
 ```mermaid
 flowchart TD
     A[Start] --> B{boot= in cmdline?}
     B -->|Yes| C[Use specified device]
-    B -->|No| D[Scan partitions]
-    D --> E{Find pcrlock.json?}
+    B -->|No| D[Scan partitions for pcrlock.json]
+    D --> E{Found?}
     E -->|Yes| F[Use that partition]
-    E -->|No| G[/boot not found]
-    C --> H[Mount as FAT32]
+    E -->|No| G[/boot not mounted]
+    C --> H[Mount as VFAT rw]
     F --> H
-    H --> I[Return success]
-    G --> J[Return failure]
 ```
 
 ### Step 5: Init Boot Log
 
-If `/boot` was mounted successfully, the boot log is initialized at `/boot/.vanguard.log`. All subsequent console output is also logged.
+If `/boot` was mounted successfully, boot logging begins at `/boot/.vanguard.log`. All subsequent console output is also captured.
 
 ### Steps 6-10: Module Loading and TPM Setup
 
@@ -135,7 +117,8 @@ sequenceDiagram
     participant Kernel
     participant TPM
 
-    Init->>udevd: Start daemon
+    Init->>udevd: Start daemon with --resolve-names=never
+    Init->>udevd: Write db_persist rule (09-dm-persist.rules)
     Init->>Kernel: Load modules from /lib/modules
     Init->>udevd: Trigger events
     udevd->>Kernel: Request firmware
@@ -145,38 +128,46 @@ sequenceDiagram
     Init->>Init: Copy pcrlock.json to /var/lib/systemd/
 ```
 
+**db_persist rule:** A custom udev rule (`OPTIONS+="db_persist"` on DM devices) ensures device mapper state survives `switch_root` without needing explicit udev triggers.
+
 ## Phase 3: Unlock Encrypted Storage
 
 ### Step 11: LUKS Unlock Strategy
 
+Uses **native Go TPM2** (`internal/tpm/`) and **native Go LUKS** (`internal/luks/`) for all operations:
+
 ```mermaid
 flowchart TD
-    A[Scan /sys/block] --> B[Find LUKS devices]
-    B --> D{Has TPM2 token?}
+    A[Scan /sys/block for LUKS devices] --> D{Has TPM2 token?}
 
     D -->|Yes| E[Wait for /dev/tpmrm0]
     D -->|No| K
 
     E --> F{Token needs PIN?}
     F -->|No| G[Native Go TPM Unseal]
-    F -->|Yes| H[Prompt for PIN]
-    H --> I[Native Go TPM Unseal with PIN]
+    F -->|Yes| H[Prompt for PIN via TUI]
+    H --> I[Native Go TPM Unseal with PBKDF2-salted PIN]
 
     G --> J{Success?}
     I --> J
 
-    J -->|Yes| L[Device Unlocked]
+    J -->|Yes| L[Native Go dm-crypt setup via ioctl]
     J -->|No| M[Log PCR values for debug]
     M --> StrictCheck{Strict mode?}
     StrictCheck -->|Yes| P[HALT]
-    StrictCheck -->|No| K[Passphrase Fallback]
+    StrictCheck -->|No| K[TUI passphrase prompt]
 
-    K --> N[Prompt: Enter passphrase]
+    K --> N[Try each keyslot]
     N --> O{Correct?}
     O -->|Yes| L
-    O -->|No, attempts < 3| N
-    O -->|No, attempts = 3| P
+    O -->|No, < 3 attempts| N
+    O -->|No, = 3| P
 ```
+
+**Token strategy detection** (`init/luks/detect.go`):
+- **PIN-only** — no PCRs, no pcrlock → skips policy hash verification
+- **PCR policy** — traditional PCR binding → validates against enrolled PCRs
+- **PCRLock** — pcrlock.json found → builds super-PCR policy with PolicyAuthorizeNV
 
 ### Step 12: LVM Activation
 
@@ -185,34 +176,37 @@ flowchart TD
     A[pvscan --cache] --> B[vgscan]
     B --> C[vgchange -ay]
     C --> D[vgmknodes]
-    D --> E[Create symlinks]
-    E --> F["/dev/vg/lv → /dev/mapper/vg-lv"]
+    D --> E[dmsetup mknodes]
+    E --> F[Create /dev/vg/lv symlinks from lvs output]
+    F --> G[Wait for device nodes with retry]
+    G --> H[Verify volume accessibility]
 ```
+
+**No `DM_DISABLE_UDEV=1` is set** — udev handles device node creation through `10-dm.rules` and `11-dm-lvm.rules`. The db_persist rule ensures state survives switch_root.
 
 ## Phase 4: Mount Root
 
 ### Step 13: Hibernate Resume
 
+Attempts resume **after** LUKS unlock and LVM activation since swap is typically inside the encrypted volume.
+
 ```mermaid
 flowchart TD
     A{resume= in cmdline?} -->|No| B[Skip resume]
-    A -->|Yes| C[Normalize LVM path]
+    A -->|Yes| C[Normalize LVM path to /dev/mapper/vg-lv]
     C --> D[Wait for device 5s]
     D --> E{Device exists?}
     E -->|No| B
-    E -->|Yes| F[Get major:minor]
+    E -->|Yes| F[Get major:minor from sysfs]
     F --> G{resume_offset= set?}
     G -->|Yes| H[Write to /sys/power/resume_offset]
     G -->|No| I[Write to /sys/power/resume]
     H --> I
     I --> J{Hibernation image?}
-    J -->|Yes| K[Kernel restores memory]
-    K --> L[Resume execution - never returns]
+    J -->|Yes| K[Kernel restores memory — never returns]
     J -->|No| B
     B --> M[Continue boot]
 ```
-
-**Note:** Resume happens AFTER LUKS+LVM because swap is typically inside the encrypted volume. The LVM path `/dev/vg0/swap` is automatically normalized to `/dev/mapper/vg0-swap`.
 
 ### Step 14: Find Root Device
 
@@ -223,8 +217,8 @@ flowchart TD
     B -->|No| D{Root in /etc/fstab?}
     D -->|Yes| E[Use fstab device]
     D -->|No| F{GPT auto enabled?}
-    F -->|Yes| G[Scan GPT tables]
-    G --> H{Find root GUID?}
+    F -->|Yes| G[Scan GPT tables for root GUID]
+    G --> H{Found?}
     H -->|Yes| I[Use discovered device]
     H -->|No| J[HALT: No root found]
     F -->|No| J
@@ -234,31 +228,39 @@ flowchart TD
     I --> K
 ```
 
-**Root GUID for x86-64:** `4f68bce3-e8cd-4db1-96e7-fbcaf984b709`
+**LVM path normalization** (`/dev/vg0/root` → `/dev/mapper/vg0-root`) is applied to all discovered devices.
 
-### Step 15: Filesystem Check
+### Step 15: fsck
+
+Runs filesystem check before mounting root. Can be disabled with `vanguard.fsck=0` or `fsck.mode=skip` on the kernel cmdline.
+
+### Step 16: Mount Root
+
+Mounts the root filesystem to `/sysroot` using the detected filesystem type (from fstab, magic bytes, or blkid-style fallback).
+
+### Step 16a: Mount Non-Root Filesystems
 
 ```mermaid
 flowchart TD
-    A{fsck disabled?} -->|Yes| B[Skip fsck]
-    A -->|No| C[Find fsck binary]
-    C --> D{Binary found?}
-    D -->|No| B
-    D -->|Yes| E{Filesystem type?}
-    E -->|ext2/3/4| F[Run fsck.ext4 -y]
-    E -->|xfs| G[Run xfs_repair -n]
-    E -->|btrfs| B
-    F --> H{Exit code}
-    G --> H
-    H -->|0: Clean| I[Continue]
-    H -->|1: Corrected| I
-    H -->|2: Reboot needed| I
-    H -->|4+: Uncorrectable| J[Warning - continue anyway]
-    J --> I
-    B --> I
+    A[Read /sysroot/etc/fstab] --> B{Entry is /?}
+    B -->|Yes| C[Skip]
+    B -->|No| D{Pseudo-FS type?}
+    D -->|proc, tmpfs, swap, etc.| C
+    D -->|No| E{noauto option?}
+    E -->|Yes| C
+    E -->|No| F[Normalize LVM path]
+    F --> G{Device exists?}
+    G -->|No| C
+    G -->|Yes| H[Create mount point under /sysroot]
+    H --> I[Mount with filesystem type from fstab]
+    I --> J[Systemd finds them already mounted after switch_root]
 ```
 
-**Note:** btrfs check is skipped at boot time as it's not recommended. Filesystem check can be disabled with `vanguard.fsck=0` or `fsck.mode=skip`.
+**Why this matters:** After switch_root, the udev database may have `SYSTEMD_READY=0` on DM devices from coldplug non-primary events. By mounting `/home` and other non-root filesystems in the initramfs, systemd inherits pre-mounted filesystems and doesn't wait for device nodes that may never become "ready."
+
+### Step 16b: Create LVM Symlinks
+
+Creates `/dev/<vg>/<lv>` → `/dev/mapper/<vg>-<lv>` symlinks in the initramfs devtmpfs. Since switch_root uses `MS_MOVE` to transfer `/dev` to `/sysroot/dev`, these symlinks survive unscathed into the real root.
 
 ## Phase 5: Switch Root
 
@@ -272,19 +274,25 @@ sequenceDiagram
     participant NewInit
 
     Init->>udevd: udevadm settle (5s)
-    Init->>udevd: cleanup-db
-    Init->>udevd: Stop daemon
+    Init->>udevd: Trigger graphics (DRM subsystem)
+    Init->>udevd: Settle (2s)
+    Init->>udevd: Stop daemon gracefully (SIGTERM)
     
+    Init->>Init: Ensure LVM symlinks in /dev
     Init->>Init: Close boot log
     Init->>Kernel: Unmount /boot
     
-    Init->>Kernel: Move /proc to /sysroot/proc
-    Init->>Kernel: Move /sys to /sysroot/sys
-    Init->>Kernel: Move /dev to /sysroot/dev
-    Init->>Kernel: Move /run to /sysroot/run
+    Init->>Init: Stop TUI, reset terminal
     
-    Init->>Kernel: chroot /sysroot
-    Init->>NewInit: Try exec in order
+    Init->>Kernel: MS_MOVE /proc to /sysroot/proc
+    Init->>Kernel: MS_MOVE /sys to /sysroot/sys
+    Init->>Kernel: MS_MOVE /dev to /sysroot/dev
+    Init->>Kernel: MS_MOVE /run to /sysroot/run
+    
+    Init->>Kernel: chdir /sysroot
+    Init->>Kernel: MS_MOVE /sysroot to /
+    Init->>Kernel: chroot . ; chdir /
+    Init->>NewInit: exec init
     
     Note over NewInit: 1. /usr/lib/systemd/systemd
     Note over NewInit: 2. /lib/systemd/systemd
@@ -292,7 +300,7 @@ sequenceDiagram
     Note over NewInit: 4. /init
 ```
 
-**Note:** Vanguard tries multiple init paths in order. The first one that exists and executes successfully is used.
+**Critical:** The TUI is stopped and terminal reset **before** switch_root to release the DRM master lock and restore normal terminal state for systemd.
 
 ## Error Handling
 
@@ -302,7 +310,7 @@ flowchart TD
         A[No console]
         B[Essential mount fails]
         C[No LUKS devices found]
-        D[LUKS unlock fails after 3 attempts]
+        D[LUKS unlock fails after 3 passphrase attempts]
         E[Root device not found]
         F[Root mount fails]
         G[No init found on root]
@@ -315,6 +323,8 @@ flowchart TD
         K[Vconsole config fails]
         L[Resume fails]
         M[PCRLock setup fails]
+        N[Non-root FS mount fails]
+        O[LVM symlink creation fails]
     end
 ```
 
@@ -328,9 +338,10 @@ When ESP is mounted, events are logged to `/boot/.vanguard.log`:
 2024-01-15T10:30:00Z BOOT_MOUNTED status=ok
 2024-01-15T10:30:01Z MODULES_LOADED count=15
 2024-01-15T10:30:02Z PCRLOCK found=true
-2024-01-15T10:30:03Z LUKS_UNLOCK device=/dev/sda2 method=tpm2 status=ok
+2024-01-15T10:30:03Z LUKS_UNLOCK device=/dev/nvme0n1p2 method=token status=ok
 2024-01-15T10:30:04Z LVM_ACTIVATE status=ok
-2024-01-15T10:30:05Z ROOT_MOUNTED target=/sysroot device=/dev/vg0/root status=ok
+2024-01-15T10:30:05Z ROOT_MOUNTED target=/sysroot device=/dev/gentoo/root status=ok
+2024-01-15T10:30:05Z DEBUG msg=/home mounted on /sysroot/home
 2024-01-15T10:30:05Z SWITCHROOT target=/sysroot
 ```
 
@@ -338,54 +349,17 @@ When ESP is mounted, events are logged to `/boot/.vanguard.log`:
 
 Enable verbose output with: `vanguard generate -d -o /boot/initramfs-linux.img`
 
-Debug output shows all boot steps:
-```
-vanguard: starting init
-vanguard: mounting filesystems
-vanguard: configuring vconsole
-vanguard: loaded keymap us
-vanguard: mounting /boot early
-vanguard: starting udevd
-...
-```
+Debug output shows all boot steps with detailed TPM2, LUKS, and LVM status messages. In debug mode, the boot TUI is disabled so all output goes directly to the console.
 
-## Complete Boot Timeline
+## Build Variants
 
-```mermaid
-gantt
-    title Vanguard Boot Sequence (19 steps + substeps)
-    dateFormat X
-    axisFormat %s
+Vanguard produces 4 init binaries via Go build tags from the same source:
 
-    section Phase 1 (Steps 1-3)
-    1. Console Setup        :a1, 0, 1
-    2. Mount Filesystems    :a2, after a1, 1
-    3. Vconsole Config      :a3, after a2, 1
+| Build Tags | Binary | Output | Passphrase Fallback |
+|------------|--------|--------|:---:|
+| (none) | `init` | Minimal | ✓ |
+| `debug` | `init-debug` | Verbose | ✓ |
+| `strict` | `init-strict` | Minimal | ✗ |
+| `debug,strict` | `init-debug-strict` | Verbose | ✗ |
 
-    section Phase 2 (Steps 4-10)
-    4. Mount /boot          :b1, after a3, 1
-    5. Init Boot Log        :b2, after b1, 1
-    6. Start udevd          :b3, after b2, 1
-    7. Load Modules         :b4, after b3, 2
-    8. Trigger udev         :b5, after b4, 3
-    9. Load TPM Modules     :b6, after b5, 1
-    10. Setup PCRLock       :b7, after b6, 1
-
-    section Phase 3 (Steps 11-12a)
-    11. Unlock LUKS         :c1, after b7, 3
-    11a. udev dm-crypt      :c2, after c1, 2
-    12. Activate LVM        :c3, after c2, 2
-    12a. udev LVM           :c4, after c3, 2
-
-    section Phase 4 (Steps 13-16a)
-    13. Try Resume          :d1, after c4, 1
-    14. Find Root           :d2, after d1, 1
-    15. fsck                :d3, after d2, 2
-    16. Mount Root          :d4, after d3, 1
-    16a. LVM Symlinks       :d5, after d4, 1
-
-    section Phase 5 (Steps 17-19)
-    17. Cleanup udev        :e1, after d5, 1
-    18. Close Boot Log      :e2, after e1, 1
-    19. Switch Root         :e3, after e2, 1
-```
+The generator selects the appropriate embedded binary based on the `-d` and `-s` flags.

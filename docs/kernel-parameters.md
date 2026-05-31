@@ -242,6 +242,6 @@ flowchart TD
 
 ## See Also
 
-- [Boot Flow](boot-flow.md) - Detailed boot sequence documentation
-- [Configuration](configuration.md) - CLI and configuration file options
-- [TPM2 Setup](tpm2-setup.md) - TPM2 enrollment and policy setup
+- [Boot Flow](boot-flow.md) — Detailed boot sequence documentation
+- [Configuration](configuration.md) — CLI and configuration file options
+- [TPM2 Setup](tpm2-setup.md) — TPM2 enrollment and PCRLock policy setup

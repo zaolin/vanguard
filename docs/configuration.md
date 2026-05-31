@@ -41,16 +41,19 @@ vanguard generate -o /boot/initramfs-linux.img \
 # Debug mode
 vanguard generate -o /boot/initramfs-linux.img -d
 
+# Strict mode (no passphrase fallback with TPM2 token)
+vanguard generate -o /boot/initramfs-linux.img -s
+
 # Using config file
 vanguard generate --config /etc/vanguard.toml
 ```
 
-### update-tpm-policy
+### update
 
 Update TPM2 PCRLock policy for secure boot. Requires root privileges.
 
 ```bash
-vanguard update-tpm-policy [options]
+vanguard update [options]
 ```
 
 #### Options
@@ -65,31 +68,97 @@ vanguard update-tpm-policy [options]
 | `--verbose` | `-v` | bool | `false` | Show verbose output from pcrlock tools |
 | `--cleanup` | `-c` | bool | `false` | Remove old unused pcrlock NV indices from TPM |
 
-#### What It Does
+#### 5-Phase Execution
 
-1. Configures PCR masks (disables PCR 15 which causes timing issues with Vanguard)
-2. Locks Secure Boot state (PCR 7)
-3. Locks GPT partition table (PCR 5) - **auto-enabled when `--luks-device` is specified**
-4. Locks UKI measurement (PCR 4) using `lock-pe` with `lock-uki` fallback
-5. Generates policy with recovery PIN prompt
-6. Verifies the generated policy
+1. **PCR Masks** — Masks noisy/unstable PCRs, unmaskes stable PCRs 2, 3
+2. **Lock PCRs** — Locks Secure Boot (PCR 7), GPT (PCR 5, with `-l`), UKI (PCR 4 with PE fallback)
+3. **Make Policy** — Runs `systemd-pcrlock make-policy` with recovery PIN
+4. **Verify** — Validates that PCR 7 is present in the generated policy
+5. **Integrity Check** — Verifies NV index sync and PCR values against the TPM
 
 #### Examples
 
 ```bash
 # Basic policy update
-sudo vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi
+sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi
 
 # With custom output path
-sudo vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi \
-  -p /boot/pcrlock.json
+sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -p /boot/custom.json
 
-# With LUKS device for token verification
-sudo vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi \
-  -l /dev/sda2
+# With LUKS device (enables GPT binding on PCR 5)
+sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2
 
 # Skip verification
-sudo vanguard update-tpm-policy -u /boot/EFI/Linux/kernel.efi --no-verify
+sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi --no-verify
+
+# Clean up old NV indices
+sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 -c
+```
+
+### verify
+
+Verify TPM2 pcrlock setup (PCRs, NV Index, LUKS token).
+
+```bash
+vanguard verify [options]
+```
+
+#### Options
+
+| Option | Short | Type | Default | Description |
+|--------|-------|------|---------|-------------|
+| `--policy-path` | `-p` | string | *required* | Path to pcrlock.json policy file |
+| `--luks-device` | `-l` | string | | LUKS device to verify token on |
+
+#### Checks Performed
+
+1. **NV Index Synchronization** — TPM auth policy + size vs policy file
+2. **PCR Validation** — Current PCR values against policy expectations
+3. **LUKS Token** — Token NV index match + pcrlock enforcement (with `-l`)
+
+#### Examples
+
+```bash
+# Verify NV index and PCRs
+sudo vanguard verify -p /boot/EFI/Gentoo/kernel.pcrlock.json
+
+# Include LUKS token validation
+sudo vanguard verify -p /boot/EFI/Gentoo/kernel.pcrlock.json -l /dev/nvme0n1p2
+```
+
+### status
+
+Show system protection status.
+
+```bash
+vanguard status [options]
+```
+
+#### Options
+
+| Option | Short | Type | Default | Description |
+|--------|-------|------|---------|-------------|
+| `--json` | | bool | `false` | Machine-readable JSON output |
+| `-v, --verbose` | | bool | `false` | Show full PCR hash values |
+
+#### What It Shows
+
+- **Protection tier** — HIGH / MEDIUM / LOW / WARNING with visual bar
+- **LUKS encryption** — Device, UUID, slots, token type + flags (PIN, pcrlock, SRK)
+- **TPM 2.0** — Device presence, dictionary attack lockout state
+- **Boot integrity** — Per-PCR status with enforced/unbound classification, NV index sync, Secure Boot detection (PCR 7)
+
+#### Examples
+
+```bash
+# Show protection status
+vanguard status
+
+# Machine-readable output
+vanguard status --json
+
+# Verbose PCR details
+vanguard status -v
 ```
 
 ## Configuration File
@@ -138,7 +207,6 @@ modules = [
 - **Type:** string
 - **Default:** `zstd`
 - **Values:** `zstd`, `gzip`, `none`
-- **Description:** Compression algorithm for the initramfs.
 
 | Algorithm | Speed | Size | Notes |
 |-----------|-------|------|-------|
@@ -149,12 +217,12 @@ modules = [
 #### debug
 - **Type:** bool
 - **Default:** `false`
-- **Description:** When enabled, the init binary outputs verbose messages during boot. Useful for debugging boot issues.
+- **Description:** When enabled, the init binary outputs verbose messages during boot. Useful for debugging boot issues. Equivalent to `-d` flag.
 
 #### strict_mode
 - **Type:** bool
 - **Default:** `false`
-- **Description:** When enabled with a TPM2 token present, disables passphrase fallback. Boot halts if TPM2 unlock fails.
+- **Description:** When enabled with a TPM2 token present, disables passphrase fallback. Boot halts if TPM2 unlock fails. Equivalent to `-s` flag.
 
 #### firmware
 - **Type:** array of strings
@@ -171,20 +239,17 @@ modules = [
 The generator automatically includes these binaries and their library dependencies:
 
 | Binary | Purpose | Required |
-|--------|---------|----------|
-| `cryptsetup` | LUKS device management | Yes |
+|--------|---------|:--------:|
 | `lvm` | LVM volume management | Yes |
 | `dmsetup` | Device mapper control (udev rules require `/sbin/dmsetup`) | Yes |
 | `systemd-udevd` | Device event daemon | Yes |
 | `udevadm` | udev administration | Yes |
-| `tpm2_pcrread` | TPM PCR debugging (shows values on unlock failure) | Optional |
-| `tpm2_pcrextend` | TPM PCR extension (LUKS header measurement) | Optional |
 | `loadkeys` | Keyboard layout loading | Optional |
 | `setfont` | Console font loading | Optional |
 | `fsck` | Generic filesystem check wrapper | Optional |
 | `fsck.ext4` / `e2fsck` | ext4 filesystem check | Optional |
 
-The generator searches multiple paths for each binary (e.g., `/usr/bin/`, `/sbin/`, `/bin/`) and uses the first one found.
+**LUKS and TPM2 operations use native Go** — no `cryptsetup` or `tpm2-tools` binaries are needed at runtime. The init binary handles LUKS header parsing, key derivation, dm-crypt setup, and TPM2 sealed key unseal internally.
 
 ## Included Files
 
@@ -193,25 +258,34 @@ The generator searches multiple paths for each binary (e.g., `/usr/bin/`, `/sbin
 | File | Purpose |
 |------|---------|
 | `/etc/fstab` | Root device detection (fallback if `root=` not in cmdline) |
-| `/etc/vconsole.conf` | Keyboard/font settings (only if file exists) |
+
+### Conditional
+
+| File | Condition |
+|------|-----------|
+| `/etc/vconsole.conf` | Included if file exists on host |
+| Keymap data files | Included if `/usr/share/kbd/keymaps` or `/lib/kbd/keymaps` exists |
 
 ### udev Rules
 
-Minimal set of udev rules for device-mapper:
+Minimal set of udev rules for device-mapper and graphics:
 
-- `09-dm-persist.rules` - Custom rule for switch_root survival
-- `10-dm.rules` - Core device-mapper rules
-- `11-dm-lvm.rules` - LVM symlink creation
-- `13-dm-disk.rules` - DM disk symlinks
-- `95-dm-notify.rules` - udev completion signaling
-
-## Environment Variables
-
-Vanguard does not currently use environment variables for configuration. All settings are passed via command line or config file.
+| Rule | Purpose |
+|------|---------|
+| `09-dm-persist.rules` | Custom: db_persist for DM devices across switch_root |
+| `10-dm.rules` | Core device-mapper rules |
+| `11-dm-lvm.rules` | LVM symlink creation (`/dev/<vg>/<lv>`) |
+| `13-dm-disk.rules` | DM disk symlinks |
+| `50-udev-default.rules` | Default device permissions |
+| `60-drm.rules` | DRM device rules (graphics/Wayland) |
+| `70-uaccess.rules` | User access control |
+| `71-seat.rules` | Multi-seat device handling |
+| `73-seat-late.rules` | Late seat assignment |
+| `95-dm-notify.rules` | udev completion signaling (dmsetup udevcomplete) |
 
 ## Precedence
 
-When the same option is specified in multiple places, the following precedence applies (highest to lowest):
+When the same option is specified in multiple places (highest to lowest):
 
 1. Command line flags
 2. Configuration file
@@ -228,13 +302,9 @@ vanguard generate -c zstd --config /etc/vanguard.toml -o /boot/initramfs.img
 ## Validation
 
 The generator validates:
-
 - Output path is writable
 - Firmware files exist in `/lib/firmware/`
-- Required binaries are available
+- Required binaries are available on the host
 - Compression algorithm is valid
 
-Warnings are printed for:
-- Missing optional binaries (tpm2_pcrread, etc.)
-- Missing firmware files
-- Missing kernel modules
+Warnings are printed for missing optional binaries or firmware files.
