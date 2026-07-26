@@ -165,6 +165,27 @@ func copyPasswdEntries(archive *intcpio.Archive, users []string) int {
 	return len(entries)
 }
 
+// sanitizeInitramfsPath strips a leading "/" from an absolute path and rejects
+// any path containing ".." components, preventing path traversal outside the
+// initramfs root. Returns the cleaned relative path or an error.
+func sanitizeInitramfsPath(p string) (string, error) {
+	// Strip leading slash
+	p = strings.TrimPrefix(p, "/")
+
+	// Clean the path and reject any ".." components
+	cleaned := filepath.Clean(p)
+	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
+		return "", fmt.Errorf("path traversal detected: %q escapes initramfs root", p)
+	}
+
+	// Reject absolute paths (after cleaning, should never happen but be safe)
+	if filepath.IsAbs(cleaned) {
+		return "", fmt.Errorf("absolute path not allowed in initramfs: %q", p)
+	}
+
+	return cleaned, nil
+}
+
 func runGenerate(cfg *config.Config) error {
 	fmt.Printf("vanguard: generating initramfs\n")
 	fmt.Printf("  output: %s\n", cfg.Output)
@@ -247,7 +268,11 @@ func runGenerate(cfg *config.Config) error {
 
 		// Add firmware files to early CPIO
 		for _, fw := range fwFiles {
-			dstPath := fw.DstPath[1:] // Remove leading /
+			dstPath, err := sanitizeInitramfsPath(fw.DstPath)
+			if err != nil {
+				fmt.Printf("  warning: skipping firmware %s: %v\n", fw.DstPath, err)
+				continue
+			}
 
 			// Create parent directories
 			dir := filepath.Dir(dstPath)
@@ -474,7 +499,11 @@ func runGenerate(cfg *config.Config) error {
 
 	// Add kernel modules
 	for _, mod := range modFiles {
-		dstPath := mod.DstPath[1:] // Remove leading /
+		dstPath, err := sanitizeInitramfsPath(mod.DstPath)
+		if err != nil {
+			fmt.Printf("  warning: skipping module %s: %v\n", mod.DstPath, err)
+			continue
+		}
 		// Create parent directories for modules
 		modDir := filepath.Dir(dstPath)
 		if !seen[modDir] {
@@ -685,7 +714,10 @@ func addKeymapFiles(archive *intcpio.Archive, rootDir string) int {
 		if strings.HasSuffix(name, ".map") || strings.HasSuffix(name, ".map.gz") ||
 			strings.HasSuffix(name, ".map.bz2") || strings.HasSuffix(name, ".kmap") ||
 			strings.HasSuffix(name, ".kmap.gz") {
-			dstPath := path[1:] // strip leading /
+			dstPath, err := sanitizeInitramfsPath(path)
+			if err != nil {
+				return nil
+			}
 			if err := archive.AddFileFromDisk(path, dstPath); err == nil {
 				count++
 			}

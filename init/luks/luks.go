@@ -264,9 +264,14 @@ func (d *Device) UnlockWithTPM2() error {
 		return fmt.Errorf("%w", intpm.ErrTPMUnavailable)
 	}
 
-	// Check lockout status
+	// Check lockout status. If the read fails, treat it as a potential
+	// lockout — proceeding could burn additional DA counter slots.
 	status, err := tpmClient.GetLockoutStatus()
-	if err == nil && status.InLockout {
+	if err != nil {
+		LogFunc("TPM_LOCKOUT_READ_FAILED", "device", d.Path, "error", err.Error())
+		return fmt.Errorf("failed to read TPM lockout status: %w", err)
+	}
+	if status.InLockout {
 		msg := "TPM locked - too many failed attempts"
 		hint := ""
 		if status.LockoutRecovery > 0 {

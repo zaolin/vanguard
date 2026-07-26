@@ -136,6 +136,11 @@ func (c *Client) openTPM() (transport.TPMCloser, error) {
 }
 
 // GetLockoutStatus reads the TPM lockout status.
+//
+// If any property read fails, the error is returned — callers must not
+// proceed to attempt unseal when lockout status is unavailable, as a
+// failed read could mask a real lockout and the subsequent unseal attempt
+// would burn additional dictionary-attack counter slots.
 func (c *Client) GetLockoutStatus() (*LockoutStatus, error) {
 	tpm, err := c.openTPM()
 	if err != nil {
@@ -147,19 +152,22 @@ func (c *Client) GetLockoutStatus() (*LockoutStatus, error) {
 
 	// Read TPM properties for lockout info
 	lockoutCounter, err := getTPMProperty(tpm, tpm2.TPMPTLockoutCounter)
-	if err == nil {
-		status.LockoutCounter = uint64(lockoutCounter)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read lockout counter: %w", err)
 	}
+	status.LockoutCounter = uint64(lockoutCounter)
 
 	maxAuthFail, err := getTPMProperty(tpm, tpm2.TPMPTMaxAuthFail)
-	if err == nil {
-		status.MaxAuthFail = uint64(maxAuthFail)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read max auth fail: %w", err)
 	}
+	status.MaxAuthFail = uint64(maxAuthFail)
 
 	lockoutRecovery, err := getTPMProperty(tpm, tpm2.TPMPTLockoutRecovery)
-	if err == nil {
-		status.LockoutRecovery = uint64(lockoutRecovery)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read lockout recovery: %w", err)
 	}
+	status.LockoutRecovery = uint64(lockoutRecovery)
 
 	// Check if in lockout
 	if status.MaxAuthFail > 0 && status.LockoutCounter >= status.MaxAuthFail {

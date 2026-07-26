@@ -1,6 +1,8 @@
 package main
 
 import (
+	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
@@ -32,6 +34,7 @@ type tpmStatus struct {
 	InLockout      bool   `json:"inLockout"`
 	LockoutCounter uint64 `json:"lockoutCounter"`
 	MaxAuthFail    uint64 `json:"maxAuthFail"`
+	LockoutError   string `json:"lockoutError,omitempty"`
 }
 
 type luksDeviceInfo struct {
@@ -143,7 +146,9 @@ func collectTPMStatus(data *statusData) {
 
 	client := tpm.New()
 	status, err := client.GetLockoutStatus()
-	if err == nil {
+	if err != nil {
+		data.TPM.LockoutError = err.Error()
+	} else {
 		data.TPM.InLockout = status.InLockout
 		data.TPM.LockoutCounter = status.LockoutCounter
 		data.TPM.MaxAuthFail = status.MaxAuthFail
@@ -194,8 +199,8 @@ func parseTokenDetail(payload []byte) tokenDetail {
 	if raw.PCRLockNV != 0 {
 		td.NVIndex = raw.PCRLockNV
 	} else if raw.PCRLockNVAlt != "" {
-		nvBytes, err := base64Decode(raw.PCRLockNVAlt)
-		if err == nil && len(nvBytes) >= 4 {
+	nvBytes, err := base64.StdEncoding.DecodeString(raw.PCRLockNVAlt)
+	if err == nil && len(nvBytes) >= 4 {
 			td.NVIndex = uint32(nvBytes[0])<<24 | uint32(nvBytes[1])<<16 |
 				uint32(nvBytes[2])<<8 | uint32(nvBytes[3])
 		}
@@ -209,63 +214,6 @@ func parseTokenDetail(payload []byte) tokenDetail {
 	}
 
 	return td
-}
-
-func base64Decode(s string) ([]byte, error) {
-	dst := make([]byte, len(s))
-	n, err := base64DecodeInto(dst, []byte(s))
-	if err != nil {
-		return nil, err
-	}
-	return dst[:n], nil
-}
-
-func base64DecodeInto(dst, src []byte) (int, error) {
-	var buf [4]byte
-	var writeIdx, i int
-	table := [256]byte{}
-	for j := 0; j < 26; j++ {
-		table['A'+j] = byte(j)
-	}
-	for j := 0; j < 26; j++ {
-		table['a'+j] = byte(26 + j)
-	}
-	for j := 0; j < 10; j++ {
-		table['0'+j] = byte(52 + j)
-	}
-	table['+'] = 62
-	table['/'] = 63
-	table['='] = 0xFF
-
-	for _, c := range src {
-		if c >= 128 || table[c] == 0 && c != 'A' && c != '=' {
-			continue
-		}
-		if c == '=' {
-			break
-		}
-		buf[i] = table[c]
-		i++
-		if i == 4 {
-			dst[writeIdx] = buf[0]<<2 | buf[1]>>4
-			writeIdx++
-			dst[writeIdx] = buf[1]<<4 | buf[2]>>2
-			writeIdx++
-			dst[writeIdx] = buf[2]<<6 | buf[3]
-			writeIdx++
-			i = 0
-		}
-	}
-	if i == 2 {
-		dst[writeIdx] = buf[0]<<2 | buf[1]>>4
-		writeIdx++
-	} else if i == 3 {
-		dst[writeIdx] = buf[0]<<2 | buf[1]>>4
-		writeIdx++
-		dst[writeIdx] = buf[1]<<4 | buf[2]>>2
-		writeIdx++
-	}
-	return writeIdx, nil
 }
 
 func findPCRLockPolicy() string {
@@ -475,35 +423,11 @@ func bytesEqual(a, b []byte) bool {
 }
 
 func hexDecode(s string) ([]byte, error) {
-	dst := make([]byte, len(s)/2)
-	for i := 0; i < len(s); i += 2 {
-		b := hexVal(s[i])<<4 | hexVal(s[i+1])
-		dst[i/2] = b
-	}
-	return dst, nil
-}
-
-func hexVal(c byte) byte {
-	switch {
-	case c >= '0' && c <= '9':
-		return c - '0'
-	case c >= 'a' && c <= 'f':
-		return c - 'a' + 10
-	case c >= 'A' && c <= 'F':
-		return c - 'A' + 10
-	default:
-		return 0
-	}
+	return hex.DecodeString(s)
 }
 
 func hexEncode(b []byte) string {
-	const h = "0123456789abcdef"
-	dst := make([]byte, len(b)*2)
-	for i, v := range b {
-		dst[i*2] = h[v>>4]
-		dst[i*2+1] = h[v&0x0f]
-	}
-	return string(dst)
+	return hex.EncodeToString(b)
 }
 
 func computeTier(data *statusData) {
