@@ -249,7 +249,7 @@ Vanguard keeps the current policy NV index and the LUKS token's NV index, removi
 
 ### TPM Unlock Fails — PCR Mismatch
 
-**Symptom:** Boot falls back to passphrase with TPM error.
+**Symptom:** Boot falls back to passphrase with TPM errors.
 
 **Debug:** With debug mode (`-d`), Vanguard logs PCRs and current values to the boot log at `/boot/.vanguard.log`.
 
@@ -264,6 +264,43 @@ sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto \
   --tpm2-with-pin=yes \
   --tpm2-pcrlock=/boot/EFI/Gentoo/kernel.pcrlock.json \
   /dev/nvme0n1p2
+```
+
+### "PCR 7 missing from policy" — Stale Firmware Components
+
+**Symptom:** `vanguard update` fails with `policy verification failed: PCR 7 missing from policy`. Verbose output shows `No PCRs kept in protection mask` or `PCR 0 event log contains unrecognized measurements`.
+
+**Root cause:** The auto-generated firmware component files in `/var/lib/pcrlock.d/` (e.g. `250-firmware-code-early.pcrlock.d/generated.pcrlock`) are stale — they were generated from a previous boot or firmware version and their digests no longer match the current event log. When `systemd-pcrlock make-policy` can't match a component, it drops the PCR from the protection mask. Since PCR 0/1 are at the root of the component dependency chain, dropping them cascades to drop ALL PCRs — including PCR 7.
+
+**Fix:** Vanguard automatically regenerates firmware components before `make-policy` by running `systemd-pcrlock lock-firmware-code` and `lock-firmware-config` (or the Varlink `Lock` method on systemd 262+). If this still fails:
+
+```bash
+# Check the component file age
+ls -la /var/lib/pcrlock.d/250-firmware-code-early.pcrlock.d/generated.pcrlock
+
+# Manually regenerate firmware components
+sudo systemd-pcrlock lock-firmware-code
+sudo systemd-pcrlock lock-firmware-config
+
+# Re-run vanguard update
+sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 -v
+```
+
+### "PCR 0 touched by component we can't find" — Unmasked OS Separator
+
+**Symptom:** Verbose output shows `PCR 0 is touched by component we can't find in event log` even after firmware component regeneration.
+
+**Root cause:** systemd-pcrlock's `750-os-separator.pcrlock` and `770-nvpcr-separator.pcrlock` components expect systemd's userspace PCR measurements (EV_SEPARATOR events). Vanguard's custom init does not extend these PCRs, so the components can never match. When a component can't match, `systemd-pcrlock` drops every PCR it touches (0–7, 9, 12–14), cascading to drop ALL PCRs.
+
+**Fix:** Vanguard masks these components (symlinks to `/dev/null` in `/etc/pcrlock.d/`). This is handled automatically by `ConfigureMasks()` during `vanguard update`. If the masks are missing:
+
+```bash
+# Check that masks exist
+ls -la /etc/pcrlock.d/750-os-separator.pcrlock /etc/pcrlock.d/770-nvpcr-separator.pcrlock
+# Both should be symlinks to /dev/null
+
+# Re-run vanguard update to recreate masks
+sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 -v
 ```
 
 ### TPM Device Not Found
@@ -285,6 +322,82 @@ Vanguard loads `tpm_crb`, `tpm_tis`, and `tpm_tis_core` modules automatically.
 **Check:** TPM lockout status with `vanguard status`.
 
 **Solution:** Wait for lockout recovery period (shown in boot TUI), then re-enter correct PIN.
+
+## Firmware Updates and fwupd Coexistence
+
+### How fwupd interacts with pcrlock
+
+[fwupd](https://fwupd.org/) 2.1.7+ includes a `systemd-pcrlock` plugin that coordinates with `systemd-pcrlock` to prevent disk lockout after firmware or SecureBoot updates. The plugin uses the `io.systemd.PCRLock` Varlink interface (requires systemd 262+).
+
+**Before a firmware update**, fwupd:
+1. Calls `io.systemd.PCRLock.Lock{category, lock=false}` for affected categories (firmwareCode, firmwareConfig, secureBootPolicy, secureBootAuthority)
+2. Calls `io.systemd.PCRLock.MakePolicy` to regenerate systemd's policy without the removed measurements
+3. Applies the firmware update
+4. Reboots
+
+**After reboot**, systemd's `systemd-pcrlock-secureboot-policy.service` and related units re-lock the policy against the new measurements.
+
+### Vanguard's separate policy
+
+Vanguard uses its own pcrlock policy at `/boot/EFI/Gentoo/kernel.pcrlock.json` with a separate TPM NV index. fwupd's plugin only regenerates systemd's policy at `/var/lib/systemd/pcrlock.json` — it does **not** touch vanguard's policy.
+
+This means after a firmware/SecureBoot update, you must regenerate vanguard's policy **before rebooting**:
+
+```bash
+# After fwupd applies the update but BEFORE rebooting:
+sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2
+
+# Re-enroll the LUKS token with the new policy
+sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto \
+  --tpm2-with-pin=yes \
+  --tpm2-pcrlock=/boot/EFI/Gentoo/kernel.pcrlock.json \
+  /dev/nvme0n1p2
+
+# Now it's safe to reboot
+sudo reboot
+```
+
+### Varlink interface (systemd 262+)
+
+On systemd 262+, vanguard uses the `io.systemd.PCRLock` Varlink interface instead of shelling out to the `systemd-pcrlock` CLI for the following operations:
+
+| Operation | Varlink method | CLI fallback |
+|-----------|---------------|-------------|
+| Lock Secure Boot policy | `Lock{secureBootPolicy, lock=true}` | `lock-secureboot-policy` |
+| Lock Secure Boot authority | `Lock{secureBootAuthority, lock=true}` | `lock-secureboot-authority` |
+| Regenerate firmware code | `Lock{firmwareCode, lock=true}` | `lock-firmware-code` |
+| Regenerate firmware config | `Lock{firmwareConfig, lock=true}` | `lock-firmware-config` |
+
+Vanguard automatically detects whether the Varlink interface is available (by introspecting the socket at `/run/systemd/io.systemd.PCRLock` for the `Lock` method). If unavailable, it falls back to the CLI path. No configuration needed.
+
+The `make-policy` step always uses the CLI path because:
+1. The Varlink `MakePolicy` method writes to systemd's default policy path (`/var/lib/systemd/pcrlock.json`), not vanguard's policy path
+2. Vanguard needs an interactive recovery PIN prompt (`--recovery-pin=query`), while the Varlink method only supports `RECOVERY_PIN_HIDE` mode
+
+### Automatic re-lock after firmware update (optional)
+
+To automatically regenerate vanguard's policy after a firmware update + reboot, install the following systemd units:
+
+```ini
+# /etc/systemd/system/vanguard-pcrlock-relock.service
+[Unit]
+Description=Re-lock Vanguard TPM policy after firmware update
+After=systemd-pcrlock-secureboot-policy.service systemd-pcrlock-secureboot-authority.service
+ConditionPathExists=/boot/EFI/Gentoo/kernel.pcrlock.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 --no-verify
+
+[Install]
+WantedBy=sysinit.target
+```
+
+```bash
+sudo systemctl enable vanguard-pcrlock-relock.service
+```
+
+This runs after systemd's own pcrlock re-lock services, ensuring the firmware components are fresh before vanguard reads them.
 
 ## Recovery
 

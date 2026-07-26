@@ -54,12 +54,22 @@ func cmdOutput() (io.Writer, io.Writer) {
 // extends PCR 15, causing a timing mismatch with pcrlock predictions
 // Note: 600-gpt.pcrlock is NOT masked by default - it's conditionally masked
 // in update_policy.go based on whether --luks-device is specified
+//
+// 750-os-separator and 770-nvpcr-separator are masked because they expect
+// systemd's userspace PCR measurements (EV_SEPARATOR events extended by
+// systemd-pcrlock-machine-id / systemd-pcrlock-os-separator). Vanguard's
+// custom init does not extend these PCRs, so the components can never match
+// the event log. When a component can't match, systemd-pcrlock drops every PCR
+// it touches (0-7, 9, 12-14) with "touched by component we can't find",
+// cascading to drop ALL PCRs including PCR 7.
 var maskedPolicies = []string{
 	"200-firmware-code.pcrlock",
 	"220-firmware-config.pcrlock",
 	"250-firmware-code-early.pcrlock",
 	"250-firmware-config-early.pcrlock",
 	"750-enter-initrd.pcrlock",
+	"750-os-separator.pcrlock",
+	"770-nvpcr-separator.pcrlock",
 	"800-leave-initrd.pcrlock",
 	"820-machine-id.pcrlock",
 	"830-root-file-system.pcrlock",
@@ -158,8 +168,137 @@ func ConfigureMasks() error {
 	return nil
 }
 
-// LockSecureBoot locks PCR 7 (policy + authority)
+// VarLibPCRLockDir is where systemd-pcrlock stores auto-generated component files
+// (e.g. 250-firmware-code-early.pcrlock.d/generated.pcrlock).
+// These can go stale if the firmware changes its measurement pattern (e.g.
+// INSYDE firmware measuring vendor-specific blobs to PCR 0/1). A stale
+// generated.pcrlock that doesn't match the current event log causes
+// systemd-pcrlock to drop the entire PCR, cascading to drop ALL PCRs including
+// PCR 7, producing "PCR 7 missing from policy".
+const VarLibPCRLockDir = "/var/lib/pcrlock.d"
+
+// firmwareComponentDirs lists the component subdirectories under
+// /var/lib/pcrlock.d/ whose generated.pcrlock files can go stale when firmware
+// measurement patterns change. These are the "early firmware" components that
+// cover vendor-specific PCR 0/1 measurements before EV_S_CRTM_VERSION.
+var firmwareComponentDirs = []string{
+	"250-firmware-code-early.pcrlock.d",
+	"250-firmware-config-early.pcrlock.d",
+	"550-firmware-code-late.pcrlock.d",
+	"550-firmware-config-late.pcrlock.d",
+}
+
+// RegenerateFirmwareComponents refreshes the stale auto-generated firmware
+// component files in /var/lib/pcrlock.d/ by running systemd-pcrlock's
+// lock-firmware-code and lock-firmware-config commands. These generate
+// .pcrlock files from the current boot's firmware event log, ensuring the
+// component digests match what the firmware actually measured this boot.
+//
+// Without this, a stale generated.pcrlock (e.g. from a previous firmware
+// version or a different boot) causes systemd-pcrlock to report "event log
+// contains unrecognized measurements" and drop the PCR from the protection
+// mask. Since PCR 0/1 are at the root of the component dependency chain,
+// dropping them cascades to drop EVERY PCR — including PCR 7 (secure-boot).
+//
+// This must be called BEFORE MakePolicy so make-policy sees fresh components.
+//
+// On systemd v262+ with the io.systemd.PCRLock Varlink interface available,
+// this uses the Varlink Lock method (category=firmwareCode/firmwareConfig,
+// lock=true) instead of shelling out to the CLI. On older systemd, it falls
+// back to exec.Command("systemd-pcrlock", "lock-firmware-code", ...).
+func RegenerateFirmwareComponents() error {
+	// Try Varlink first (systemd v262+)
+	vc := NewVarlinkClient()
+	if vc.IsAvailable() {
+		if Verbose {
+			fmt.Println("[+] Using Varlink interface for firmware component regeneration")
+		}
+		if err := vc.LockCategory(CategoryFirmwareCode, true); err != nil {
+			if Verbose {
+				fmt.Printf("Note: Varlink lock firmwareCode failed: %v\n", err)
+			}
+			// Fall back to CLI
+			return regenerateFirmwareComponentsCLI()
+		}
+		if err := vc.LockCategory(CategoryFirmwareConfig, true); err != nil {
+			if Verbose {
+				fmt.Printf("Note: Varlink lock firmwareConfig failed: %v\n", err)
+			}
+			return regenerateFirmwareComponentsCLI()
+		}
+		return nil
+	}
+
+	// CLI fallback (systemd <262 or Varlink unavailable)
+	return regenerateFirmwareComponentsCLI()
+}
+
+// regenerateFirmwareComponentsCLI is the exec.Command fallback path.
+func regenerateFirmwareComponentsCLI() error {
+	// lock-firmware-code regenerates PCR 0 firmware code components
+	if err := runPCRLock("lock-firmware-code"); err != nil {
+		if Verbose {
+			fmt.Printf("Note: lock-firmware-code failed (may be harmless): %v\n", err)
+		}
+		// Non-fatal: if lock-firmware-code fails, the stale component remains.
+		// make-policy will still try to match it and may drop PCR 0, but that
+		// is the existing behavior — we haven't made things worse.
+	}
+
+	// lock-firmware-config regenerates PCR 1 firmware config components
+	if err := runPCRLock("lock-firmware-config"); err != nil {
+		if Verbose {
+			fmt.Printf("Note: lock-firmware-config failed (may be harmless): %v\n", err)
+		}
+	}
+
+	return nil
+}
+
+// runPCRLock runs a systemd-pcrlock subcommand, forwarding output to the
+// configured stdout/stderr writers.
+func runPCRLock(args ...string) error {
+	stdout, stderr := cmdOutput()
+	cmd := exec.Command(PCRLockBinPath(), args...)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
+	return cmd.Run()
+}
+
+// LockSecureBoot locks PCR 7 (policy + authority).
+//
+// On systemd v262+ with the io.systemd.PCRLock Varlink interface available,
+// this uses the Varlink Lock method (category=secureBootPolicy/secureBootAuthority,
+// lock=true) instead of shelling out to the CLI. On older systemd, it falls
+// back to exec.Command("systemd-pcrlock", "lock-secureboot-policy", ...).
 func LockSecureBoot() error {
+	// Try Varlink first (systemd v262+)
+	vc := NewVarlinkClient()
+	if vc.IsAvailable() {
+		if Verbose {
+			fmt.Println("[+] Using Varlink interface for SecureBoot lock")
+		}
+		if err := vc.LockCategory(CategorySecureBootPolicy, true); err != nil {
+			if Verbose {
+				fmt.Printf("Note: Varlink lock secureBootPolicy failed: %v, falling back to CLI\n", err)
+			}
+			return lockSecureBootCLI()
+		}
+		if err := vc.LockCategory(CategorySecureBootAuth, true); err != nil {
+			if Verbose {
+				fmt.Printf("Note: Varlink lock secureBootAuthority failed: %v, falling back to CLI\n", err)
+			}
+			return lockSecureBootCLI()
+		}
+		return nil
+	}
+
+	// CLI fallback (systemd <262 or Varlink unavailable)
+	return lockSecureBootCLI()
+}
+
+// lockSecureBootCLI is the exec.Command fallback path.
+func lockSecureBootCLI() error {
 	stdout, stderr := cmdOutput()
 
 	// Lock secureboot policy

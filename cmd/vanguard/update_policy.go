@@ -42,6 +42,18 @@ func (c *UpdatePolicyCmd) Run() error {
 	}
 	results.masksDone = true
 
+	// Regenerate stale firmware components from the current boot's event log.
+	// Without this, a stale 250-firmware-code-early/generated.pcrlock (e.g. from
+	// a previous firmware version) causes systemd-pcrlock to drop PCR 0/1, which
+	// cascades to drop ALL PCRs — including PCR 7 — producing
+	// "PCR 7 missing from policy". See docs/tpm2-setup.md for details.
+	if c.Verbose {
+		fmt.Println(dimStyle.Render(box("Firmware Components", []string{"Regenerating from current event log..."})))
+	}
+	if err := pcrlock.RegenerateFirmwareComponents(); err != nil {
+		return fmt.Errorf("failed to regenerate firmware components: %w", err)
+	}
+
 	fmt.Println(box("Lock PCRs", []string{
 		fmt.Sprintf("%s PCR 7  secure-boot-policy", okStyle.Render("✓")),
 	}))

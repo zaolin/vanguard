@@ -88,7 +88,7 @@ vanguard update -u /boot/EFI/Gentoo/kernel.efi [options]
 ```
 
 | Option | Description |
-|--------|-------------|
+|--------|--------|
 | `-u, --uki-path` | Path to UKI file (required) |
 | `-p, --policy-output` | Output path for policy JSON (default: `<uki-path>.pcrlock.json`) |
 | `-l, --luks-device` | LUKS device for token verification (enables GPT binding on PCR 5) |
@@ -96,6 +96,16 @@ vanguard update -u /boot/EFI/Gentoo/kernel.efi [options]
 | `--no-verify` | Skip policy verification |
 | `-v, --verbose` | Show verbose output from pcrlock tools |
 | `-c, --cleanup` | Remove old unused pcrlock NV indices from TPM |
+
+**What it does:**
+
+1. **Configure masks** — Masks noisy/unpredictable PCR components (firmware code/config, OS separator, NV-PCR separator, machine ID, root filesystem, shutdown, final). These systemd-specific components expect userspace PCR measurements that vanguard's custom init does not produce; unmasked they cause `systemd-pcrlock make-policy` to drop all PCRs from the protection mask.
+2. **Regenerate firmware components** — Runs `systemd-pcrlock lock-firmware-code` and `lock-firmware-config` (or the Varlink `Lock` method on systemd 262+) to refresh stale `/var/lib/pcrlock.d/250-firmware-*-early.pcrlock.d/generated.pcrlock` files from the current boot's event log. Without this, stale firmware components cause a cascade that drops all PCRs including PCR 7.
+3. **Lock Secure Boot** — Runs `lock-secureboot-policy` + `lock-secureboot-authority` (or Varlink `Lock`) to generate PCR 7 component files from current Secure Boot state.
+4. **Lock GPT** (with `-l`) — Binds the policy to the disk's GPT partition layout (PCR 5).
+5. **Lock UKI** — Creates multi-branch PCR 4 predictions for the UKI (lock-pe + lock-uki + event log extraction).
+6. **Make policy** — Runs `systemd-pcrlock make-policy` to generate the final policy JSON with a recovery PIN.
+7. **Verify** — Checks that required PCRs (7, and optionally 5) are present in the generated policy.
 
 ### verify
 
@@ -260,6 +270,10 @@ See [docs/boot-flow.md](docs/boot-flow.md) for detailed documentation.
 - systemd-udevd
 - systemd-pcrlock (for policy generation only, not runtime)
 
+**Optional (for fwupd coexistence on systemd 262+):**
+- systemd 262+ — enables the `io.systemd.PCRLock` Varlink interface for `Lock`/`MakePolicy` calls. On older systemd, vanguard falls back to the `systemd-pcrlock` CLI automatically.
+- fwupd 2.1.7+ — the `systemd-pcrlock` fwupd plugin loosens systemd's pcrlock policy before firmware updates. Vanguard's policy is separate (different NV index) and must be regenerated manually before rebooting after a firmware update.
+
 **No external TPM or LUKS dependencies** — Vanguard's init binary uses native Go implementations for all crypto and TPM2 operations.
 
 ## Testing
@@ -273,6 +287,12 @@ See [docs/boot-flow.md](docs/boot-flow.md) for detailed documentation.
 ./scripts/qemu-test.sh disk        # Create test disk
 ./scripts/qemu-test.sh enroll-tpm  # Enroll TPM2 token
 ./scripts/qemu-test.sh tpm         # Boot with TPM
+
+# Unit tests (no TPM hardware required)
+go test ./internal/pcrlock/... -v  # Varlink client + pcrlock integration
+go test ./internal/tpm/... -v      # TPM2 policy computation + auth
+go test ./internal/luks/... -v     # LUKS header parsing
+go test ./init/... -v              # Init token parsing
 ```
 
 ## Security Features
