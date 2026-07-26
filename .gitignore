@@ -18,6 +18,12 @@ tmp/
 .idea/
 .vscode
 .vscode/
+
+# Graphify knowledge graph output
+graphify-out/
+
+# OpenCode plans (working notes, not source)
+.opencode/
 *.swp
 
 # OS

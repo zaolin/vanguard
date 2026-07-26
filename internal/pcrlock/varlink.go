@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"time"
 )
 
@@ -13,10 +14,10 @@ const VarlinkSocketPath = "/run/systemd/io.systemd.PCRLock"
 
 // LockCategory constants matching systemd-pcrlock's LockCategory enum.
 const (
-	CategoryFirmwareCode      = "firmwareCode"
-	CategoryFirmwareConfig    = "firmwareConfig"
-	CategorySecureBootPolicy  = "secureBootPolicy"
-	CategorySecureBootAuth    = "secureBootAuthority"
+	CategoryFirmwareCode     = "firmwareCode"
+	CategoryFirmwareConfig   = "firmwareConfig"
+	CategorySecureBootPolicy = "secureBootPolicy"
+	CategorySecureBootAuth   = "secureBootAuthority"
 )
 
 // VarlinkClient connects to systemd-pcrlock's Varlink socket and calls
@@ -176,7 +177,7 @@ func (c *VarlinkClient) MakePolicy(force bool) error {
 
 // Component represents a pcrlock component as returned by ListComponents.
 type Component struct {
-	ID      string           `json:"id"`
+	ID       string             `json:"id"`
 	Variants []ComponentVariant `json:"variants"`
 }
 
@@ -289,16 +290,13 @@ done:
 
 // containsMethod checks if a Varlink interface description string contains
 // a method definition with the given name. The IDL format is:
-// Lock(category: string, lock?: bool) -> ()
+//
+//	Lock(category: string, lock?: bool) -> ()
+//
+// We require the method name to appear at the start of a line or after a
+// newline, followed by "(". This prevents false positives where a method
+// name is a substring of another (e.g. "Lock" matching "Unlock").
 func containsMethod(description, method string) bool {
-	// Look for "MethodName(" at the start of a line or after whitespace
-	needle := method + "("
-	for i := 0; i < len(description); i++ {
-		if description[i] == needle[0] {
-			if i+len(needle) <= len(description) && description[i:i+len(needle)] == needle {
-				return true
-			}
-		}
-	}
-	return false
+	needle := "\n" + method + "("
+	return strings.Contains("\n"+description, needle)
 }

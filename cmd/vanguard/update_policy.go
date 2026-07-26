@@ -109,13 +109,11 @@ func (c *UpdatePolicyCmd) Run() error {
 	if err := pcrlock.MakePolicy(c.PolicyOutput); err != nil {
 		return fmt.Errorf("failed to generate policy: %w", err)
 	}
-	results.policyMade = true
 
 	if !c.NoVerify {
 		requiredPCRs := []int{7}
 
 		verifyErr := pcrlock.VerifyPolicy(c.PolicyOutput, requiredPCRs)
-		results.verifyPassed = verifyErr == nil
 
 		pcrs, _ := pcrlock.Predict(c.PolicyOutput)
 		var verifyLines []string
@@ -247,10 +245,8 @@ func (c *UpdatePolicyCmd) Run() error {
 }
 
 type updateResults struct {
-	masksDone   bool
-	pcr7Locked  bool
-	policyMade  bool
-	verifyPassed bool
+	masksDone  bool
+	pcr7Locked bool
 }
 
 func box(title string, lines []string) string {

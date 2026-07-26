@@ -52,7 +52,7 @@ PCRLock provides fine-grained control over which boot measurements are validated
 |-----|----------|:--------:|-------|
 | 2 | External code | ✓ Enforced (2 branches) | Option ROMs |
 | 3 | External config | ✓ Enforced (2 branches) | |
-| 4 | Boot loader code (UKI) | ✓ Enforced (up to 4 branches) | Multi-branch handles firmware variance |
+| 4 | Boot loader code (UKI) | ✓ Enforced (up to 3 branches) | Multi-branch handles firmware variance |
 | 5 | GPT partition table | Optional (`-l` flag) | Auto-enabled with `--luks-device` |
 | 7 | Secure Boot state | ✓ Enforced (up to 2 branches) | Primary security PCR |
 | 13 | sysexts | — Unbound (all-zeros) | |
@@ -62,12 +62,11 @@ PCRLock provides fine-grained control over which boot measurements are validated
 
 ### PCR 4 Multi-Branch Prediction
 
-PCR 4 (boot-loader-code) uses **PolicyOR** with up to 4 predicted values covering firmware event variations:
+PCR 4 (boot-loader-code) uses **PolicyOR** with up to 3 predicted values covering firmware event variations:
 
-1. Current kernel measurement from `lock-pe`
-2. Current kernel measurement from `lock-uki`  
-3. Event log extraction for currently-booted kernel
-4. PE fallback path measurement
+1. **`pe.pcrlock`** — `lock-pe` measurement of the UKI file (most reliable for PCR 4 when sd-stub uses LoadImage)
+2. **`uki.pcrlock`** — `lock-uki` measurement (includes PCR 11 measurements; may fail on some systems, treated as fallback)
+3. **`eventlog.pcrlock`** — Last `EV_EFI_BOOT_SERVICES_APPLICATION` event extracted from the current boot's CEL event log. This ensures the currently-booted kernel is recognized even if the file on disk has been replaced.
 
 This means PCR 4 won't prevent unlock unless the UKI itself has been tampered with — legitimate firmware variations are handled by the multi-branch policy.
 
@@ -233,7 +232,7 @@ sudo vanguard status
 sudo reboot
 ```
 
-Vanguard creates up to 4 predicted values for PCR 4, so the old kernel can still unlock the disk until the new kernel is booted.
+Vanguard creates up to 3 predicted values for PCR 4, so the old kernel can still unlock the disk until the new kernel is booted.
 
 ## NV Index Cleanup
 
@@ -387,7 +386,7 @@ ConditionPathExists=/boot/EFI/Gentoo/kernel.pcrlock.json
 
 [Service]
 Type=oneshot
-ExecStart=/usr/local/bin/vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 --no-verify
+ExecStart=/usr/bin/vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 --no-verify
 
 [Install]
 WantedBy=sysinit.target
@@ -400,6 +399,14 @@ sudo systemctl enable vanguard-pcrlock-relock.service
 This runs after systemd's own pcrlock re-lock services, ensuring the firmware components are fresh before vanguard reads them.
 
 ## Recovery
+
+### Recovery PIN
+
+When you run `vanguard update`, the `make-policy` step prompts for a recovery PIN. This PIN is sealed into the TPM alongside the PCR policy. If the PCR values change (e.g. after a firmware update without re-running `vanguard update`), the TPM will not unseal the key automatically — but the recovery PIN can be used to unseal it manually via `systemd-pcrlock recover`.
+
+The recovery PIN is separate from the LUKS passphrase. It is stored in the TPM NV index, not on disk.
+
+### Passphrase fallback
 
 Always maintain a passphrase slot for emergency recovery:
 

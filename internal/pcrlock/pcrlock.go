@@ -168,26 +168,6 @@ func ConfigureMasks() error {
 	return nil
 }
 
-// VarLibPCRLockDir is where systemd-pcrlock stores auto-generated component files
-// (e.g. 250-firmware-code-early.pcrlock.d/generated.pcrlock).
-// These can go stale if the firmware changes its measurement pattern (e.g.
-// INSYDE firmware measuring vendor-specific blobs to PCR 0/1). A stale
-// generated.pcrlock that doesn't match the current event log causes
-// systemd-pcrlock to drop the entire PCR, cascading to drop ALL PCRs including
-// PCR 7, producing "PCR 7 missing from policy".
-const VarLibPCRLockDir = "/var/lib/pcrlock.d"
-
-// firmwareComponentDirs lists the component subdirectories under
-// /var/lib/pcrlock.d/ whose generated.pcrlock files can go stale when firmware
-// measurement patterns change. These are the "early firmware" components that
-// cover vendor-specific PCR 0/1 measurements before EV_S_CRTM_VERSION.
-var firmwareComponentDirs = []string{
-	"250-firmware-code-early.pcrlock.d",
-	"250-firmware-config-early.pcrlock.d",
-	"550-firmware-code-late.pcrlock.d",
-	"550-firmware-config-late.pcrlock.d",
-}
-
 // RegenerateFirmwareComponents refreshes the stale auto-generated firmware
 // component files in /var/lib/pcrlock.d/ by running systemd-pcrlock's
 // lock-firmware-code and lock-firmware-config commands. These generate
@@ -423,95 +403,15 @@ func LockGPT(device string) error {
 	return nil
 }
 
-// LockUKI locks PCR 4 for the given UKI path (single file mode)
-func LockUKI(ukiPath string) error {
-	stdout, stderr := cmdOutput()
-	cmd := exec.Command(PCRLockBinPath(), "lock-uki", ukiPath)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("lock-uki failed: %w", err)
-	}
-	return nil
-}
-
-// LockUKIVariant locks PCR 4 for the given UKI path into a variant directory
-// This creates /etc/pcrlock.d/510-uki.pcrlock.d/<name>.pcrlock
-// The 510 prefix ensures UKI comes after firmware PCR 4 events:
-// - 350-action-efi-application (EV_EFI_ACTION)
-// - 500-separator (EV_SEPARATOR)
-// Using variants allows both old (currently booted) and new UKI to be valid
-func LockUKIVariant(ukiPath string, variantName string) error {
-	stdout, stderr := cmdOutput()
-	variantDir := filepath.Join(PCRLockDir, "510-uki.pcrlock.d")
-	if err := os.MkdirAll(variantDir, 0755); err != nil {
-		return fmt.Errorf("failed to create variant directory: %w", err)
-	}
-
-	pcrLockPath := filepath.Join(variantDir, variantName+".pcrlock")
-
-	cmd := exec.Command(PCRLockBinPath(), "lock-uki", ukiPath, "--pcrlock="+pcrLockPath)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("lock-uki variant failed: %w", err)
-	}
-	return nil
-}
-
-// LockUKIWithVariants creates UKI variant for the new UKI file
-// This allows the policy to work with both currently booted UKI and the new one
-func LockUKIWithVariants(newUKIPath string) error {
-	stdout, stderr := cmdOutput()
-	variantDir := filepath.Join(PCRLockDir, "510-uki.pcrlock.d")
-
-	// Remove old single-file pcrlock if exists (we're switching to variant directory)
-	os.Remove(filepath.Join(PCRLockDir, "510-uki.pcrlock"))
-
-	// Create variant directory
-	if err := os.MkdirAll(variantDir, 0755); err != nil {
-		return fmt.Errorf("failed to create variant directory: %w", err)
-	}
-
-	// Create new variant from specified UKI file
-	newPath := filepath.Join(variantDir, "new.pcrlock")
-	cmd := exec.Command(PCRLockBinPath(), "lock-uki", newUKIPath, "--pcrlock="+newPath)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("failed to lock new UKI: %w", err)
-	}
-
-	return nil
-}
-
-// LockMachineID locks PCR 15 for machine ID
-func LockMachineID() error {
-	stdout, stderr := cmdOutput()
-	cmd := exec.Command(PCRLockBinPath(), "lock-machine-id")
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("lock-machine-id failed: %w", err)
-	}
-	return nil
-}
-
-// LockFileSystem locks PCR 15 for root filesystem
-func LockFileSystem(path string) error {
-	stdout, stderr := cmdOutput()
-	cmd := exec.Command(PCRLockBinPath(), "lock-file-system", path)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("lock-file-system failed: %w", err)
-	}
-	return nil
-}
-
-// MakePolicy generates policy with recovery PIN prompt
+// MakePolicy generates policy with recovery PIN prompt.
+//
+// In non-verbose mode, stderr is captured (not discarded) so that on failure
+// the diagnostic output from systemd-pcrlock (e.g. "PCR 7 dropped from
+// protection mask") is included in the error message. Without this, the user
+// sees only "make-policy failed: exit status 1" with no clue why PCRs were
+// dropped.
 func MakePolicy(outputPath string) error {
-	stdout, stderr := cmdOutput()
+	stdout, _ := cmdOutput()
 
 	// Create output directory if needed
 	if err := os.MkdirAll(filepath.Dir(outputPath), 0755); err != nil {
@@ -555,9 +455,23 @@ func MakePolicy(outputPath string) error {
 	cmd := exec.Command(PCRLockBinPath(), args...)
 	cmd.Stdin = os.Stdin
 	cmd.Stdout = stdout
-	cmd.Stderr = stderr
+
+	// Always capture stderr. In verbose mode, pipe to os.Stderr for live display.
+	// In non-verbose mode, capture to a buffer so we can include it in error
+	// messages on failure. This is critical for debugging "PCR missing from
+	// policy" errors — without stderr the user only sees "exit status 1".
+	var stderrBuf bytes.Buffer
+	if Verbose {
+		cmd.Stderr = os.Stderr
+	} else {
+		cmd.Stderr = &stderrBuf
+	}
 
 	if err := cmd.Run(); err != nil {
+		stderrStr := strings.TrimSpace(stderrBuf.String())
+		if stderrStr != "" {
+			return fmt.Errorf("make-policy failed: %w\nstderr:\n%s", err, stderrStr)
+		}
 		return fmt.Errorf("make-policy failed: %w", err)
 	}
 	return nil
@@ -610,15 +524,6 @@ func VerifyPolicy(policyPath string, requiredPCRs []int) error {
 	}
 
 	return nil
-}
-
-// PredictJSON returns the raw JSON prediction output
-func PredictJSON(policyPath string) ([]byte, error) {
-	cmd := exec.Command(PCRLockBinPath(), "predict",
-		"--policy="+policyPath,
-		"--json=pretty",
-	)
-	return cmd.Output()
 }
 
 // PolicyInfo contains parsed policy information
@@ -703,37 +608,6 @@ func ParsePolicyJSON(data []byte) (*PolicyInfo, error) {
 	return nil, fmt.Errorf("unknown JSON format")
 }
 
-// LockPE locks PCR 4 for the given PE binary using lock-pe
-// This is more reliable than lock-uki for PCR4 measurements when sd-stub uses LoadImage
-func LockPE(pePath string) error {
-	stdout, stderr := cmdOutput()
-	cmd := exec.Command(PCRLockBinPath(), "lock-pe", pePath)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("lock-pe failed: %w", err)
-	}
-	return nil
-}
-
-// LockPEVariant locks PCR 4 for PE binary into variant directory
-func LockPEVariant(pePath string, variantName string) error {
-	stdout, stderr := cmdOutput()
-	variantDir := filepath.Join(PCRLockDir, "510-uki.pcrlock.d")
-	if err := os.MkdirAll(variantDir, 0755); err != nil {
-		return fmt.Errorf("failed to create variant directory: %w", err)
-	}
-
-	pcrLockPath := filepath.Join(variantDir, variantName+".pcrlock")
-	cmd := exec.Command(PCRLockBinPath(), "lock-pe", pePath, "--pcrlock="+pcrLockPath)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	if err := cmd.Run(); err != nil {
-		return fmt.Errorf("lock-pe variant failed: %w", err)
-	}
-	return nil
-}
-
 // LockUKIWithPEFallback creates both lock-pe and lock-uki predictions as variants
 // lock-pe is primary (more reliable for PCR4 when sd-stub uses LoadImage)
 // lock-uki is fallback (includes PCR11 measurements)
@@ -790,8 +664,12 @@ func LockUKIWithPEFallback(ukiPath string) error {
 // and creates a variant pcrlock file for it. This allows the policy to work with
 // the currently booted kernel even if the kernel file has been replaced on disk.
 //
-// We only extract the EV_EFI_BOOT_SERVICES_APPLICATION event for the kernel,
-// not firmware events (EV_EFI_ACTION, EV_SEPARATOR) which are handled by
+// On a UKI system, multiple EV_EFI_BOOT_SERVICES_APPLICATION events may appear
+// on PCR 4 (shim, bootloader, sd-stub, kernel). We take only the LAST one,
+// which is the kernel/UKI — firmware loads EFI applications in order, and the
+// kernel is the final EV_EFI_BOOT_SERVICES_APPLICATION before ExitBootServices.
+//
+// We skip firmware events (EV_EFI_ACTION, EV_SEPARATOR) which are handled by
 // systemd-pcrlock's firmware component matching.
 func lockCurrentBootPCR4(variantDir string) error {
 	// Read the event log in CEL-JSON format
@@ -807,16 +685,16 @@ func lockCurrentBootPCR4(variantDir string) error {
 		return fmt.Errorf("failed to parse event log: %w", err)
 	}
 
-	// Find the kernel boot application measurement in PCR 4
-	// We look for EV_EFI_BOOT_SERVICES_APPLICATION events which measure loaded PE images
-	var kernelRecords []map[string]interface{}
+	// Find the last EV_EFI_BOOT_SERVICES_APPLICATION event on PCR 4.
+	// This is the kernel measurement — firmware loads EFI apps in order
+	// (shim → bootloader → sd-stub → kernel), so the last one is the UKI.
+	var kernelRecord map[string]interface{}
 	for _, event := range events {
 		pcr, ok := event["pcr"].(float64)
 		if !ok || int(pcr) != 4 {
 			continue
 		}
 
-		// Check if this is an EFI boot services application event (kernel/UKI load)
 		content, ok := event["content"].(map[string]interface{})
 		if !ok {
 			continue
@@ -826,32 +704,29 @@ func lockCurrentBootPCR4(variantDir string) error {
 			continue
 		}
 
-		// Only include EV_EFI_BOOT_SERVICES_APPLICATION - this is the kernel measurement
-		// Skip firmware events like EV_EFI_ACTION and EV_SEPARATOR
 		if eventType == "EV_EFI_BOOT_SERVICES_APPLICATION" {
-			// Create a simplified record with just pcr and digests (like lock-pe output)
 			digests, ok := event["digests"].([]interface{})
 			if !ok {
 				continue
 			}
-			record := map[string]interface{}{
+			// Keep the last matching record — this is the kernel
+			kernelRecord = map[string]interface{}{
 				"pcr":     4,
 				"digests": digests,
 			}
-			kernelRecords = append(kernelRecords, record)
 		}
 	}
 
-	if len(kernelRecords) == 0 {
+	if kernelRecord == nil {
 		return fmt.Errorf("no kernel boot application records found in event log")
 	}
 
 	// Create a pcrlock file matching the format used by lock-pe
-	pcrlock := map[string]interface{}{
-		"records": kernelRecords,
+	pcrlockFile := map[string]interface{}{
+		"records": []map[string]interface{}{kernelRecord},
 	}
 
-	data, err := json.MarshalIndent(pcrlock, "", "  ")
+	data, err := json.MarshalIndent(pcrlockFile, "", "  ")
 	if err != nil {
 		return fmt.Errorf("failed to marshal pcrlock: %w", err)
 	}
@@ -914,7 +789,7 @@ func listNVIndices() ([]int, error) {
 	cmd := exec.Command("tpm2_getcap", "handles-nv-index")
 	output, err := cmd.Output()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("tpm2_getcap handles-nv-index failed: %w", err)
 	}
 
 	var indices []int

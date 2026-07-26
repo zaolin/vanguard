@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -14,7 +15,6 @@ import (
 type Policy struct {
 	NVIndex   int        `json:"nvIndex"`
 	NVPublic  string     `json:"nvPublic"`
-	NVHandle  string     `json:"nvHandle"`
 	PCRValues []PCRValue `json:"pcrValues"`
 }
 
@@ -46,19 +46,26 @@ func ParsePolicy(path string) (*Policy, error) {
 	return &policy, nil
 }
 
-// VerifyNVIndex checks if the TPM NV Index matches the policy expectation
+// VerifyNVIndex checks if the TPM NV Index matches the policy expectation.
+// It compares the NV index name (cryptographic hash of the NV public area),
+// auth policy, and data size against the values derived from the policy's
+// base64-encoded nvPublic field. A mismatch on any field indicates the NV
+// index has been tampered with or is out of sync with the policy.
 func VerifyNVIndex(policy *Policy) (*NVIndexDetails, bool, error) {
 	details, err := ReadNVIndexDetails(policy.NVIndex)
 	if err != nil {
 		return nil, false, err
 	}
 
-	_, expectedAuthPolicy, expectedSize, err := extractNVPublicDetails(policy.NVPublic)
+	expectedName, expectedAuthPolicy, expectedSize, err := extractNVPublicDetails(policy.NVPublic)
 	if err != nil {
 		return details, false, fmt.Errorf("failed to decode nvPublic from policy: %w", err)
 	}
 
 	matches := true
+	if !strings.EqualFold(details.Name, expectedName) {
+		matches = false
+	}
 	if !strings.EqualFold(details.AuthPolicy, expectedAuthPolicy) {
 		matches = false
 	}
@@ -74,7 +81,8 @@ func ReadNVIndexDetails(index int) (*NVIndexDetails, error) {
 	cmd := exec.Command("tpm2_nvreadpublic", fmt.Sprintf("0x%x", index))
 	output, err := cmd.Output()
 	if err != nil {
-		if exitErr, ok := err.(*exec.ExitError); ok {
+		var exitErr *exec.ExitError
+		if errors.As(err, &exitErr) {
 			return nil, fmt.Errorf("%v: %s", err, string(exitErr.Stderr))
 		}
 		return nil, err // likely index not found or TPM error

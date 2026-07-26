@@ -212,16 +212,22 @@ func TestContainsMethod(t *testing.T) {
 			want:        false,
 		},
 		{
-			name:        "partial match without paren",
-			description: "io.systemd.PCRLock\n\nLockdown(category: string) -> ()",
-			method:      "Lock",
-			want:        false,
-		},
-		{
 			name:        "method at start of description",
 			description: "Lock(category: string, lock?: bool) -> ()",
 			method:      "Lock",
 			want:        true,
+		},
+		{
+			name:        "Unlock should not match Lock",
+			description: "io.systemd.PCRLock\n\nUnlock(category: string) -> ()",
+			method:      "Lock",
+			want:        false,
+		},
+		{
+			name:        "Lockdown should not match Lock",
+			description: "io.systemd.PCRLock\n\nLockdown(category: string) -> ()",
+			method:      "Lock",
+			want:        false,
 		},
 	}
 
@@ -775,51 +781,80 @@ func TestVarlinkClientMultipleCalls(t *testing.T) {
 
 // --- Test for malformed response ---
 
-func TestVarlinkClientMalformedResponse(t *testing.T) {
-	srv := newMockVarlinkServer(t, map[string]func(json.RawMessage) (json.RawMessage, string){
-		"io.systemd.PCRLock.Lock": func(params json.RawMessage) (json.RawMessage, string) {
-			// Return invalid JSON by sending raw bytes directly.
-			// We can't do this through the handler, so we'll test the
-			// call() method's error handling via a custom approach.
-			return json.RawMessage(`{}`), ""
-		},
-	})
-	defer srv.Close()
+func TestVarlinkClientMalformedJSONResponse(t *testing.T) {
+	// Start a raw listener that sends malformed JSON + NUL
+	dir := t.TempDir()
+	socket := filepath.Join(dir, "io.systemd.PCRLock")
 
-	// Connect manually and send malformed response
-	conn, err := net.DialTimeout("unix", srv.socket, 5*time.Second)
+	addr, err := net.ResolveUnixAddr("unix", socket)
 	if err != nil {
-		t.Fatalf("dial: %v", err)
+		t.Fatalf("resolve: %v", err)
 	}
-	defer conn.Close()
 
-	// Send a valid request
-	req := varlinkRequest{
-		Method:     "io.systemd.PCRLock.Lock",
-		Parameters: map[string]interface{}{"category": "firmwareCode", "lock": true},
-	}
-	data, _ := json.Marshal(req)
-	data = append(data, 0)
-	conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
-	conn.Write(data)
-
-	// Read the server's response (we just need to consume it)
-	conn.SetReadDeadline(time.Now().Add(5 * time.Second))
-	buf := make([]byte, 4096)
-	conn.Read(buf)
-
-	// The mock server handles the request properly, so we can't easily inject
-	// a malformed response. Instead, test that call() handles a closed connection.
-	conn.Close()
-
-	// Now try a new connection that gets closed immediately
-	conn2, err := net.DialTimeout("unix", srv.socket, 5*time.Second)
+	listener, err := net.ListenUnix("unix", addr)
 	if err != nil {
-		// Server might have shut down, skip this test
-		t.Skip("could not reconnect to mock server")
+		t.Fatalf("listen: %v", err)
 	}
-	// Close immediately without sending anything — server will get EOF
-	conn2.Close()
+	defer listener.Close()
+
+	go func() {
+		conn, err := listener.AcceptUnix()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+
+		// Read the request (discard it)
+		buf := make([]byte, 4096)
+		conn.SetReadDeadline(time.Now().Add(5 * time.Second))
+		conn.Read(buf)
+
+		// Send malformed JSON followed by NUL
+		conn.SetWriteDeadline(time.Now().Add(5 * time.Second))
+		conn.Write([]byte("this is not valid json\x00"))
+	}()
+
+	vc := &VarlinkClient{socketPath: socket}
+	err = vc.LockCategory(CategoryFirmwareCode, true)
+	if err == nil {
+		t.Fatal("expected error for malformed JSON response, got nil")
+	}
+
+	if !strings.Contains(err.Error(), "failed to parse response") {
+		t.Errorf("error should mention parse failure, got: %v", err)
+	}
+}
+
+func TestVarlinkClientEmptyResponse(t *testing.T) {
+	// Start a raw listener that closes the connection immediately
+	dir := t.TempDir()
+	socket := filepath.Join(dir, "io.systemd.PCRLock")
+
+	addr, err := net.ResolveUnixAddr("unix", socket)
+	if err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+
+	listener, err := net.ListenUnix("unix", addr)
+	if err != nil {
+		t.Fatalf("listen: %v", err)
+	}
+	defer listener.Close()
+
+	go func() {
+		conn, err := listener.AcceptUnix()
+		if err != nil {
+			return
+		}
+		// Close immediately — client should get a read error
+		conn.Close()
+	}()
+
+	vc := &VarlinkClient{socketPath: socket}
+	err = vc.LockCategory(CategoryFirmwareCode, true)
+	if err == nil {
+		t.Fatal("expected error for closed connection, got nil")
+	}
 }
 
 // --- Test for response with both parameters and error ---
