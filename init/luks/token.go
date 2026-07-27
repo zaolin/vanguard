@@ -231,9 +231,12 @@ func (t *TPM2Token) Unseal(tpmClient *intpm.Client, pin []byte, skipPolicyHashVe
 		return nil, err
 	}
 
-	// systemd-cryptenroll stores the TPM-sealed secret base64-encoded as the LUKS2 passphrase.
-	// The unlock path must base64-encode the unsealed secret before passing it to LUKS2.
-	// See: src/cryptsetup/cryptsetup-token-systemd-tpm2.c in the systemd repo.
+	// systemd-cryptenroll stores the TPM-sealed secret base64-encoded as the LUKS2
+	// passphrase. The unsealed raw bytes must be base64-encoded before passing
+	// to LUKS2 to match the keyslot. This is a hard assumption — vanguard only
+	// supports tokens created by systemd-cryptenroll (see docs/tpm2-setup.md).
+	// Non-systemd enrollment tools that don't base64-encode the sealed secret
+	// will not work with vanguard.
 	encoded := base64.StdEncoding.EncodeToString(result)
 	buildtags.Debug("tpm token: unsealed %d bytes, base64-encoded to %d chars for LUKS2\n", len(result), len(encoded))
 	return []byte(encoded), nil

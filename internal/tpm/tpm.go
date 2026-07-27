@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"sync"
 	"time"
 
 	"github.com/google/go-tpm/tpm2"
@@ -78,6 +79,7 @@ type LockoutStatus struct {
 // Client provides TPM 2.0 operations.
 type Client struct {
 	device string
+	mu     sync.Mutex // protects device field during openTPM fallback
 }
 
 // DefaultDevice is the default TPM device path.
@@ -119,6 +121,9 @@ func (c *Client) WaitForDevice(timeout time.Duration) bool {
 
 // openTPM opens a connection to the TPM device.
 func (c *Client) openTPM() (transport.TPMCloser, error) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
 	tpm, err := linuxtpm.Open(c.device)
 	if err != nil {
 		// Try fallback device

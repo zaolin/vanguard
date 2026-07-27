@@ -191,11 +191,18 @@ func runGenerate(cfg *config.Config) error {
 	fmt.Printf("  output: %s\n", cfg.Output)
 	fmt.Printf("  compression: %s\n", cfg.Compression)
 
+	// Track warnings to summarize at the end
+	warnCount := 0
+	warn := func(format string, args ...interface{}) {
+		fmt.Printf("  warning: "+format+"\n", args...)
+		warnCount++
+	}
+
 	// Autodetect LUKS devices
 	fmt.Printf("vanguard: detecting LUKS devices...\n")
 	luksDevices, err := luks.Detect()
 	if err != nil {
-		fmt.Printf("  warning: failed to detect LUKS devices: %v\n", err)
+		warn("failed to detect LUKS devices: %v", err)
 	} else {
 		fmt.Printf("  found %d LUKS device(s)\n", len(luksDevices))
 		for _, dev := range luksDevices {
@@ -398,14 +405,20 @@ func runGenerate(cfg *config.Config) error {
 		fmt.Printf("  warning: failed to add /usr/lib/firmware symlink: %v\n", err)
 	}
 
-	// Add the dynamic linker - search common paths
+	// Add the dynamic linker - search common paths for x86-64 and aarch64
 	ldPaths := []string{
+		// x86-64
 		"/lib64/ld-linux-x86-64.so.2",
 		"/lib/ld-linux-x86-64.so.2",
 		"/usr/lib64/ld-linux-x86-64.so.2",
 		"/usr/lib/ld-linux-x86-64.so.2",
+		// aarch64
+		"/lib/ld-linux-aarch64.so.1",
+		"/lib64/ld-linux-aarch64.so.1",
+		"/usr/lib/ld-linux-aarch64.so.1",
+		"/usr/lib64/ld-linux-aarch64.so.1",
 	}
-	for _, ldPath := range ldPaths {
+		for _, ldPath := range ldPaths {
 		if _, err := os.Stat(ldPath); err == nil {
 			// Resolve symlink to get the actual file
 			realPath, err := filepath.EvalSymlinks(ldPath)
@@ -413,7 +426,11 @@ func runGenerate(cfg *config.Config) error {
 				realPath = ldPath
 			}
 			// Add the actual file
-			dstPath := realPath[1:] // Remove leading /
+			dstPath, err := sanitizeInitramfsPath(realPath)
+			if err != nil {
+				fmt.Printf("  warning: skipping ld-linux %s: %v\n", realPath, err)
+				break
+			}
 			if err := archive.AddFileFromDisk(realPath, dstPath); err != nil {
 				fmt.Printf("  warning: failed to add ld-linux: %v\n", err)
 			} else {
@@ -421,8 +438,10 @@ func runGenerate(cfg *config.Config) error {
 			}
 			// Add symlink if the paths differ
 			if realPath != ldPath {
-				symlinkDst := ldPath[1:] // Remove leading /
-				archive.AddSymlink(symlinkDst, realPath)
+				symlinkDst, err := sanitizeInitramfsPath(ldPath)
+				if err == nil {
+					archive.AddSymlink(symlinkDst, realPath)
+				}
 			}
 			break
 		}
@@ -698,6 +717,10 @@ LABEL="dm_persist_end"
 	// Get file size
 	info, _ := os.Stat(cfg.Output)
 	fmt.Printf("vanguard: generated %s (%d bytes)\n", cfg.Output, info.Size())
+
+	if warnCount > 0 {
+		fmt.Printf("vanguard: %d warning(s) during generation — review output above\n", warnCount)
+	}
 
 	return nil
 }

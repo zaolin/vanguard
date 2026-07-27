@@ -108,6 +108,7 @@ func main() {
 	tui.UpdateStage(tui.StageUdev)
 	buildtags.Debug("vanguard: starting udevd\n")
 	if err := udev.Start(); err != nil {
+		console.Print("vanguard: warning: udevd start failed: %v\n", err)
 		buildtags.Debug("vanguard: udevd start warning: %v\n", err)
 	}
 	tui.StageDone(tui.StageUdev)
