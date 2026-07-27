@@ -1,11 +1,15 @@
 package main
 
+import "github.com/alecthomas/kong"
+
 // CLI defines the root command structure with subcommands
 type CLI struct {
 	Generate      GenerateCmd      `cmd:"" help:"Generate initramfs image"`
 	Update        UpdatePolicyCmd  `cmd:"" name:"update" help:"Update TPM2 pcrlock policy"`
 	Verify        VerifyPCRLockCmd `cmd:"" name:"verify" help:"Verify TPM2 pcrlock setup (PCRs, NV Index, LUKS)"`
 	Status        StatusCmd        `cmd:"" help:"Show system protection status"`
+
+	Version kong.VersionFlag `short:"V" help:"Show version"`
 }
 
 // GenerateCmd generates a new initramfs image

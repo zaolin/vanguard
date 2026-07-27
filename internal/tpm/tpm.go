@@ -907,77 +907,6 @@ func (c *Client) FindPCRLockNVIndex() (uint32, error) {
 	return 0, fmt.Errorf("no PCRLock NV index found")
 }
 
-// ReadPCRValues reads the current PCR values from the TPM.
-// Returns a map of PCR number to PCR value (digest).
-func (c *Client) ReadPCRValues(bank HashAlgorithm, pcrs []uint) (map[uint][]byte, error) {
-	tpm, err := c.openTPM()
-	if err != nil {
-		return nil, err
-	}
-	defer tpm.Close()
-
-	result := make(map[uint][]byte)
-
-	// Convert bank string to TPM algorithm
-	var alg tpm2.TPMAlgID
-	switch bank {
-	case AlgSHA1:
-		alg = tpm2.TPMAlgSHA1
-	case AlgSHA256:
-		alg = tpm2.TPMAlgSHA256
-	case AlgSHA384:
-		alg = tpm2.TPMAlgSHA384
-	case AlgSHA512:
-		alg = tpm2.TPMAlgSHA512
-	default:
-		alg = tpm2.TPMAlgSHA256
-	}
-
-	// Build PCR selection - use single TPMSPCRSelection with bitmap of all PCRs
-	pcrSelectionIn := tpm2.TPMLPCRSelection{
-		PCRSelections: []tpm2.TPMSPCRSelection{{
-			Hash:      alg,
-			PCRSelect: pcrsToBitmapInt(pcrs),
-		}},
-	}
-
-	rsp, err := tpm2.PCRRead{
-		PCRSelectionIn: pcrSelectionIn,
-	}.Execute(tpm)
-	if err != nil {
-		return nil, fmt.Errorf("PCRRead failed: %w", err)
-	}
-
-	// Parse the PCR values - they are in order of the selection
-	// Each PCR value is a SHA256 digest (32 bytes)
-	pcrIdx := 0
-	for _, sel := range rsp.PCRValues.Digests {
-		if pcrIdx < len(pcrs) {
-			result[uint(pcrs[pcrIdx])] = sel.Buffer
-			pcrIdx++
-		}
-	}
-
-	return result, nil
-}
-
-// pcrsToBitmapInt converts a list of PCR indices to a PCR select bitmap (3 bytes for PCRs 0-23).
-func pcrsToBitmapInt(pcrs []uint) []byte {
-	bitmap := make([]byte, 3)
-	for _, pcr := range pcrs {
-		if pcr < 24 {
-			bitmap[pcr/8] |= 1 << (pcr % 8)
-		}
-	}
-	return bitmap
-}
-
-// ReadAllPCRValues reads all PCR values for a specific bank.
-func (c *Client) ReadAllPCRValues(bank HashAlgorithm) (map[uint][]byte, error) {
-	// Read PCRs 0-23
-	return c.ReadPCRValues(bank, []uint{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23})
-}
-
 // ParsePCRBank converts a bank name string to TPM algorithm.
 func ParsePCRBank(bank string) HashAlgorithm {
 	switch bank {
@@ -992,22 +921,6 @@ func ParsePCRBank(bank string) HashAlgorithm {
 	default:
 		return AlgSHA256
 	}
-}
-
-// HashPIN hashes a PIN using SHA-256 for TPM2 auth value (legacy).
-// Use DeriveAuthValue when salt is available.
-func HashPIN(pin string) []byte {
-	hash := sha256.Sum256([]byte(pin))
-	return hash[:]
-}
-
-// DeriveAuthValue derives the TPM auth value from a PIN using PBKDF2-HMAC-SHA256.
-// This matches systemd's tpm2_util_pbkdf2_hmac_sha256 function.
-// The salt is provided in the token JSON as "tpm2-salt".
-func DeriveAuthValue(pin string, salt []byte) []byte {
-	// systemd uses PBKDF2-HMAC-SHA256 with 10000 iterations
-	// The output length matches SHA256 (32 bytes)
-	return pbkdf2.Key([]byte(pin), salt, 10000, sha256.Size, sha256.New)
 }
 
 // ParseBlob parses a systemd-tpm2 blob into private and public components.
@@ -1103,43 +1016,22 @@ func containsAny(s string, substrs ...string) bool {
 	return false
 }
 
-// computeAuthValue computes the auth value from salted PIN per systemd's approach:
-// salted_pin → SHA256 → trim trailing zeros → auth value
-func computeAuthValue(saltedPin []byte) []byte {
-	// SHA256 hash of the salted PIN
-	hash := sha256.Sum256(saltedPin)
-	// Trim trailing zeros per TPM spec
-	return bytes.TrimRight(hash[:], "\x00")
-}
-
-// trimAuthValue trims trailing zeros from auth value per TPM spec.
-// This is used for SHA256-based auth values.
-func trimAuthValue(auth []byte) []byte {
-	return bytes.TrimRight(auth, "\x00")
-}
-
 // DerivePinAuthUnseal derives the auth value for unsealing when no salt is present.
 // systemd's tpm2_auth_value_from_pin: PIN -> SHA256 -> trim_zeros
 // Use DerivePinAuthSalted when the token has a tpm2_salt field.
 func DerivePinAuthUnseal(pin string) []byte {
-	// systemd's tpm2_auth_value_from_pin:
-	// PIN -> SHA256 -> trim_zeros
 	hash := sha256.Sum256([]byte(pin))
-	return trimAuthValue(hash[:])
+	return bytes.TrimRight(hash[:], "\x00")
 }
 
 // DerivePinAuthSalted derives the auth value when a salt is present.
 // systemd uses PBKDF2(pin, salt) → base64 → SHA256 → trim_zeros for both
 // enrollment AND unseal when the token has a tpm2_salt field.
 func DerivePinAuthSalted(pin string, salt []byte) []byte {
-	// systemd's tpm2_util_pbkdf2_hmac_sha256 for enrollment:
-	// PIN + Salt -> PBKDF2 -> salted_pin (32 bytes)
-	// salted_pin -> base64 encode -> b64_string
-	// b64_string -> SHA256 -> hash
-	// hash -> trim trailing zeros -> auth_value
 	pbkdf2Key := pbkdf2.Key([]byte(pin), salt, 10000, sha256.Size, sha256.New)
 	b64String := base64.StdEncoding.EncodeToString(pbkdf2Key)
-	return computeAuthValue([]byte(b64String))
+	hash := sha256.Sum256([]byte(b64String))
+	return bytes.TrimRight(hash[:], "\x00")
 }
 
 // parseESYS_TR_SRK extracts the SRK handle and public area from systemd's serialized format.

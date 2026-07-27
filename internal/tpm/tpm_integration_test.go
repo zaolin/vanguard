@@ -141,7 +141,7 @@ func TestIntegrationReadPCRs(t *testing.T) {
 		sel := tpm2.TPMLPCRSelection{
 			PCRSelections: []tpm2.TPMSPCRSelection{{
 				Hash:      tpm2.TPMAlgSHA256,
-				PCRSelect: pcrsToBitmapInt([]uint{pcr}),
+				PCRSelect: pcrsToBitmap([]int{int(pcr)}),
 			}},
 		}
 		rsp, err := tpm2.PCRRead{PCRSelectionIn: sel}.Execute(tpm)

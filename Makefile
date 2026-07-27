@@ -1,10 +1,12 @@
-.PHONY: all clean build embed
+.PHONY: all clean build embed install
+
+VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
 all: build
 
 # Build the CLI with embedded init binaries
 build: embed
-	go build -o vanguard ./cmd/vanguard/
+	go build -ldflags "-X main.Version=$(VERSION)" -o vanguard ./cmd/vanguard/
 
 # Build the init binaries for embedding
 embed: cmd/vanguard/embed/init cmd/vanguard/embed/init-debug cmd/vanguard/embed/init-strict cmd/vanguard/embed/init-debug-strict

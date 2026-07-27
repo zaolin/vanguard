@@ -10,6 +10,7 @@ func main() {
 		kong.Name("vanguard"),
 		kong.Description("A minimal initrd generator for encrypted LVM root with TPM2 support"),
 		kong.UsageOnError(),
+		kong.Vars{"version": Version},
 	)
 	err := ctx.Run()
 	ctx.FatalIfErrorf(err)
