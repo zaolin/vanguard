@@ -27,7 +27,14 @@ type PCRLockPolicy struct {
 // If currentDigest is nil or empty, starts from all-zeros (fresh session).
 // The marshalling follows TPM 2.0 Spec Part 2 format, verified against go-tpm's
 // PolicyCalculator output.
+//
+// Currently only SHA256 is supported. If a different algorithm is passed, an
+// error is returned rather than silently producing a wrong digest.
 func computePolicyPCRHash(alg HashAlgorithm, currentDigest []byte, pcrDigest []byte, pcrSelection tpm2.TPMLPCRSelection) ([]byte, error) {
+	if alg != AlgSHA256 {
+		return nil, fmt.Errorf("unsupported hash algorithm: 0x%x (only SHA256 supported)", alg)
+	}
+
 	state := currentDigest
 	if len(state) == 0 {
 		state = make([]byte, sha256.Size)
@@ -47,7 +54,14 @@ func computePolicyPCRHash(alg HashAlgorithm, currentDigest []byte, pcrDigest []b
 // computePolicyORHash computes the policy digest for a PolicyOR command.
 // PolicyOR resets the state to zeros and extends:
 // H(0x00...0 || TPM_CC_PolicyOR || branch1 || branch2 || ... || branchN)
+//
+// Currently only SHA256 is supported. If a different algorithm is passed, an
+// error is returned rather than silently producing a wrong digest.
 func computePolicyORHash(alg HashAlgorithm, branchDigests [][]byte) ([]byte, error) {
+	if alg != AlgSHA256 {
+		return nil, fmt.Errorf("unsupported hash algorithm: 0x%x (only SHA256 supported)", alg)
+	}
+
 	var buf []byte
 	buf = binary.BigEndian.AppendUint32(buf, uint32(tpm2.TPMCCPolicyOR))
 	for _, d := range branchDigests {

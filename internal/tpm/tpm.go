@@ -407,7 +407,11 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 			buildtags.Debug("tpm:   PCR %d: %d variant(s)\n", pred.PCR, len(pred.Values))
 		}
 	} else {
-		buildtags.Debug("tpm: WARNING: no PCR predictions provided, PolicyAuthorizeNV will likely fail\n")
+		// Without PCR predictions, we cannot build the super-PCR policy
+		// that PolicyAuthorizeNV requires. Proceeding would guarantee a
+		// PolicyAuthorizeNV failure with a confusing error. Fail fast
+		// with a clear cause instead.
+		return nil, fmt.Errorf("pcrlock token requires PCR predictions from pcrlock.json; pcrlock.json is missing or unparseable")
 	}
 
 	authVariants := []struct {
@@ -456,18 +460,16 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 
 		// Step 1: Build super-PCR policy on the session
 		// This makes the session digest match what's stored in the NV index
-		if hasPredictions {
-			buildtags.Debug("tpm: building super-PCR policy on session...\n")
-			if err := buildSuperPCRPolicySession(tpm, opts.Bank, opts.PCRPredictions, sess); err != nil {
-				cleanup()
-				lastErr = fmt.Errorf("build super-PCR policy: %w", err)
-				continue
-			}
+		buildtags.Debug("tpm: building super-PCR policy on session...\n")
+		if err := buildSuperPCRPolicySession(tpm, opts.Bank, opts.PCRPredictions, sess); err != nil {
+			cleanup()
+			lastErr = fmt.Errorf("build super-PCR policy: %w", err)
+			continue
+		}
 
-			digestRsp, debugErr := tpm2.PolicyGetDigest{PolicySession: sess.Handle()}.Execute(tpm)
-			if debugErr == nil {
-				buildtags.Debug("tpm: session digest after super-PCR policy: %x\n", digestRsp.PolicyDigest.Buffer)
-			}
+		digestRsp, debugErr := tpm2.PolicyGetDigest{PolicySession: sess.Handle()}.Execute(tpm)
+		if debugErr == nil {
+			buildtags.Debug("tpm: session digest after super-PCR policy: %x\n", digestRsp.PolicyDigest.Buffer)
 		}
 
 		// Step 2: PolicyAuthorizeNV
@@ -555,11 +557,14 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 	return nil, ErrPCRMismatch
 }
 
-// unsealWithPCRPolicy handles traditional PCR-bound tokens
 // unsealWithPCRPolicy handles traditional PCR-bound tokens.
 // Uses a policy session for authorization. No extra HMAC session is needed
 // for Unseal (the TPM returns OutData directly; an extra HMAC session with
 // Encrypt attribute causes TPM_RC_ATTRIBUTES).
+//
+// For PIN-less tokens (needsAuth=false), a plain policy session is created
+// and PolicyPCR is executed. For PIN tokens (needsAuth=true), an auth policy
+// session is created and both PolicyPCR and PolicyAuthValue are executed.
 func (c *Client) unsealWithPCRPolicy(tpm transport.TPM, loadRsp *tpm2.LoadResponse, opts UnsealOpts, needsAuth bool) ([]byte, error) {
 	var authValue []byte
 	var authName string
@@ -579,8 +584,9 @@ func (c *Client) unsealWithPCRPolicy(tpm transport.TPM, loadRsp *tpm2.LoadRespon
 
 	buildtags.Debug("tpm debug: trying auth '%s'\n", authName)
 
-	// Policy session with PolicyAuthValue - matches systemd's approach exactly
-	// This tells the TPM what the auth value is for the sealed object
+	// Create policy session.
+	// For PIN tokens: use fixedAuthPolicySession (wraps Auth() for HMAC key trimming).
+	// For PIN-less tokens: use plain PolicySession (no auth, just PCR binding).
 	var policySess tpm2.Session
 	var policyCleanup func() error
 	var err error
@@ -588,41 +594,63 @@ func (c *Client) unsealWithPCRPolicy(tpm transport.TPM, loadRsp *tpm2.LoadRespon
 	if needsAuth && len(authValue) > 0 {
 		policySess, policyCleanup, err = newFixedAuthPolicySession(tpm, authValue)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create policy session: %w", err)
+			return nil, fmt.Errorf("failed to create auth policy session: %w", err)
 		}
 
 		// Call PolicyAuthValue to tell the TPM what the auth value is
-		// This is the key step - without it, TPM returns AUTH_UNAVAILABLE
 		_, err = tpm2.PolicyAuthValue{PolicySession: policySess.Handle()}.Execute(tpm)
 		if err != nil {
 			policyCleanup()
 			return nil, fmt.Errorf("PolicyAuthValue failed: %w", err)
 		}
 
-		buildtags.Debug("tpm debug: Policy session with PolicyAuthValue\n")
+		buildtags.Debug("tpm debug: PolicyAuthValue executed on session\n")
 
 		digestRsp, debugErr := tpm2.PolicyGetDigest{PolicySession: policySess.Handle()}.Execute(tpm)
 		if debugErr == nil {
 			buildtags.Debug("tpm debug: session digest after PolicyAuthValue: %x\n", digestRsp.PolicyDigest.Buffer)
 			buildtags.Debug("tpm debug: expected authPolicy: %x\n", opts.PolicyHash)
 		}
+	} else {
+		// PIN-less token: plain policy session, no auth
+		policySess, policyCleanup, err = tpm2.PolicySession(tpm, tpm2.TPMAlgSHA256, 16)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create policy session: %w", err)
+		}
+		buildtags.Debug("tpm debug: plain policy session (no auth) for PIN-less token\n")
+	}
+
+	// Execute PolicyPCR on the session — required for ALL PCR-bound tokens,
+	// whether PIN or PIN-less. Without this, the TPM cannot satisfy the
+	// object's authPolicy and Unseal will fail with a policy error.
+	if len(opts.PCRs) > 0 {
+		pcrSelection := buildPCRLSelection(opts.Bank, opts.PCRs)
+		buildtags.Debug("tpm debug: PolicyPCR for PCRs %v (bank 0x%x)\n", opts.PCRs, opts.Bank)
+		_, err = tpm2.PolicyPCR{
+			PolicySession: policySess.Handle(),
+			PcrDigest:     tpm2.TPM2BDigest{},
+			Pcrs:          pcrSelection,
+		}.Execute(tpm)
+		if err != nil {
+			policyCleanup()
+			return nil, fmt.Errorf("PolicyPCR failed: %w", err)
+		}
+
+		digestRsp, debugErr := tpm2.PolicyGetDigest{PolicySession: policySess.Handle()}.Execute(tpm)
+		if debugErr == nil {
+			buildtags.Debug("tpm debug: session digest after PolicyPCR: %x\n", digestRsp.PolicyDigest.Buffer)
+		}
 	}
 
 	// Create handle with Policy session for authorization
-	auth := policySess
-	if auth == nil {
-		auth = tpm2.PasswordAuth(nil)
-	}
 	loadedHandle := tpm2.AuthHandle{
 		Handle: loadRsp.ObjectHandle,
 		Name:   loadRsp.Name,
-		Auth:   auth,
+		Auth:   policySess,
 	}
 
 	// Unseal with policy session only (no extra HMAC session).
-	// Unseal has no command parameters that require decryption, and
-	// an extra session with Encrypt attribute causes TPM_RC_ATTRIBUTES.
-	buildtags.Debug("tpm debug: Calling Unseal with policy session (auth, no extra session)\n")
+	buildtags.Debug("tpm debug: Calling Unseal with policy session\n")
 	var unsealRsp *tpm2.UnsealResponse
 	unsealRsp, err = tpm2.Unseal{ItemHandle: loadedHandle}.Execute(tpm)
 
@@ -805,19 +833,70 @@ func (c *Client) ListNVIndexes() (map[uint32][]byte, error) {
 // FindPCRLockNVIndex finds the PCRLock NV index by searching for NV indexes
 // that have a PolicyAuthorizeNV policy set up.
 // Returns the NV index if found, 0 if not found.
+// FindPCRLockNVIndex searches the TPM NV indexes for a pcrlock policy index.
+//
+// pcrlock indexes have these characteristics:
+//   - In the owner hierarchy range (0x01800000 - 0x01BFFFFF)
+//   - Size 34 (SHA256 hash + 2-byte TPM2B header)
+//   - Attributes include policywrite and ownerread, but NOT platformcreate
+//
+// If multiple candidates are found, returns the first match. If none are
+// found, returns an error.
 func (c *Client) FindPCRLockNVIndex() (uint32, error) {
 	indexes, err := c.ListNVIndexes()
 	if err != nil {
 		return 0, err
 	}
 
-	// For now, return the first NV index found in the owner hierarchy
-	// The pcrlock NV index should be in the range 0x01000000 - 0x01FFFFFF
+	tpm, err := c.openTPM()
+	if err != nil {
+		return 0, err
+	}
+	defer tpm.Close()
+
 	for index := range indexes {
-		if index&0xFF000000 == 0x01000000 {
-			buildtags.Debug("tpm: found potential PCRLock NV index: 0x%x\n", index)
-			return index, nil
+		// Must be in owner hierarchy pcrlock range
+		if index < 0x01800000 || index > 0x01BFFFFF {
+			continue
 		}
+
+		// Read the NV public info to check attributes and size
+		readPubRsp, err := tpm2.NVReadPublic{
+			NVIndex: tpm2.TPMHandle(index),
+		}.Execute(tpm)
+		if err != nil {
+			buildtags.Debug("tpm: failed to read NV public for 0x%x: %v\n", index, err)
+			continue
+		}
+
+		nvPub, err := readPubRsp.NVPublic.Contents()
+		if err != nil {
+			buildtags.Debug("tpm: failed to parse NV public for 0x%x: %v\n", index, err)
+			continue
+		}
+
+		// pcrlock indexes have size 34 (SHA256 digest + 2-byte TPM2B header)
+		if nvPub.DataSize != 34 {
+			continue
+		}
+
+		// Must have policywrite (for make-policy to update it)
+		if !nvPub.Attributes.PolicyWrite {
+			continue
+		}
+
+		// Must have ownerread (so userspace can read it)
+		if !nvPub.Attributes.OwnerRead {
+			continue
+		}
+
+		// Must NOT have platformcreate (those are firmware indexes, not pcrlock)
+		if nvPub.Attributes.PlatformCreate {
+			continue
+		}
+
+		buildtags.Debug("tpm: found PCRLock NV index: 0x%x (size=%d)\n", index, nvPub.DataSize)
+		return index, nil
 	}
 
 	return 0, fmt.Errorf("no PCRLock NV index found")

@@ -23,6 +23,10 @@ initluks "github.com/zaolin/vanguard/init/luks"
 	"github.com/zaolin/vanguard/init/vconsole"
 )
 
+// earlyBootMounted tracks whether /boot was mounted during early init.
+// Used by cleanupAndHalt to know whether to unmount on failure paths.
+var earlyBootMounted bool
+
 func main() {
 	// 1. Setup early console for debugging and passphrase prompts
 	if err := console.Setup(); err != nil {
@@ -74,7 +78,8 @@ func main() {
 
 	// 4. Mount /boot early for logging (before anything else)
 	buildtags.Debug("vanguard: mounting /boot early\n")
-	earlyBootMounted, err := mount.MountBootEarly()
+	var err error
+	earlyBootMounted, err = mount.MountBootEarly()
 	if err != nil {
 		buildtags.Debug("vanguard: early mount /boot: %v\n", err)
 	}
@@ -150,15 +155,13 @@ func main() {
 		tui.StageError(tui.StageLUKS, err)
 		bootlog.Log(bootlog.EventLUKSFail, "error", err.Error())
 		console.Print("vanguard: failed to unlock devices: %v\n", err)
-		bootlog.Close()
-		halt()
+		cleanupAndHalt()
 	}
 	if !unlocked {
 		tui.StageError(tui.StageLUKS, fmt.Errorf("no LUKS devices found"))
 		bootlog.Log(bootlog.EventLUKSFail, "error", "no LUKS devices found")
 		console.Print("vanguard: no LUKS devices found\n")
-		bootlog.Close()
-		halt()
+		cleanupAndHalt()
 	}
 	tui.StageDone(tui.StageLUKS)
 	// Note: Per-device LUKS_UNLOCK events are logged by cryptsetup package
@@ -204,8 +207,7 @@ func main() {
 	if err != nil {
 		bootlog.Log(bootlog.EventRootMounted, "status", "error", "error", "no root device found")
 		console.Print("vanguard: failed to determine root device: %v\n", err)
-		bootlog.Close()
-		halt()
+		cleanupAndHalt()
 	}
 
 	// 15. Run fsck on root device before mounting
@@ -229,8 +231,7 @@ func main() {
 		tui.StageError(tui.StageRoot, err)
 		bootlog.Log(bootlog.EventRootMounted, "status", "error", "error", err.Error())
 		console.Print("vanguard: failed to mount root: %v\n", err)
-		bootlog.Close()
-		halt()
+		cleanupAndHalt()
 	}
 	tui.StageDone(tui.StageRoot)
 	bootlog.Log(bootlog.EventRootMounted, "target", "/sysroot", "device", rootDev, "status", "ok")
@@ -317,7 +318,7 @@ func main() {
 	}
 
 	console.Print("vanguard: no init found on root filesystem\n")
-	halt()
+	cleanupAndHalt()
 }
 
 // discoverModules scans /lib/modules for available kernel modules in the image
@@ -361,6 +362,23 @@ func halt() {
 	for {
 		time.Sleep(time.Hour)
 	}
+}
+
+// cleanupAndHalt performs cleanup (close bootlog, unmount /boot, reset TUI)
+// before halting. This ensures diagnostics are flushed to disk and the
+// terminal is restored on every failure path, not just the success path.
+func cleanupAndHalt() {
+	bootlog.Close()
+	if earlyBootMounted {
+		if err := mount.UnmountBootEarly(); err != nil {
+			console.Print("vanguard: warning: failed to unmount /boot: %v\n", err)
+		}
+	}
+	if tui.IsEnabled() {
+		tui.Quit()
+		tui.ForceReset()
+	}
+	halt()
 }
 
 // loadTPMModulesIfNeeded loads TPM driver modules if TPM device doesn't exist
