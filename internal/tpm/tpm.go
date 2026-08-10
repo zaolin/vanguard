@@ -33,6 +33,13 @@ var ErrPCRMismatch = errors.New("PCR policy mismatch")
 // ErrWrongPIN indicates incorrect PIN/password.
 var ErrWrongPIN = errors.New("incorrect PIN")
 
+// ErrPolicyFailed is a generic error for pcrlock token policy failures.
+// It collapses ErrWrongPIN and ErrPCRMismatch into a single error to prevent
+// an attacker from distinguishing "wrong PIN" from "wrong PCR values" via
+// error messages (error-message oracle attack). The internal debug log still
+// records the specific failure, but the caller sees only this generic error.
+var ErrPolicyFailed = errors.New("TPM policy failed")
+
 // HashAlgorithm is the TPM hash algorithm type.
 type HashAlgorithm = tpm2.TPMAlgID
 
@@ -52,20 +59,20 @@ type PCRPrediction struct {
 
 // UnsealOpts contains options for unsealing a TPM-protected secret.
 type UnsealOpts struct {
-	Public               []byte          // TPM public blob
-	Private              []byte          // TPM private blob
-	PCRs                 []int           // PCR indices (empty for pcrlock)
-	Bank                 HashAlgorithm   // PCR hash algorithm
-	PolicyHash           []byte          // Expected policy hash
-	AuthValue            []byte          // PIN/password (raw)
-	Salt                 []byte          // Salt for PBKDF2 (systemd uses this) - ONLY for enrollment
-	PrimaryAlg           string          // "ecc" or "rsa"
-	UsePCRLock           bool            // True for pcrlock-based tokens
-	PCRLockNV            uint32          // NV index for pcrlock (0 = default 0x01c20000)
-	SRKHandle            uint32          // Persistent SRK handle (0 = create transient)
-	SRKData              []byte          // Serialized SRK public data (tpm2_srk from systemd v255+)
-	SkipPolicyHashVerify bool            // Skip policy hash verification (for PIN-only tokens)
-	PCRPredictions       []PCRPrediction // Predicted PCR values for pcrlock super-PCR policy
+	Public          []byte          // TPM public blob
+	Private         []byte          // TPM private blob
+	PCRs            []int           // PCR indices (empty for pcrlock)
+	Bank            HashAlgorithm   // PCR hash algorithm
+	PolicyHash      []byte          // Expected policy hash
+	AuthValue       []byte          // PIN/password (raw)
+	Salt            []byte          // Salt for PBKDF2 (systemd uses this) - ONLY for enrollment
+	PrimaryAlg      string          // "ecc" or "rsa"
+	UsePCRLock      bool            // True for pcrlock-based tokens
+	PCRLockNV       uint32          // NV index for pcrlock (0 = default 0x01c20000)
+	SRKHandle       uint32          // Persistent SRK handle (0 = create transient)
+	SRKData         []byte          // Serialized SRK public data (tpm2_srk from systemd v255+)
+	PCRLockNVPublic []byte          // Raw TPM2B_NV_PUBLIC from token (for NV name verification)
+	PCRPredictions  []PCRPrediction // Predicted PCR values for pcrlock super-PCR policy
 }
 
 // LockoutStatus contains TPM dictionary attack lockout information.
@@ -234,6 +241,20 @@ func (c *Client) ReadPCRs(bank HashAlgorithm, pcrs []int) (map[int][]byte, error
 	}
 
 	return result, nil
+}
+
+// ReadPCR reads a single PCR value from the TPM.
+// Returns the PCR digest (32 bytes for SHA256 bank).
+func (c *Client) ReadPCR(bank HashAlgorithm, pcr int) ([]byte, error) {
+	result, err := c.ReadPCRs(bank, []int{pcr})
+	if err != nil {
+		return nil, err
+	}
+	val, ok := result[pcr]
+	if !ok {
+		return nil, fmt.Errorf("PCR %d not returned by TPM", pcr)
+	}
+	return val, nil
 }
 
 // pcrsToBitmap converts a list of PCR indices to a PCR select bitmap.
@@ -405,11 +426,107 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 	}
 	buildtags.Debug("tpm: NV index 0x%x, NV Name (%d bytes): %x\n", nvIndex, len(nvReadPublicRsp.NVName.Buffer), nvReadPublicRsp.NVName.Buffer)
 
+	// Security check: verify the NV index name against the token's pinned
+	// TPM2B_NV_PUBLIC. The NV name is a cryptographic hash over the entire
+	// NV public area (including authPolicy, attributes, and dataSize), so
+	// any redefinition or spoofing of the NV index produces a different name.
+	// This catches:
+	//   - NV index redefinition (attacker undefines real index, defines rogue one)
+	//   - NV index spoofing (attacker creates index with same attributes but
+	//     different authPolicy)
+	//   - Most replay attacks (old NV contents can't match a new NV public area)
+	// The token carries the full TPM2B_NV_PUBLIC in the tpm2_pcrlock_nv field.
+	if len(opts.PCRLockNVPublic) > 0 {
+		expectedName, err := computeNVName(opts.PCRLockNVPublic)
+		if err != nil {
+			buildtags.Debug("tpm: WARNING: failed to compute expected NV name from token: %v\n", err)
+		} else {
+			if !bytes.Equal(expectedName, nvReadPublicRsp.NVName.Buffer) {
+				buildtags.Debug("tpm: NV name mismatch!\n  expected: %x\n  actual:   %x\n", expectedName, nvReadPublicRsp.NVName.Buffer)
+				return nil, fmt.Errorf("NV index name mismatch — possible tampering detected (NV index may have been redefined)")
+			}
+			buildtags.Debug("tpm: NV index name verified against token\n")
+		}
+	} else {
+		buildtags.Debug("tpm: WARNING: no NV public blob in token, cannot verify NV index name\n")
+	}
+
+	// Pre-check: compute the expected super-PCR policy digest offline from
+	// pcrlock.json predictions, then read the NV index contents and compare.
+	// If they don't match, the pcrlock.json is wrong for this NV index —
+	// fail BEFORE prompting for PIN, avoiding:
+	//   - PIN harvest via error oracle (wrong PIN vs wrong PCR distinguishable)
+	//   - Unnecessary PIN exposure on a tampered system
+	//   - Confusing "PolicyAuthorizeNV failed" errors
+	//
+	// The NV index stores the super-PCR policy digest (32 bytes). We read it
+	// with owner auth (PasswordAuth(nil) — vanguard assumes empty owner auth).
+	// If owner auth is set, NVRead fails gracefully and we skip the pre-check
+	// with a warning rather than aborting.
+	if len(opts.PCRPredictions) > 0 {
+		expectedDigest, err := buildSuperPCRPolicyOffline(opts.Bank, opts.PCRPredictions)
+		if err != nil {
+			buildtags.Debug("tpm: WARNING: failed to compute offline super-PCR digest: %v\n", err)
+		} else {
+			// Read NV index contents (34 bytes = 2-byte TPM2B size + 32-byte digest)
+			nvReadRsp, err := tpm2.NVRead{
+				AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
+				NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(nvIndex)},
+				Size:       34,
+				Offset:     0,
+			}.Execute(tpm)
+			if err != nil {
+				// Gracefully handle: owner auth may be set, or NV index may
+				// require policy auth to read. Don't abort — the TPM's
+				// PolicyAuthorizeNV will still enforce the check at unseal time.
+				buildtags.Debug("tpm: WARNING: cannot read NV index contents (owner auth may be set): %v — skipping pre-check, TPM will enforce at PolicyAuthorizeNV\n", err)
+			} else {
+				nvData := nvReadRsp.Data.Buffer
+				// NV data is TPM2B-wrapped: [2-byte size][32-byte digest]
+				if len(nvData) >= 2 {
+					dataSize := int(binary.BigEndian.Uint16(nvData[0:2]))
+					if dataSize == 32 && len(nvData) >= 34 {
+						storedDigest := nvData[2:34]
+						if !bytes.Equal(expectedDigest, storedDigest) {
+							buildtags.Debug("tpm: pcrlock.json pre-check FAILED!\n  expected: %x\n  stored:   %x\n", expectedDigest, storedDigest)
+							return nil, fmt.Errorf("pcrlock.json predictions do not match NV index contents — pcrlock.json may be tampered or stale")
+						}
+						buildtags.Debug("tpm: pcrlock.json pre-check passed (digest matches NV index)\n")
+					}
+				}
+			}
+		}
+	}
+
 	hasPredictions := len(opts.PCRPredictions) > 0
 	if hasPredictions {
 		buildtags.Debug("tpm: have %d PCR predictions from pcrlock.json\n", len(opts.PCRPredictions))
 		for _, pred := range opts.PCRPredictions {
 			buildtags.Debug("tpm:   PCR %d: %d variant(s)\n", pred.PCR, len(pred.Values))
+		}
+
+		// Security check: warn if PCR 0 or PCR 7 are not in the policy.
+		// PCR 0 (firmware code) changes each boot, preventing replay attacks.
+		// PCR 7 (Secure Boot state) ensures the boot chain was measured.
+		// Without these, an attacker who can replay old PCR values or
+		// reset PCRs to all-zeros can bypass the policy.
+		// This is a warning, not a hard failure — some firmware (embedded,
+		// virtual) may not measure PCR 0.
+		hasPCR0 := false
+		hasPCR7 := false
+		for _, pred := range opts.PCRPredictions {
+			if pred.PCR == 0 {
+				hasPCR0 = true
+			}
+			if pred.PCR == 7 {
+				hasPCR7 = true
+			}
+		}
+		if !hasPCR0 {
+			buildtags.Debug("tpm: WARNING: PCR 0 (firmware code) not in pcrlock policy — replay attacks may be possible\n")
+		}
+		if !hasPCR7 {
+			buildtags.Debug("tpm: WARNING: PCR 7 (Secure Boot state) not in pcrlock policy — boot chain integrity not enforced\n")
 		}
 	} else {
 		// Without PCR predictions, we cannot build the super-PCR policy
@@ -546,7 +663,7 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 		}
 
 		buildtags.Debug("tpm: Unseal failed (auth=%s): %v\n", auth.name, err)
-		lastErr = classifyUnsealError(err)
+		lastErr = classifyUnsealError(err, false)
 		if errors.Is(lastErr, ErrTPMLockout) {
 			return nil, lastErr
 		}
@@ -675,7 +792,7 @@ func (c *Client) unsealWithPCRPolicy(tpm transport.TPM, loadRsp *tpm2.LoadRespon
 	}
 
 	buildtags.Debug("tpm debug: unseal failed with '%s': %v\n", authName, err)
-	lastErr := classifyUnsealError(err)
+	lastErr := classifyUnsealError(err, true)
 	if errors.Is(lastErr, ErrTPMLockout) {
 		return nil, lastErr
 	}
@@ -953,7 +1070,25 @@ func ParseBlob(blob []byte) (private, public []byte, err error) {
 }
 
 // classifyUnsealError converts TPM errors to semantic errors.
-func classifyUnsealError(err error) error {
+// classifyUnsealError converts a raw TPM error into a sentinel error.
+// For pcrlock tokens (usePCRLock=true), ErrWrongPIN and ErrPCRMismatch are
+// collapsed into ErrPolicyFailed to prevent an attacker from distinguishing
+// "wrong PIN" from "wrong PCR values" via error messages (error-message
+// oracle attack). The caller can still check errors.Is for ErrTPMLockout
+// to decide whether to retry.
+func classifyUnsealError(err error, usePCRLock bool) error {
+	// For pcrlock tokens, ErrWrongPIN and ErrPCRMismatch are collapsed into
+	// ErrPolicyFailed to prevent an error-message oracle attack.
+	classifyPinOrPCR := func(isPIN bool) error {
+		if usePCRLock {
+			return fmt.Errorf("%w: %v", ErrPolicyFailed, err)
+		}
+		if isPIN {
+			return fmt.Errorf("%w: %v", ErrWrongPIN, err)
+		}
+		return fmt.Errorf("%w: %v", ErrPCRMismatch, err)
+	}
+
 	// Check for TPM response codes from google/go-tpm
 	// TPMRC implements the error interface
 	var tpmRC tpm2.TPMRC
@@ -966,13 +1101,13 @@ func classifyUnsealError(err error) error {
 		}
 		// Check for specific error codes using Is() which handles FMT1 errors
 		if errors.Is(tpmRC, tpm2.TPMRCAuthFail) {
-			return fmt.Errorf("%w: %v", ErrWrongPIN, err)
+			return classifyPinOrPCR(true)
 		}
 		if errors.Is(tpmRC, tpm2.TPMRCPolicyFail) {
-			return fmt.Errorf("%w: %v", ErrPCRMismatch, err)
+			return classifyPinOrPCR(false)
 		}
 		if errors.Is(tpmRC, tpm2.TPMRCBadAuth) {
-			return fmt.Errorf("%w: %v", ErrWrongPIN, err)
+			return classifyPinOrPCR(true)
 		}
 	}
 
@@ -981,20 +1116,20 @@ func classifyUnsealError(err error) error {
 	if errors.As(err, &fmt1Err) {
 		errStr := fmt1Err.Error()
 		if containsAny(errStr, "AUTH_FAIL", "BAD_AUTH") {
-			return fmt.Errorf("%w: %v", ErrWrongPIN, err)
+			return classifyPinOrPCR(true)
 		}
 		if containsAny(errStr, "POLICY_FAIL") {
-			return fmt.Errorf("%w: %v", ErrPCRMismatch, err)
+			return classifyPinOrPCR(false)
 		}
 	}
 
 	// Fallback to string matching for any other errors
 	errStr := err.Error()
 	if containsAny(errStr, "authorization", "auth fail", "HMAC check failed", "AUTH_FAIL", "BAD_AUTH") {
-		return fmt.Errorf("%w: %v", ErrWrongPIN, err)
+		return classifyPinOrPCR(true)
 	}
 	if containsAny(errStr, "policy", "POLICY_FAIL") {
-		return fmt.Errorf("%w: %v", ErrPCRMismatch, err)
+		return classifyPinOrPCR(false)
 	}
 	if containsAny(errStr, "lockout", "LOCKOUT") {
 		return fmt.Errorf("%w: %v", ErrTPMLockout, err)

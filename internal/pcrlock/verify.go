@@ -1,7 +1,6 @@
 package pcrlock
 
 import (
-	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -47,25 +46,30 @@ func ParsePolicy(path string) (*Policy, error) {
 }
 
 // VerifyNVIndex checks if the TPM NV Index matches the policy expectation.
-// It compares the NV index name (cryptographic hash of the NV public area),
-// auth policy, and data size against the values derived from the policy's
-// base64-encoded nvPublic field. A mismatch on any field indicates the NV
-// index has been tampered with or is out of sync with the policy.
+// It compares the auth policy and data size against the values derived from
+// the policy's base64-encoded nvPublic field.
+//
+// The NV index name is NOT compared here because it includes volatile
+// attribute bits (Written, ReadLocked, WriteLocked) that change at runtime
+// when make-policy writes the digest. The TPM computes the name in hardware
+// with the current attribute state (Written=1), while the policy's nvPublic
+// was captured before the write (Written=0) — so the names will always differ
+// by those volatile bits. The full NV name verification with volatile bit
+// masking happens only in the boot-time unseal path (internal/tpm/tpm.go:
+// unsealWithPCRLock), where both sides are in software and volatile bits can
+// be masked on both.
 func VerifyNVIndex(policy *Policy) (*NVIndexDetails, bool, error) {
 	details, err := ReadNVIndexDetails(policy.NVIndex)
 	if err != nil {
 		return nil, false, err
 	}
 
-	expectedName, expectedAuthPolicy, expectedSize, err := extractNVPublicDetails(policy.NVPublic)
+	expectedAuthPolicy, expectedSize, err := extractNVPublicDetails(policy.NVPublic)
 	if err != nil {
 		return details, false, fmt.Errorf("failed to decode nvPublic from policy: %w", err)
 	}
 
 	matches := true
-	if !strings.EqualFold(details.Name, expectedName) {
-		matches = false
-	}
 	if !strings.EqualFold(details.AuthPolicy, expectedAuthPolicy) {
 		matches = false
 	}
@@ -118,38 +122,39 @@ func ReadNVIndexDetails(index int) (*NVIndexDetails, error) {
 	return details, nil
 }
 
-// extractNVPublicDetails extracts name, authPolicy and dataSize from base64-encoded TPM2B_NV_PUBLIC
-func extractNVPublicDetails(nvPublicB64 string) (name, authPolicy string, dataSize int, err error) {
+// extractNVPublicDetails extracts authPolicy and dataSize from base64-encoded
+// TPM2B_NV_PUBLIC. The name is no longer computed here — NV name verification
+// with volatile bit masking is handled in the boot-time unseal path
+// (internal/tpm/tpm.go: unsealWithPCRLock) where both the token blob and the
+// TPM response are in software and volatile bits can be masked on both sides.
+func extractNVPublicDetails(nvPublicB64 string) (authPolicy string, dataSize int, err error) {
 	data, err := base64.StdEncoding.DecodeString(nvPublicB64)
 	if err != nil {
-		return "", "", 0, fmt.Errorf("base64 decode failed: %w", err)
+		return "", 0, fmt.Errorf("base64 decode failed: %w", err)
 	}
 
 	if len(data) < 14 {
-		return "", "", 0, fmt.Errorf("nvPublic too short: %d bytes", len(data))
+		return "", 0, fmt.Errorf("nvPublic too short: %d bytes", len(data))
 	}
 
-	nameAlg := int(data[6])<<8 | int(data[7])
+	// nameAlg is at data[6:8] (after TPM2B size[2] + NVIndex[4])
+	// authPolicySize is at data[12:14] (after TPM2B size[2] + NVIndex[4] + nameAlg[2] + attributes[4])
 	offset := 12
 
 	authPolicySize := int(data[offset])<<8 | int(data[offset+1])
 	offset += 2
 	if offset+authPolicySize > len(data) {
-		return "", "", 0, fmt.Errorf("authPolicy truncated")
+		return "", 0, fmt.Errorf("authPolicy truncated")
 	}
 	authPolicy = fmt.Sprintf("%X", data[offset:offset+authPolicySize])
 	offset += authPolicySize
 
 	if offset+2 > len(data) {
-		return "", "", 0, fmt.Errorf("dataSize truncated")
+		return "", 0, fmt.Errorf("dataSize truncated")
 	}
 	dataSize = int(data[offset])<<8 | int(data[offset+1])
 
-	nvPublicContent := data[2:]
-	hash := sha256.Sum256(nvPublicContent)
-	name = fmt.Sprintf("%04X%X", nameAlg, hash[:])
-
-	return name, authPolicy, dataSize, nil
+	return authPolicy, dataSize, nil
 }
 
 // PCRNames maps PCR numbers to human-readable names

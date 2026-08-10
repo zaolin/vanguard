@@ -473,7 +473,7 @@ func TestXTS_Vs_GoXTS(t *testing.T) {
 	// Our XTS decrypt on Go's encrypted output
 	var tweak [16]byte
 	binary.LittleEndian.PutUint64(tweak[:8], 1) // sector 1
-	tweakBlock.Encrypt(tweak[:], tweak[:])       // plain64: encrypt sector number
+	tweakBlock.Encrypt(tweak[:], tweak[:])      // plain64: encrypt sector number
 	xtsDecryptSector(dataBlock, src, src, tweak)
 
 	for i := range src {
@@ -518,6 +518,7 @@ func TestXTS_GoXTS_RoundTrip(t *testing.T) {
 
 	t.Logf("Go XTS round-trip: OK")
 }
+
 // produces the expected results by doing a complete round-trip.
 func TestXTS_ESSIV_RoundTrip(t *testing.T) {
 	t.Parallel()
@@ -566,7 +567,7 @@ func TestXTS_ESSIV_DumpsEncryption(t *testing.T) {
 	skipIfNoCryptsetup(t)
 
 	cases := []struct {
-		name       string
+		name      string
 		extraArgs []string
 	}{
 		{"pbkdf2_sha512", []string{"--pbkdf", "pbkdf2", "--pbkdf-force-iterations", "1000", "--hash", "sha512"}},

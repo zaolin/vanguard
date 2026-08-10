@@ -1,22 +1,130 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"sort"
 
 	"github.com/zaolin/vanguard/internal/pcrlock"
 )
 
-type VerifyPCRLockCmd struct {
-	PolicyPath string `short:"p" required:"" help:"Path to pcrlock.json policy file"`
-	LUKSDevice string `short:"l" help:"Path to LUKS device to verify (optional)"`
-}
-
 func (c *VerifyPCRLockCmd) Run() error {
 	policy, err := pcrlock.ParsePolicy(c.PolicyPath)
 	if err != nil {
 		return err
 	}
+
+	if c.JSON {
+		return c.runJSON(policy)
+	}
+
+	return c.runHuman(policy)
+}
+
+// verifyResult is the JSON output structure for `vanguard verify --json`.
+type verifyResult struct {
+	Policy   string       `json:"policy"`
+	NVIndex  int          `json:"nvIndex"`
+	NVMatch  bool         `json:"nvMatch"`
+	NVError  string       `json:"nvError,omitempty"`
+	PCRs     []verifyPCR  `json:"pcrs"`
+	Token    *verifyToken `json:"token,omitempty"`
+	AllMatch bool         `json:"allMatch"`
+}
+
+type verifyPCR struct {
+	PCR      int    `json:"pcr"`
+	Name     string `json:"name"`
+	Match    bool   `json:"match"`
+	Enforced bool   `json:"enforced"`
+	Current  string `json:"current,omitempty"`
+}
+
+type verifyToken struct {
+	NVIndex    int  `json:"nvIndex"`
+	HasPCRLock bool `json:"hasPcrlock"`
+	NVMatch    bool `json:"nvMatch"`
+}
+
+func (c *VerifyPCRLockCmd) runJSON(policy *pcrlock.Policy) error {
+	result := verifyResult{
+		Policy:  c.PolicyPath,
+		NVIndex: policy.NVIndex,
+	}
+
+	nvDetails, nvMatch, nvErr := pcrlock.VerifyNVIndex(policy)
+	if nvErr != nil {
+		result.NVError = nvErr.Error()
+	} else {
+		result.NVMatch = nvMatch
+		_ = nvDetails
+	}
+
+	pcrMatches, currentValues, pcrErr := pcrlock.VerifyPCRs(policy)
+	if pcrErr != nil {
+		return fmt.Errorf("failed to read PCRs: %w", pcrErr)
+	}
+
+	result.AllMatch = result.NVMatch
+
+	for _, pv := range policy.PCRValues {
+		name := pcrlock.PCRNames[pv.PCR]
+		if name == "" {
+			name = "unknown"
+		}
+
+		isEnforced := true
+		for _, v := range pv.Values {
+			if v != "0000000000000000000000000000000000000000000000000000000000000000" {
+				isEnforced = false
+				break
+			}
+		}
+		isEnforced = !isEnforced
+
+		matched := pcrMatches[pv.PCR]
+		current := currentValues[pv.PCR]
+
+		result.PCRs = append(result.PCRs, verifyPCR{
+			PCR:      pv.PCR,
+			Name:     name,
+			Match:    matched,
+			Enforced: isEnforced,
+			Current:  current,
+		})
+
+		if !matched && isEnforced {
+			result.AllMatch = false
+		}
+	}
+
+	if c.LUKSDevice != "" {
+		token, err := pcrlock.GetLUKSTPMToken(c.LUKSDevice)
+		if err == nil && token != nil {
+			result.Token = &verifyToken{
+				NVIndex:    token.NVIndex,
+				HasPCRLock: token.HasPCRLock,
+				NVMatch:    token.NVIndex == policy.NVIndex,
+			}
+			if !result.Token.NVMatch {
+				result.AllMatch = false
+			}
+		}
+	}
+
+	data, err := json.MarshalIndent(result, "", "  ")
+	if err != nil {
+		return err
+	}
+	fmt.Println(string(data))
+
+	if !result.AllMatch {
+		return fmt.Errorf("verification failed")
+	}
+	return nil
+}
+
+func (c *VerifyPCRLockCmd) runHuman(policy *pcrlock.Policy) error {
 
 	fmt.Println()
 	fmt.Println("  " + headerSty.Render("VERIFYING PCRLOCK SETUP"))

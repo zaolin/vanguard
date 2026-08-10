@@ -125,9 +125,9 @@ func ReadPassword(prompt string) (string, error) {
 		return "", fmt.Errorf("failed to get terminal state: %w", err)
 	}
 
-	// Disable echo
+	// Disable echo and related echo flags to prevent password keystroke leakage
 	newState := *oldState
-	newState.Lflag &^= unix.ECHO
+	newState.Lflag &^= unix.ECHO | unix.ECHOE | unix.ECHOK | unix.ECHOCTL | unix.ECHOPRT | unix.ECHOKE
 	if err := unix.IoctlSetTermios(int(consoleFd.Fd()), unix.TCSETS, &newState); err != nil {
 		return "", fmt.Errorf("failed to disable echo: %w", err)
 	}
@@ -146,12 +146,36 @@ func ReadPassword(prompt string) (string, error) {
 			break
 		}
 		if len(password) >= maxPasswordLen {
-			// Discard additional input but keep reading until newline
 			continue
 		}
 		password = append(password, buf[0])
 	}
+	// Zero the read buffer
+	buf[0] = 0
 	Print("\n")
 
 	return string(password), nil
+}
+
+// ZeroString converts a string to a mutable byte slice, zeroes it, and returns
+// the empty string. This is best-effort: Go strings are immutable, so the
+// original backing array may have been copied by the runtime. Still, this
+// reduces the cold-boot extraction window for the most common code path where
+// the string's backing array is the same slice that was read.
+func ZeroString(s *string) {
+	if s == nil || len(*s) == 0 {
+		return
+	}
+	b := []byte(*s)
+	for i := range b {
+		b[i] = 0
+	}
+	*s = ""
+}
+
+// ZeroBytes zeroes a byte slice in place.
+func ZeroBytes(b []byte) {
+	for i := range b {
+		b[i] = 0
+	}
 }

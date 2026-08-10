@@ -504,17 +504,42 @@ func MountBootEarly() (bool, error) {
 		return false, nil // No boot partition found
 	}
 
-	// Mount as vfat (ESP is always FAT32)
-	if err := unix.Mount(bootDev, "/boot", "vfat", 0, ""); err != nil {
+	// Mount as vfat (ESP is always FAT32) — read-only for security.
+	// The bootlog will remount RW transiently when it needs to write.
+	if err := unix.Mount(bootDev, "/boot", "vfat", unix.MS_RDONLY, ""); err != nil {
 		return false, fmt.Errorf("failed to mount boot partition %s: %w", bootDev, err)
 	}
-	console.DebugPrint("vanguard: mounted early /boot (%s, vfat, rw)\n", bootDev)
+	console.DebugPrint("vanguard: mounted early /boot (%s, vfat, ro)\n", bootDev)
 	return true, nil
 }
 
-// UnmountBootEarly unmounts /boot in initramfs
+// UnmountBootEarly unmounts /boot in initramfs.
+// If the normal unmount fails (e.g., filesystem busy from cached state),
+// it falls back to MNT_DETACH (lazy unmount) which detaches the mount
+// even if it's busy, allowing the real system to mount /boot fresh.
 func UnmountBootEarly() error {
-	return unix.Unmount("/boot", 0)
+	// Try normal unmount first
+	if err := unix.Unmount("/boot", 0); err == nil {
+		return nil
+	}
+	// Fall back to lazy unmount (MNT_DETACH)
+	// This detaches the mount immediately — the filesystem is cleaned up
+	// when the last reference is released. This prevents the "already
+	// mounted" error when the user tries to mount /boot in the real system.
+	return unix.Unmount("/boot", unix.MNT_DETACH)
+}
+
+// RemountBootRW remounts /boot read-write. Used by bootlog to write
+// the boot log file. The window where /boot is writable is minimized:
+// remount RW → write log → remount RO → continue boot.
+func RemountBootRW() error {
+	return unix.Mount("", "/boot", "", unix.MS_REMOUNT, "")
+}
+
+// RemountBootRO remounts /boot read-only. Called after bootlog writes
+// to minimize the writable window.
+func RemountBootRO() error {
+	return unix.Mount("", "/boot", "", unix.MS_REMOUNT|unix.MS_RDONLY, "")
 }
 
 // SetupPCRLockEarly copies pcrlock.json from /boot to /var/lib/systemd/ in initramfs

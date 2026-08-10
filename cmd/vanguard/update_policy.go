@@ -20,8 +20,31 @@ func (c *UpdatePolicyCmd) Run() error {
 		return fmt.Errorf("UKI file not found: %s", c.UKIPath)
 	}
 
+	if c.DryRun {
+		fmt.Println()
+		fmt.Println("  " + headerSty.Render("DRY RUN — no changes will be made"))
+		fmt.Println()
+		fmt.Printf("  UKI:          %s\n", c.UKIPath)
+		fmt.Printf("  Policy:       %s\n", c.PolicyOutput)
+		if c.LUKSDevice != "" {
+			fmt.Printf("  LUKS device:  %s\n", c.LUKSDevice)
+		}
+		fmt.Printf("  GPT binding:  %v\n", c.LUKSDevice != "" && !c.NoGPT)
+		fmt.Printf("  Cleanup:      %v\n", c.Cleanup)
+		fmt.Println()
+		fmt.Println("  Would: configure masks, regenerate firmware components,")
+		fmt.Println("        lock Secure Boot, lock UKI, generate policy, verify.")
+		fmt.Println()
+		return nil
+	}
+
 	if c.PolicyOutput == "" {
-		c.PolicyOutput = strings.TrimSuffix(c.UKIPath, ".efi") + ".pcrlock.json"
+		// Case-insensitive .efi stripping — handles kernel.efi, kernel.EFI, BOOTX64.EFI
+		ukiBase := c.UKIPath
+		if strings.HasSuffix(strings.ToLower(ukiBase), ".efi") {
+			ukiBase = ukiBase[:len(ukiBase)-4]
+		}
+		c.PolicyOutput = ukiBase + ".pcrlock.json"
 	}
 
 	if _, err := os.Stat(pcrlock.PCRLockBinPath()); err != nil {
@@ -40,7 +63,6 @@ func (c *UpdatePolicyCmd) Run() error {
 	if err := pcrlock.ConfigureMasks(); err != nil {
 		return fmt.Errorf("failed to configure masks: %w", err)
 	}
-	results.masksDone = true
 
 	// Regenerate stale firmware components from the current boot's event log.
 	// Without this, a stale 250-firmware-code-early/generated.pcrlock (e.g. from
@@ -63,30 +85,40 @@ func (c *UpdatePolicyCmd) Run() error {
 	results.pcr7Locked = true
 
 	gptEnabled := c.LUKSDevice != "" && !c.NoGPT
-	ukiLocked := true
 
 	if gptEnabled {
 		gptDevice := getParentDisk(c.LUKSDevice)
 		if err := pcrlock.LockGPT(gptDevice); err != nil {
 			if err == pcrlock.ErrNoGPT {
 				gptEnabled = false
-				pcrlock.MaskPolicy("600-gpt.pcrlock")
+				if err := pcrlock.MaskPolicy("600-gpt.pcrlock"); err != nil {
+					if c.Verbose {
+						fmt.Printf("Note: failed to mask GPT policy: %v\n", err)
+					}
+				}
 			} else {
 				return fmt.Errorf("failed to lock GPT: %w", err)
 			}
 		} else {
-			pcrlock.LockEFIActions()
+			if err := pcrlock.LockEFIActions(); err != nil {
+				if c.Verbose {
+					fmt.Printf("Note: failed to lock EFI actions: %v\n", err)
+				}
+			}
 		}
 	} else {
-		pcrlock.MaskPolicy("600-gpt.pcrlock")
+		if err := pcrlock.MaskPolicy("600-gpt.pcrlock"); err != nil {
+			if c.Verbose {
+				fmt.Printf("Note: failed to mask GPT policy: %v\n", err)
+			}
+		}
 	}
 
 	if err := pcrlock.LockUKIWithPEFallback(c.UKIPath); err != nil {
-		ukiLocked = false
 		return fmt.Errorf("failed to lock UKI: %w", err)
 	}
 
-	if ukiLocked {
+	{
 		var lockLines []string
 		addPCR := func(pcr int, name string, locked bool) {
 			if locked {
@@ -96,7 +128,7 @@ func (c *UpdatePolicyCmd) Run() error {
 			}
 		}
 		addPCR(7, "secure-boot", results.pcr7Locked)
-		addPCR(4, "boot-loader", ukiLocked)
+		addPCR(4, "boot-loader", true)
 		if gptEnabled {
 			addPCR(5, "GPT partition", true)
 		}
@@ -245,7 +277,6 @@ func (c *UpdatePolicyCmd) Run() error {
 }
 
 type updateResults struct {
-	masksDone  bool
 	pcr7Locked bool
 }
 

@@ -288,7 +288,7 @@ func TestLoadExternalSRKDecision_RawPublicData(t *testing.T) {
 
 func TestIsPersistentHandle_EsysTRHandles(t *testing.T) {
 	handles := []struct {
-		handle    uint32
+		handle     uint32
 		persistent bool
 	}{
 		{0x81000000, true},

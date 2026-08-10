@@ -11,9 +11,10 @@ import (
 	"strings"
 	"time"
 
-	lk "github.com/zaolin/vanguard/internal/luks"
 	"github.com/zaolin/vanguard/init/console"
+	"github.com/zaolin/vanguard/init/recovery"
 	"github.com/zaolin/vanguard/init/tui"
+	lk "github.com/zaolin/vanguard/internal/luks"
 	intpm "github.com/zaolin/vanguard/internal/tpm"
 )
 
@@ -32,7 +33,10 @@ var Debug func(format string, args ...any) = func(format string, args ...any) {}
 var LogFunc func(event string, kvPairs ...string) = func(event string, kvPairs ...string) {}
 
 // StrictMode disables passphrase fallback when TPM2 token is present.
-var StrictMode bool = false
+// Always true — strict mode is the default and only mode.
+// Passphrase fallback requires TOTP recovery (see init/recovery/recovery.go).
+// There is no kernel cmdline override and no build-tag option.
+var StrictMode bool = true
 
 // Maximum PIN retry attempts.
 const maxPINAttempts = 3
@@ -198,14 +202,29 @@ func (d *Device) Unlock() error {
 
 		console.DebugPrint("luks: TPM2 unlock failed: %v\n", err)
 
-		// Strict mode: no passphrase fallback
+		// Strict mode: try TOTP recovery before halting
 		if StrictMode {
-			console.Print("luks: strict mode - no passphrase fallback\n")
-			LogFunc("LUKS_FAIL", "device", d.Path, "method", "token", "error", err.Error(), "mode", "strict")
-			return fmt.Errorf("token unlock failed (strict mode): %w", err)
+			// Quit TUI so console prompts are visible for TOTP recovery
+			if tui.IsEnabled() {
+				tui.Quit()
+				tui.ForceReset()
+			}
+			// Attempt TOTP recovery — if successful, enable passphrase fallback
+			// for this boot only
+			tpmClient := intpm.New()
+			if recovery.TryTOTP(tpmClient, d.Path) {
+				console.Print("luks: TOTP recovery accepted, passphrase fallback enabled\n")
+				LogFunc("RECOVERY_SUCCESS", "device", d.Path, "method", "totp")
+				// Fall through to passphrase fallback below
+			} else {
+				console.Print("luks: strict mode - no passphrase fallback\n")
+				LogFunc("LUKS_FAIL", "device", d.Path, "method", "token",
+					"error", err.Error(), "mode", "strict")
+				return fmt.Errorf("token unlock failed (strict mode): %w", err)
+			}
 		}
 
-		// Normal mode: fall back to passphrase
+		// Normal mode or TOTP recovery succeeded: fall back to passphrase
 		console.Print("luks: falling back to passphrase: %v\n", err)
 
 		// Show failure reason in TUI
@@ -295,9 +314,8 @@ func (d *Device) UnlockWithTPM2() error {
 		return err
 	}
 
-	// Detect TPM2 token strategy to determine if we should skip policy hash verification
+	// Detect TPM2 token strategy
 	detection, _ := DetectTPM2TokenStrategy(d.Path)
-	skipPolicy := detection != nil && detection.Strategy == StrategyPINOnly
 	var pcrlockPolicy *intpm.PCRLockPolicy
 	if detection != nil {
 		Debug("luks: TPM2 token strategy: %v\n", detection.Strategy)
@@ -305,15 +323,15 @@ func (d *Device) UnlockWithTPM2() error {
 	}
 
 	if token.NeedsPIN {
-		return d.unlockWithTPM2PIN(tpmClient, token, skipPolicy, pcrlockPolicy)
+		return d.unlockWithTPM2PIN(tpmClient, token, pcrlockPolicy)
 	}
 
-	return d.unlockWithTPM2NoPIN(tpmClient, token, skipPolicy, pcrlockPolicy)
+	return d.unlockWithTPM2NoPIN(tpmClient, token, pcrlockPolicy)
 }
 
 // unlockWithTPM2NoPIN attempts TPM2 unlock without PIN.
-func (d *Device) unlockWithTPM2NoPIN(tpmClient *intpm.Client, token *TPM2Token, skipPolicyHashVerify bool, pcrlockPolicy *intpm.PCRLockPolicy) error {
-	password, err := token.Unseal(tpmClient, nil, skipPolicyHashVerify, pcrlockPolicy)
+func (d *Device) unlockWithTPM2NoPIN(tpmClient *intpm.Client, token *TPM2Token, pcrlockPolicy *intpm.PCRLockPolicy) error {
+	password, err := token.Unseal(tpmClient, nil, pcrlockPolicy)
 	if err != nil {
 		d.logPCRDebug(token)
 		return err
@@ -323,10 +341,27 @@ func (d *Device) unlockWithTPM2NoPIN(tpmClient *intpm.Client, token *TPM2Token, 
 }
 
 // unlockWithTPM2PIN attempts TPM2 unlock with PIN and retry logic.
-func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, skipPolicyHashVerify bool, pcrlockPolicy *intpm.PCRLockPolicy) error {
+func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, pcrlockPolicy *intpm.PCRLockPolicy) error {
 	var lastError error
 	var pin string
 	var err error
+
+	// zeroPIN overwrites the PIN string's backing buffer after use to reduce
+	// the cold-boot PIN extraction window. Go strings are immutable, so we
+	// convert to []byte, use it, then zero the original string's backing store.
+	// This is best-effort — the GC may have copied the string, and the TUI
+	// may retain its own copy. Still better than leaving it in heap indefinitely.
+	zeroPIN := func() {
+		if len(pin) > 0 {
+			// Convert string to mutable bytes (unsafe but the string is ours)
+			pinBytes := []byte(pin)
+			for i := range pinBytes {
+				pinBytes[i] = 0
+			}
+			pin = ""
+		}
+	}
+	defer zeroPIN()
 
 	for attempt := 1; attempt <= maxPINAttempts; attempt++ {
 		// Prompt for PIN
@@ -346,7 +381,7 @@ func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, sk
 		}
 
 		// Unseal with PIN using native TPM implementation
-		password, unsealErr := token.Unseal(tpmClient, []byte(pin), skipPolicyHashVerify, pcrlockPolicy)
+		password, unsealErr := token.Unseal(tpmClient, []byte(pin), pcrlockPolicy)
 		if unsealErr == nil {
 			// Success - unlock with password
 			if tui.IsEnabled() {
@@ -360,9 +395,16 @@ func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, sk
 		lastError = unsealErr
 
 		// Check if retryable
-		if errors.Is(unsealErr, intpm.ErrWrongPIN) && attempt < maxPINAttempts {
+		// For pcrlock tokens, ErrPolicyFailed collapses both wrong-PIN and
+		// wrong-PCR into one error — retry anyway since the user might just
+		// have a wrong PIN.
+		if (errors.Is(unsealErr, intpm.ErrWrongPIN) || errors.Is(unsealErr, intpm.ErrPolicyFailed)) && attempt < maxPINAttempts {
 			LogFunc("TPM_PIN_FAIL", "device", d.Path, "attempt", fmt.Sprintf("%d", attempt))
-			userMsg = fmt.Sprintf("Incorrect PIN (attempt %d of %d)", attempt, maxPINAttempts)
+			if errors.Is(unsealErr, intpm.ErrPolicyFailed) {
+				userMsg = fmt.Sprintf("TPM unlock failed (attempt %d of %d)", attempt, maxPINAttempts)
+			} else {
+				userMsg = fmt.Sprintf("Incorrect PIN (attempt %d of %d)", attempt, maxPINAttempts)
+			}
 			if tui.IsEnabled() {
 				pin, err = tui.PasswordErrorWithRetry(userMsg)
 			} else {
@@ -392,7 +434,7 @@ func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, sk
 			console.Print("luks: %s\n", userMsg)
 		}
 
-		if !errors.Is(unsealErr, intpm.ErrWrongPIN) {
+		if !errors.Is(unsealErr, intpm.ErrWrongPIN) && !errors.Is(unsealErr, intpm.ErrPolicyFailed) {
 			d.logPCRDebug(token)
 			LogFunc("TPM_ERROR", "device", d.Path, "message", userMsg)
 		} else {
@@ -468,8 +510,7 @@ func (d *Device) UnlockWithPassphrase() error {
 			return err
 		}
 
-		Debug("passphrase: entered %d bytes, first: 0x%02x, last: 0x%02x\n",
-			len(passphrase), passphrase[0], passphrase[len(passphrase)-1])
+		Debug("passphrase: entered %d bytes\n", len(passphrase))
 
 		// Try each keyslot with the passphrase
 		slots := d.dev.Slots()
@@ -581,6 +622,9 @@ func (d *Device) logPCRDebug(token *TPM2Token) {
 
 // formatTPMError converts TPM errors to user-friendly messages.
 func formatTPMError(err error) string {
+	if errors.Is(err, intpm.ErrPolicyFailed) {
+		return "TPM unlock failed"
+	}
 	if errors.Is(err, intpm.ErrWrongPIN) {
 		return "Incorrect PIN"
 	}

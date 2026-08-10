@@ -22,6 +22,12 @@ import (
 
 // Run executes the generate command
 func (c *GenerateCmd) Run() error {
+	// Generate reads /etc/passwd, /etc/group, /etc/fstab, /etc/vconsole.conf
+	// and writes to /boot — requires root.
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("this command must be run as root")
+	}
+
 	// Load config file if specified
 	cfg, err := config.Load(c.Config)
 	if err != nil {
@@ -43,9 +49,6 @@ func (c *GenerateCmd) Run() error {
 	}
 	if c.Debug {
 		cfg.Debug = true
-	}
-	if c.Strict {
-		cfg.StrictMode = true
 	}
 
 	return runGenerate(cfg)
@@ -172,13 +175,20 @@ func sanitizeInitramfsPath(p string) (string, error) {
 	// Strip leading slash
 	p = strings.TrimPrefix(p, "/")
 
-	// Clean the path and reject any ".." components
+	// Clean the path
 	cleaned := filepath.Clean(p)
-	if cleaned == ".." || strings.HasPrefix(cleaned, "../") {
-		return "", fmt.Errorf("path traversal detected: %q escapes initramfs root", p)
+
+	// Reject any path that contains ".." as a component — not just leading.
+	// filepath.Clean collapses ".." where possible, but mid-path traversal
+	// like "lib/firmware/../../etc/shadow" cleans to "etc/shadow" which
+	// would be accepted but writes outside the intended subtree.
+	for _, part := range strings.Split(cleaned, "/") {
+		if part == ".." {
+			return "", fmt.Errorf("path traversal detected: %q escapes initramfs root", p)
+		}
 	}
 
-	// Reject absolute paths (after cleaning, should never happen but be safe)
+	// Reject absolute paths
 	if filepath.IsAbs(cleaned) {
 		return "", fmt.Errorf("absolute path not allowed in initramfs: %q", p)
 	}
@@ -220,21 +230,16 @@ func runGenerate(cfg *config.Config) error {
 	}
 
 	// Get embedded init binary based on configuration
+	// Both variants have strict mode always-on (no passphrase fallback without TOTP)
 	fmt.Printf("vanguard: using embedded init binary...\n")
 	var initContent []byte
 	switch {
-	case cfg.Debug && cfg.StrictMode:
-		initContent = embed.InitDebugStrictBinary
-		fmt.Printf("  using debug+strict init (%d bytes)\n", len(initContent))
-	case cfg.StrictMode:
-		initContent = embed.InitStrictBinary
-		fmt.Printf("  using strict init (%d bytes)\n", len(initContent))
 	case cfg.Debug:
 		initContent = embed.InitDebugBinary
-		fmt.Printf("  using debug init (%d bytes)\n", len(initContent))
+		fmt.Printf("  using debug init (%d bytes, strict mode)\n", len(initContent))
 	default:
 		initContent = embed.InitBinary
-		fmt.Printf("  using release init (%d bytes)\n", len(initContent))
+		fmt.Printf("  using release init (%d bytes, strict mode)\n", len(initContent))
 	}
 
 	// Collect firmware files
@@ -331,18 +336,27 @@ func runGenerate(cfg *config.Config) error {
 	// Find binaries - search multiple paths for each
 	binarySearchPaths := map[string][]string{
 		"lvm":           {"/usr/sbin/lvm", "/sbin/lvm"},
-		"dmsetup":       {"/sbin/dmsetup", "/usr/sbin/dmsetup", "/usr/bin/dmsetup"}, // Required by udev dm rules at /sbin/dmsetup
+		"dmsetup":       {"/sbin/dmsetup", "/usr/sbin/dmsetup", "/usr/bin/dmsetup"},
 		"systemd-udevd": {"/usr/lib/systemd/systemd-udevd", "/lib/systemd/systemd-udevd", "/sbin/udevd"},
 		"udevadm":       {"/usr/bin/udevadm", "/sbin/udevadm", "/bin/udevadm"},
-		// Vconsole support
-		"loadkeys": {"/usr/bin/loadkeys", "/bin/loadkeys"}, // For keyboard layout
-		"setfont":  {"/usr/bin/setfont", "/bin/setfont"},   // For console font
-		// Filesystem check support
-		"fsck":      {"/usr/bin/fsck", "/sbin/fsck"},                                              // Generic fsck wrapper
-		"fsck.ext4": {"/usr/bin/fsck.ext4", "/sbin/fsck.ext4", "/usr/bin/e2fsck", "/sbin/e2fsck"}, // ext4 fsck
+		// Vconsole support (optional)
+		"loadkeys": {"/usr/bin/loadkeys", "/bin/loadkeys"},
+		"setfont":  {"/usr/bin/setfont", "/bin/setfont"},
+		// Filesystem check support (optional)
+		"fsck":      {"/usr/bin/fsck", "/sbin/fsck"},
+		"fsck.ext4": {"/usr/bin/fsck.ext4", "/sbin/fsck.ext4", "/usr/bin/e2fsck", "/sbin/e2fsck"},
+	}
+
+	// Critical binaries that MUST be present for a working initramfs
+	criticalBinaries := map[string]bool{
+		"lvm":           true,
+		"dmsetup":       true,
+		"systemd-udevd": true,
+		"udevadm":       true,
 	}
 
 	var requiredBinaries []string
+	missingCritical := 0
 	for name, paths := range binarySearchPaths {
 		found := false
 		for _, p := range paths {
@@ -353,8 +367,16 @@ func runGenerate(cfg *config.Config) error {
 			}
 		}
 		if !found {
-			fmt.Printf("  warning: %s not found in any standard path\n", name)
+			if criticalBinaries[name] {
+				fmt.Printf("  error: required binary '%s' not found in any standard path\n", name)
+				missingCritical++
+			} else {
+				fmt.Printf("  warning: optional binary '%s' not found\n", name)
+			}
 		}
+	}
+	if missingCritical > 0 {
+		return fmt.Errorf("%d required binary(ies) not found — install lvm2, systemd, and device-mapper packages", missingCritical)
 	}
 
 	var allLibs []libs.LibraryFile
@@ -418,7 +440,7 @@ func runGenerate(cfg *config.Config) error {
 		"/usr/lib/ld-linux-aarch64.so.1",
 		"/usr/lib64/ld-linux-aarch64.so.1",
 	}
-		for _, ldPath := range ldPaths {
+	for _, ldPath := range ldPaths {
 		if _, err := os.Stat(ldPath); err == nil {
 			// Resolve symlink to get the actual file
 			realPath, err := filepath.EvalSymlinks(ldPath)
@@ -715,8 +737,12 @@ LABEL="dm_persist_end"
 	}
 
 	// Get file size
-	info, _ := os.Stat(cfg.Output)
-	fmt.Printf("vanguard: generated %s (%d bytes)\n", cfg.Output, info.Size())
+	info, err := os.Stat(cfg.Output)
+	if err != nil {
+		fmt.Printf("vanguard: generated %s (size unknown: %v)\n", cfg.Output, err)
+	} else {
+		fmt.Printf("vanguard: generated %s (%d bytes)\n", cfg.Output, info.Size())
+	}
 
 	if warnCount > 0 {
 		fmt.Printf("vanguard: %d warning(s) during generation — review output above\n", warnCount)

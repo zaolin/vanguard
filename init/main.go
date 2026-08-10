@@ -10,9 +10,9 @@ import (
 	"github.com/zaolin/vanguard/init/bootlog"
 	"github.com/zaolin/vanguard/init/buildtags"
 	"github.com/zaolin/vanguard/init/console"
-initluks "github.com/zaolin/vanguard/init/luks"
 	"github.com/zaolin/vanguard/init/fsck"
 	"github.com/zaolin/vanguard/init/gpt"
+	initluks "github.com/zaolin/vanguard/init/luks"
 	"github.com/zaolin/vanguard/init/lvm"
 	"github.com/zaolin/vanguard/init/modules"
 	"github.com/zaolin/vanguard/init/mount"
@@ -21,6 +21,7 @@ initluks "github.com/zaolin/vanguard/init/luks"
 	"github.com/zaolin/vanguard/init/tui"
 	"github.com/zaolin/vanguard/init/udev"
 	"github.com/zaolin/vanguard/init/vconsole"
+	intpm "github.com/zaolin/vanguard/internal/tpm"
 )
 
 // earlyBootMounted tracks whether /boot was mounted during early init.
@@ -44,12 +45,6 @@ func main() {
 	// Pass debug function to packages
 	initluks.Debug = buildtags.Debug
 	initluks.StrictMode = buildtags.StrictMode
-	vconsole.Debug = buildtags.Debug
-	resume.Debug = buildtags.Debug
-	fsck.Debug = buildtags.Debug
-	gpt.Debug = buildtags.Debug
-
-	// Pass boot logging function to luks package
 	initluks.LogFunc = func(event string, kvPairs ...string) {
 		bootlog.Log(bootlog.Event(event), kvPairs...)
 	}
@@ -146,6 +141,48 @@ func main() {
 		}
 		tui.StageDone(tui.StagePCRLock)
 		// NOTE: Do NOT unmount /boot here - keep mounted for logging
+	}
+
+	// 10a. Security check: if pcrlock is in use, verify PCR 7 (Secure Boot
+	// state) is non-zero. An all-zeros PCR 7 means Secure Boot is off or
+	// not measured by firmware, which means the initramfs could have been
+	// replaced by an attacker with physical access. Refuse to unseal in
+	// this case to prevent PIN capture by a rogue initramfs.
+	// This is a software backstop — the real protection is Secure Boot + UKI.
+	pcrlockActive := false
+	if _, err := os.Stat("/var/lib/systemd/pcrlock.json"); err == nil {
+		pcrlockActive = true
+	}
+	if _, err := os.Stat("/run/systemd/pcrlock.json"); err == nil {
+		pcrlockActive = true
+	}
+	if pcrlockActive {
+		tpmClient := intpm.New()
+		if tpmClient.WaitForDevice(2 * time.Second) {
+			pcr7, err := tpmClient.ReadPCR(intpm.AlgSHA256, 7)
+			if err != nil {
+				// PCR 7 read failed — possible TPM interference. Refuse to
+				// proceed: an attacker who can block PCR reads could bypass
+				// the all-zeros check and reach the pcrlock unseal path.
+				console.Print("vanguard: SECURITY: failed to read PCR 7: %v\n", err)
+				console.Print("vanguard: SECURITY: refusing to unseal — PCR 7 verification unavailable\n")
+				bootlog.Log(bootlog.EventDebug, "msg", fmt.Sprintf("PCR 7 read failed, refusing pcrlock unseal: %v", err))
+				cleanupAndHalt()
+			}
+			allZeros := true
+			for _, b := range pcr7 {
+				if b != 0 {
+					allZeros = false
+					break
+				}
+			}
+			if allZeros {
+				console.Print("vanguard: SECURITY: PCR 7 is all-zeros — Secure Boot not measured\n")
+				console.Print("vanguard: SECURITY: refusing to unseal pcrlock token without Secure Boot\n")
+				bootlog.Log(bootlog.EventDebug, "msg", "PCR 7 all-zeros, refusing pcrlock unseal")
+				cleanupAndHalt()
+			}
+		}
 	}
 
 	// 11. Unlock encrypted devices (required - halt if none found)
@@ -288,7 +325,7 @@ func main() {
 	if earlyBootMounted {
 		buildtags.Debug("vanguard: unmounting early /boot\n")
 		if err := mount.UnmountBootEarly(); err != nil {
-			buildtags.Debug("vanguard: early unmount /boot: %v\n", err)
+			console.Print("vanguard: warning: failed to unmount /boot: %v (continuing)\n", err)
 		}
 	}
 
@@ -316,6 +353,27 @@ func main() {
 			buildtags.Debug("vanguard: %s: %v\n", initPath, err)
 		}
 		// If we get here, exec failed - try next
+	}
+
+	// Last resort: drop to a rescue shell if one is available on the root fs.
+	// This allows manual recovery (mount, fsck, cryptsetup) instead of a
+	// silent halt. Controlled by kernel cmdline 'vanguard.rescue=1' or
+	// automatic when /bin/sh exists on the root filesystem.
+	rescueShell := "/bin/sh"
+	if _, err := os.Stat("/sysroot" + rescueShell); err == nil {
+		console.Print("vanguard: no init found — dropping to rescue shell (%s)\n", rescueShell)
+		console.Print("vanguard: type 'exit' to halt\n")
+		bootlog.Close()
+		if earlyBootMounted {
+			mount.UnmountBootEarly()
+		}
+		if tui.IsEnabled() {
+			tui.Quit()
+			tui.ForceReset()
+		}
+		if err := switchroot.SwitchRoot("/sysroot", rescueShell); err != nil {
+			console.Print("vanguard: rescue shell failed: %v\n", err)
+		}
 	}
 
 	console.Print("vanguard: no init found on root filesystem\n")

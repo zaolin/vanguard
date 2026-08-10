@@ -2,14 +2,13 @@ package luks
 
 import (
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 
-	lk "github.com/zaolin/vanguard/internal/luks"
 	"github.com/zaolin/vanguard/init/buildtags"
+	lk "github.com/zaolin/vanguard/internal/luks"
 	intpm "github.com/zaolin/vanguard/internal/tpm"
 )
 
@@ -37,6 +36,10 @@ type TPM2Token struct {
 	SRKHandle uint32
 	// SRKData is the serialized SRK public data (tpm2_srk from systemd v255+).
 	SRKData []byte
+	// PCRLockNVPublic is the raw TPM2B_NV_PUBLIC blob from the token
+	// (tpm2_pcrlock_nv field). Used to verify the NV index name at boot,
+	// catching NV index redefinition/spoofing attacks.
+	PCRLockNVPublic []byte
 	// Keyslots are the LUKS keyslots this token unlocks.
 	Keyslots []int
 }
@@ -136,10 +139,23 @@ func ParseTPM2Token(token lk.Token) (*TPM2Token, error) {
 	pcrlockNV := payload.PCRLockNV
 	if pcrlockNV == 0 && payload.PCRLockNVDataAlt != "" {
 		// Decode base64 NV index data for v255+ format
-		// The NV index is typically the first 4 bytes in big-endian
+		// The NV index is embedded in the TPM2B_NV_PUBLIC blob at offset 2
+		// (after the 2-byte TPM2B size prefix), not offset 0.
 		nvData, err := base64.StdEncoding.DecodeString(payload.PCRLockNVDataAlt)
-		if err == nil && len(nvData) >= 4 {
-			pcrlockNV = binary.BigEndian.Uint32(nvData[:4])
+		if err == nil && len(nvData) >= 6 {
+			// Try offset 2 first (spec-compliant TPM2B_NV_PUBLIC)
+			nvIdx := uint32(nvData[2])<<24 | uint32(nvData[3])<<16 |
+				uint32(nvData[4])<<8 | uint32(nvData[5])
+			if isPcrlockNVRange(nvIdx) {
+				pcrlockNV = nvIdx
+			} else if len(nvData) >= 4 {
+				// Fallback: offset 0 (no TPM2B wrapping, older format)
+				nvIdx = uint32(nvData[0])<<24 | uint32(nvData[1])<<16 |
+					uint32(nvData[2])<<8 | uint32(nvData[3])
+				if isPcrlockNVRange(nvIdx) {
+					pcrlockNV = nvIdx
+				}
+			}
 		}
 	}
 	if usePCRLock {
@@ -160,27 +176,40 @@ func ParseTPM2Token(token lk.Token) (*TPM2Token, error) {
 		buildtags.Debug("  srk data decoded: %d bytes\n", len(srkData))
 	}
 
+	// Decode the raw TPM2B_NV_PUBLIC blob for NV index name verification.
+	// This is the full NV public area from the token, used to detect NV
+	// index redefinition/spoofing at boot time.
+	var pcrlockNVPublic []byte
+	if payload.PCRLockNVDataAlt != "" {
+		pcrlockNVPublic, err = base64.StdEncoding.DecodeString(payload.PCRLockNVDataAlt)
+		if err != nil {
+			buildtags.Debug("tpm2 token: failed to decode NV public data: %v\n", err)
+		} else {
+			buildtags.Debug("tpm2 token: NV public data decoded: %d bytes\n", len(pcrlockNVPublic))
+		}
+	}
+
 	return &TPM2Token{
-		Blob:       blob,
-		PCRs:       payload.PCRs,
-		PCRBank:    pcrBank,
-		PolicyHash: policyHash,
-		NeedsPIN:   payload.PIN,
-		Salt:       salt,
-		PrimaryAlg: primaryAlg,
-		UsePCRLock: usePCRLock,
-		PCRLockNV:  pcrlockNV,
-		SRKHandle:  srkHandle,
-		SRKData:    srkData,
-		Keyslots:   token.Slots,
+		Blob:            blob,
+		PCRs:            payload.PCRs,
+		PCRBank:         pcrBank,
+		PolicyHash:      policyHash,
+		NeedsPIN:        payload.PIN,
+		Salt:            salt,
+		PrimaryAlg:      primaryAlg,
+		UsePCRLock:      usePCRLock,
+		PCRLockNV:       pcrlockNV,
+		SRKHandle:       srkHandle,
+		SRKData:         srkData,
+		PCRLockNVPublic: pcrlockNVPublic,
+		Keyslots:        token.Slots,
 	}, nil
 }
 
 // Unseal uses the TPM to unseal the LUKS password.
 // If PIN is required, it should be provided as a hashed value.
-// skipPolicyHashVerify should be true for PIN-only tokens (no PCRs).
 // pcrlockPolicy contains PCR predictions from pcrlock.json (nil if not available).
-func (t *TPM2Token) Unseal(tpmClient *intpm.Client, pin []byte, skipPolicyHashVerify bool, pcrlockPolicy *intpm.PCRLockPolicy) ([]byte, error) {
+func (t *TPM2Token) Unseal(tpmClient *intpm.Client, pin []byte, pcrlockPolicy *intpm.PCRLockPolicy) ([]byte, error) {
 	// Parse the blob to extract private and public key material
 	private, public, err := intpm.ParseBlob(t.Blob)
 	if err != nil {
@@ -203,19 +232,19 @@ func (t *TPM2Token) Unseal(tpmClient *intpm.Client, pin []byte, skipPolicyHashVe
 
 	// Build unseal options
 	opts := intpm.UnsealOpts{
-		Public:               public,
-		Private:              private,
-		PCRs:                 t.PCRs,
-		Bank:                 bank,
-		PolicyHash:           t.PolicyHash,
-		AuthValue:            authValue,
-		Salt:                 t.Salt,
-		PrimaryAlg:           t.PrimaryAlg,
-		UsePCRLock:           t.UsePCRLock,
-		PCRLockNV:            t.PCRLockNV,
-		SRKHandle:            t.SRKHandle,
-		SRKData:              t.SRKData,
-		SkipPolicyHashVerify: skipPolicyHashVerify,
+		Public:          public,
+		Private:         private,
+		PCRs:            t.PCRs,
+		Bank:            bank,
+		PolicyHash:      t.PolicyHash,
+		AuthValue:       authValue,
+		Salt:            t.Salt,
+		PrimaryAlg:      t.PrimaryAlg,
+		UsePCRLock:      t.UsePCRLock,
+		PCRLockNV:       t.PCRLockNV,
+		SRKHandle:       t.SRKHandle,
+		SRKData:         t.SRKData,
+		PCRLockNVPublic: t.PCRLockNVPublic,
 	}
 
 	if pcrlockPolicy != nil {
@@ -240,4 +269,12 @@ func (t *TPM2Token) Unseal(tpmClient *intpm.Client, pin []byte, skipPolicyHashVe
 	encoded := base64.StdEncoding.EncodeToString(result)
 	buildtags.Debug("tpm token: unsealed %d bytes, base64-encoded to %d chars for LUKS2\n", len(result), len(encoded))
 	return []byte(encoded), nil
+}
+
+// isPcrlockNVRange checks whether a uint32 is in the pcrlock owner NV index range
+// (0x01800000–0x01BFFFFF) or the default pcrlock range (0x01C20000).
+// This prevents token fields from pointing at vanguard's own recovery NV index
+// (0x01C30001) or other non-pcrlock indexes.
+func isPcrlockNVRange(idx uint32) bool {
+	return (idx >= 0x01800000 && idx <= 0x01BFFFFF) || idx == 0x01C20000
 }

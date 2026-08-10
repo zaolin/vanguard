@@ -13,6 +13,7 @@ require (
 	github.com/google/go-tpm v0.9.8
 	github.com/jzelinskie/whirlpool v0.0.0-20201016144138-0675e54bb004
 	github.com/klauspost/compress v1.18.2
+	github.com/skip2/go-qrcode v0.0.0-20200617195104-da1b6568686e
 	github.com/stretchr/testify v1.11.1
 	github.com/ulikunitz/xz v0.5.12
 	golang.org/x/crypto v0.36.0

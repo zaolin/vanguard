@@ -21,7 +21,6 @@ vanguard generate [options]
 | `--modules` | `-m` | string | | Comma-separated list of kernel modules to include |
 | `--compression` | `-c` | string | `zstd` | Compression algorithm: `zstd`, `gzip`, or `none` |
 | `--debug` | `-d` | bool | `false` | Enable verbose debug output in init |
-| `--strict` | `-s` | bool | `false` | Strict mode: enforce token-only unlock (no passphrase fallback) |
 | `--config` | | string | | Path to TOML configuration file |
 
 #### Examples
@@ -40,9 +39,6 @@ vanguard generate -o /boot/initramfs-linux.img \
 
 # Debug mode
 vanguard generate -o /boot/initramfs-linux.img -d
-
-# Strict mode (no passphrase fallback with TPM2 token)
-vanguard generate -o /boot/initramfs-linux.img -s
 
 # Using config file
 vanguard generate --config /etc/vanguard.toml
@@ -139,27 +135,101 @@ vanguard status [options]
 | Option | Short | Type | Default | Description |
 |--------|-------|------|---------|-------------|
 | `--json` | | bool | `false` | Machine-readable JSON output |
-| `-v, --verbose` | | bool | `false` | Show full PCR hash values |
 
 #### What It Shows
 
-- **Protection tier** — HIGH / MEDIUM / LOW / WARNING with visual bar
-- **LUKS encryption** — Device, UUID, slots, token type + flags (PIN, pcrlock, SRK)
-- **TPM 2.0** — Device presence, dictionary attack lockout state
-- **Boot integrity** — Per-PCR status with enforced/unbound classification, NV index sync, Secure Boot detection (PCR 7)
+A threat-model-first view organized by attack vectors:
+
+- **Protection tier** — PHYSICAL / HIGH / WARNING / CRITICAL / LOW with visual bar
+- **Threat vectors** — 10 attack vectors with per-mitigation status:
+  - Evil Maid (initrd/UKI replacement) — Secure Boot, PCRLock PCR 7, sbctl, Platform Fused, PSB
+  - Boot Chain Tampering — PCRLock PCR binding, NV index, PCR0 reconstruction
+  - TPM Key Extraction — TPM 2.0, fTPM detection, bus encryption, DA lockout
+  - DMA Attack — IOMMU, pre-boot DMA protection, Thunderbolt
+  - Kernel Runtime Attack — lockdown, module sigs, CET, SMAP, kernel tainted
+  - Cold Boot Attack — memory encryption (informational, doesn't affect tier)
+  - Brute-Force / Key Theft — TPM2 token, PIN, PCRLock binding, TOTP fallback
+  - Physical Debug Attack — debug interface locked, fused part (via fwupd/HSTI)
+  - Firmware Tampering — SPI write/replay protection, anti-rollback (via fwupd/HSTI)
+  - SMM Attack — SMM locked (via fwupd)
+- **Platform integration** — fwupd HSI attributes, sbctl signature verification, AMD HSTI sysfs
 
 #### Examples
 
 ```bash
-# Show protection status
+# Show protection status (expanded view with all mitigations)
 vanguard status
 
 # Machine-readable output
 vanguard status --json
-
-# Verbose PCR details
-vanguard status -v
 ```
+
+### recovery
+
+Manage TOTP-based boot recovery. Without flags, prints recovery instructions.
+
+```bash
+vanguard recovery [options]
+```
+
+#### Options
+
+| Option | Description |
+|--------|-------------|
+| `--enable` | Generate TOTP seed, write to TPM NVRAM, display QR code for authenticator app enrollment |
+| `--show` | Show current TOTP seed and QR code (for re-enrollment). Also displays pending re-provisioned seed if `--auto-reseed` ran after firmware update |
+| `--disable` | Remove TOTP recovery seed from TPM NVRAM |
+| `--clean` | Forcefully remove old/legacy recovery NV indexes (for migration from older vanguard versions) |
+| `--auto-reseed` | Automatically re-provision recovery seed if unreadable (PCR 7 changed after firmware update). Non-interactive — for systemd service use |
+| `-l, --luks-device` | LUKS device path (used in recovery instructions) |
+| `--nv-index` | TPM NV index for recovery data (default: 0x01C30001) |
+
+#### Examples
+
+```bash
+# Enable TOTP recovery (interactive — displays QR code, prompts for verification)
+sudo vanguard recovery --enable
+
+# Show current seed and QR code
+sudo vanguard recovery --show
+
+# Disable recovery
+sudo vanguard recovery --disable
+
+# Re-provision after firmware update (non-interactive — for systemd services)
+sudo vanguard recovery --auto-reseed
+
+# Clean legacy NV indexes (migration from older vanguard)
+sudo vanguard recovery --clean
+```
+
+### enroll
+
+Enroll TPM2 token on a LUKS device (runs `vanguard update` + `systemd-cryptenroll`):
+
+```bash
+vanguard enroll -u <uki> -l <luks-device> [options]
+```
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--uki-path` | `-u` | Path to the UKI file (required) |
+| `--luks-device` | `-l` | LUKS device path (required) |
+| `--with-pin` | | Enable PIN protection for the TPM2 token |
+| `--verbose` | `-v` | Show verbose output |
+
+### inspect
+
+Inspect contents of a generated initramfs:
+
+```bash
+vanguard inspect -p <path> [options]
+```
+
+| Option | Short | Description |
+|--------|-------|-------------|
+| `--path` | `-p` | Path to the initramfs image (required) |
+| `--verbose` | `-v` | Show file sizes |
 
 ## Configuration File
 
@@ -176,9 +246,6 @@ compression = "zstd"
 
 # Enable debug output in init binary
 debug = false
-
-# Strict mode: enforce token-only unlock (no passphrase fallback)
-strict_mode = false
 
 # Firmware files to include (relative to /lib/firmware/)
 firmware = [
@@ -218,11 +285,6 @@ modules = [
 - **Type:** bool
 - **Default:** `false`
 - **Description:** When enabled, the init binary outputs verbose messages during boot. Useful for debugging boot issues. Equivalent to `-d` flag.
-
-#### strict_mode
-- **Type:** bool
-- **Default:** `false`
-- **Description:** When enabled with a TPM2 token present, disables passphrase fallback. Boot halts if TPM2 unlock fails. Equivalent to `-s` flag.
 
 #### firmware
 - **Type:** array of strings

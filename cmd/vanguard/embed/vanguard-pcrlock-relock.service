@@ -1,0 +1,16 @@
+[Unit]
+Description=Re-lock Vanguard TPM policy and re-provision recovery after firmware update
+Documentation=file:///usr/share/doc/vanguard/tpm2-setup.md
+After=systemd-pcrlock-secureboot-policy.service systemd-pcrlock-secureboot-authority.service
+Before=systemd-pcrlock-make-policy.service
+ConditionPathExists=/etc/vanguard/vanguard.env
+
+[Service]
+Type=oneshot
+EnvironmentFile=/etc/vanguard/vanguard.env
+ExecStart=/usr/bin/vanguard update -u ${UKI_PATH} -l ${LUKS_DEVICE} --no-verify
+ExecStartPost=/usr/bin/vanguard recovery --auto-reseed
+RemainAfterExit=no
+
+[Install]
+WantedBy=sysinit.target

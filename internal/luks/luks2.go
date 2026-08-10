@@ -102,7 +102,13 @@ func initV2Device(path string, f *os.File) (*deviceV2, error) {
 
 	var meta metadata
 	jsonData := data[4096:]
-	jsonData = jsonData[:bytes.IndexByte(jsonData, 0)]
+	// Find the NUL terminator that marks the end of the JSON region.
+	// If no NUL is found, the header is malformed — reject rather than panic.
+	nulIdx := bytes.IndexByte(jsonData, 0)
+	if nulIdx < 0 {
+		return nil, fmt.Errorf("LUKS2 JSON region has no NUL terminator — malformed header")
+	}
+	jsonData = jsonData[:nulIdx]
 
 	if err := json.Unmarshal(jsonData, &meta); err != nil {
 		return nil, err
@@ -214,6 +220,9 @@ func (d *deviceV2) UnlockAny(passphrase []byte, dmName string) error {
 			return err
 		}
 
+		// Wipe the master key after setting up the dm-crypt mapper.
+		// The kernel has its own copy; we don't need ours anymore.
+		defer clearSlice(volume.key)
 		return volume.SetupMapper(dmName)
 	}
 	return ErrPassphraseDoesNotMatch
@@ -238,16 +247,14 @@ func (d *deviceV2) UnsealVolume(keyslotIdx int, passphrase []byte) (*Volume, err
 	}
 	defer clearSlice(afKey)
 
-	kdfDebug("keyslot=%d af_key_len=%d af_key_first=0x%02x af_key_last=0x%02x\n",
-		keyslotIdx, len(afKey), afKey[0], afKey[len(afKey)-1])
+	kdfDebug("keyslot=%d af_key_len=%d\n", keyslotIdx, len(afKey))
 
 	finalKey, err := d.decryptLuks2VolumeKey(keyslotIdx, keyslot, afKey)
 	if err != nil {
 		return nil, err
 	}
 
-	kdfDebug("keyslot=%d vol_key_len=%d vol_key_first=0x%02x vol_key_last=0x%02x\n",
-		keyslotIdx, len(finalKey), finalKey[0], finalKey[len(finalKey)-1])
+	kdfDebug("keyslot=%d vol_key_len=%d\n", keyslotIdx, len(finalKey))
 
 	// verify with digest
 	digest := d.findDigestForKeyslot(keyslotIdx)
@@ -264,6 +271,11 @@ func (d *deviceV2) UnsealVolume(keyslotIdx int, passphrase []byte) (*Volume, err
 	expectedDigest, err := base64.StdEncoding.DecodeString(digest.Digest)
 	if err != nil {
 		return nil, fmt.Errorf("keyslotIdx[%v].digest.Digest base64 parsing failed: %v", keyslotIdx, err)
+	}
+	// Bounds check: expectedDigest must not exceed the generated digest length
+	// to prevent a slice-out-of-bounds panic from a crafted header.
+	if len(expectedDigest) > len(generatedDigest) {
+		return nil, fmt.Errorf("keyslotIdx[%v].digest.Digest length %d exceeds hash output %d", keyslotIdx, len(expectedDigest), len(generatedDigest))
 	}
 	if !bytes.Equal(generatedDigest[0:len(expectedDigest)], expectedDigest) {
 		return nil, ErrPassphraseDoesNotMatch
@@ -300,8 +312,8 @@ func (d *deviceV2) UnsealVolume(keyslotIdx int, passphrase []byte) (*Volume, err
 		if err != nil {
 			return nil, err
 		}
-		if size == 0 {
-			return nil, fmt.Errorf("invalid segment size: %v", size)
+		if size <= 0 {
+			return nil, fmt.Errorf("invalid segment size: %v (must be positive)", size)
 		}
 
 		storageSize = uint64(size)
@@ -348,7 +360,12 @@ func computeDigestForKey(dig *digest, keyslotIdx int, finalKey []byte) ([]byte, 
 func (d *deviceV2) decryptLuks2VolumeKey(keyslotIdx int, keyslot keyslot, afKey []byte) ([]byte, error) {
 	area := keyslot.Area
 
-	keyslotSize := keyslot.KeySize * stripesNum
+	// Validate keyslot size to prevent integer overflow / OOM from a crafted header
+	const maxKeyslotSize = 64 * 1024 * 1024 // 64MB max keyslot area
+	keyslotSize := uint64(keyslot.KeySize) * uint64(stripesNum)
+	if keyslotSize > maxKeyslotSize {
+		return nil, fmt.Errorf("keyslot[%v] size %d exceeds maximum %d — possible crafted header", keyslotIdx, keyslotSize, maxKeyslotSize)
+	}
 
 	areaSize, err := area.Size.Int64()
 	if err != nil {
@@ -357,7 +374,7 @@ func (d *deviceV2) decryptLuks2VolumeKey(keyslotIdx int, keyslot keyslot, afKey 
 	if int64(keyslotSize) > areaSize {
 		return nil, fmt.Errorf("keyslot[%v] area size too small, given %v expected at least %v", keyslotIdx, areaSize, keyslotSize)
 	}
-	if keyslotSize%storageSectorSize != 0 {
+	if keyslotSize%uint64(storageSectorSize) != 0 {
 		return nil, fmt.Errorf("keyslot[%v] size %v is not multiple of the sector size %v", keyslotIdx, keyslotSize, storageSectorSize)
 	}
 
@@ -486,8 +503,22 @@ func deriveLuks2AfKey(kdf kdf, keyslotIdx int, passphrase []byte, keyLength uint
 
 	var afKey []byte
 
+	// Bound KDF parameters to prevent CPU/OOM DoS from a crafted header.
+	// Real-world values from cryptsetup are well below these limits.
+	// Note: kdf.Memory is in KB (kibibytes), not MB.
+	const (
+		maxKdfIterations = 10_000_000 // 10M iterations (cryptsetup default is ~1000-10000)
+		maxKdfMemoryKB   = 1_048_576  // 1GB in KB (cryptsetup default is ~65536 KB = 64MB)
+		maxKdfTime       = 60         // 60 seconds (cryptsetup default is 1-4)
+		maxKdfCpus       = 16         // 16 parallel threads
+	)
+
+	// Validate KDF parameters before use
 	switch kdf.Type {
 	case "pbkdf2":
+		if kdf.Iterations > maxKdfIterations {
+			return nil, fmt.Errorf("keyslotIdx[%v].kdf.iterations %d exceeds maximum %d", keyslotIdx, kdf.Iterations, maxKdfIterations)
+		}
 		var h func() hash.Hash
 		switch kdf.Hash {
 		case "sha256":
@@ -498,10 +529,24 @@ func deriveLuks2AfKey(kdf kdf, keyslotIdx int, passphrase []byte, keyLength uint
 			return nil, fmt.Errorf("Unknown keyslotIdx[%v].kdf.hash algorithm: %v", keyslotIdx, kdf.Hash)
 		}
 		afKey = pbkdf2.Key(passphrase, salt, int(kdf.Iterations), int(keyLength), h)
-	case "argon2i":
-		afKey = argon2.Key(passphrase, salt, uint32(kdf.Time), uint32(kdf.Memory), uint8(kdf.Cpus), uint32(keyLength))
-	case "argon2id":
-		afKey = argon2.IDKey(passphrase, salt, uint32(kdf.Time), uint32(kdf.Memory), uint8(kdf.Cpus), uint32(keyLength))
+	case "argon2i", "argon2id":
+		if kdf.Time > maxKdfTime {
+			return nil, fmt.Errorf("keyslotIdx[%v].kdf.time %d exceeds maximum %d", keyslotIdx, kdf.Time, maxKdfTime)
+		}
+		if kdf.Memory > maxKdfMemoryKB {
+			return nil, fmt.Errorf("keyslotIdx[%v].kdf.memory %d KB exceeds maximum %d KB", keyslotIdx, kdf.Memory, maxKdfMemoryKB)
+		}
+		if kdf.Cpus > maxKdfCpus {
+			return nil, fmt.Errorf("keyslotIdx[%v].kdf.cpus %d exceeds maximum %d", keyslotIdx, kdf.Cpus, maxKdfCpus)
+		}
+		if kdf.Cpus == 0 {
+			return nil, fmt.Errorf("keyslotIdx[%v].kdf.cpus must be > 0", keyslotIdx)
+		}
+		if kdf.Type == "argon2i" {
+			afKey = argon2.Key(passphrase, salt, uint32(kdf.Time), uint32(kdf.Memory), uint8(kdf.Cpus), uint32(keyLength))
+		} else {
+			afKey = argon2.IDKey(passphrase, salt, uint32(kdf.Time), uint32(kdf.Memory), uint8(kdf.Cpus), uint32(keyLength))
+		}
 	default:
 		return nil, fmt.Errorf("Unknown kdf type: %v", kdf.Type)
 	}

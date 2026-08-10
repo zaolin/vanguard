@@ -353,13 +353,11 @@ Debug output shows all boot steps with detailed TPM2, LUKS, and LVM status messa
 
 ## Build Variants
 
-Vanguard produces 4 init binaries via Go build tags from the same source:
+Vanguard produces 2 init binaries via Go build tags from the same source:
 
 | Build Tags | Binary | Output | Passphrase Fallback |
 |------------|--------|--------|:---:|
-| (none) | `init` | Minimal | ✓ |
-| `debug` | `init-debug` | Verbose | ✓ |
-| `strict` | `init-strict` | Minimal | ✗ |
-| `debug,strict` | `init-debug-strict` | Verbose | ✗ |
+| (none) | `init` | Minimal | TOTP only |
+| `debug` | `init-debug` | Verbose | TOTP only |
 
-The generator selects the appropriate embedded binary based on the `-d` and `-s` flags.
+Strict mode is always-on. Passphrase fallback requires TOTP recovery (no `-s` flag needed).

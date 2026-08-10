@@ -5,6 +5,8 @@ import (
 	"os"
 	"sync"
 	"time"
+
+	"golang.org/x/sys/unix"
 )
 
 const (
@@ -32,56 +34,53 @@ const (
 )
 
 var (
-	logFile     *os.File
-	logMu       sync.Mutex
+	mu          sync.Mutex
+	buffer      []string
 	initialized bool
 )
 
+// remountRW and remountRO are function variables so they can be overridden
+// in tests. By default they use unix.Mount to remount /boot.
+var (
+	remountRW = func() error { return unix.Mount("", "/boot", "", unix.MS_REMOUNT, "") }
+	remountRO = func() error { return unix.Mount("", "/boot", "", unix.MS_REMOUNT|unix.MS_RDONLY, "") }
+)
+
 // Init initializes the boot log for a new session.
-// It opens the log file in append mode and writes the session header.
-// Returns error if initialization fails (caller should ignore and continue boot).
+// Lines are buffered in memory — no file operations or remounts happen
+// until Close() is called. This keeps /boot read-only for the entire
+// boot sequence, eliminating the TOCTOU window from repeated remounts.
 func Init() error {
-	logMu.Lock()
-	defer logMu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
 
 	if initialized {
 		return nil
 	}
 
-	// Open log file (create if not exists, append mode, sync writes)
-	var err error
-	logFile, err = os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND|os.O_SYNC, 0644)
-	if err != nil {
-		return fmt.Errorf("open log: %w", err)
-	}
-
 	// Record session start time
 	sessionTime := time.Now().UTC()
 
-	// Write session header
-	header := fmt.Sprintf("\n%s\nCRYPTINT BOOT LOG - %s\n%s\n\n",
+	// Write session header to the in-memory buffer
+	header := fmt.Sprintf("\n%s\nVANGUARD BOOT LOG - %s\n%s\n\n",
 		sessionSep,
 		sessionTime.Format(time.RFC3339),
 		sessionSep)
 
-	if _, err := logFile.WriteString(header); err != nil {
-		logFile.Close()
-		logFile = nil
-		return fmt.Errorf("write header: %w", err)
-	}
-
+	buffer = append(buffer, header)
 	initialized = true
 	return nil
 }
 
-// Log writes an event with optional key-value data.
+// Log appends an event with optional key-value data to the in-memory buffer.
+// No file I/O or remounts happen — the buffer is flushed to /boot only
+// when Close() is called.
 // Example: Log(EventLUKSUnlock, "device", "/dev/sda2", "method", "tpm2")
-// Returns error if write fails (caller should ignore and continue boot).
 func Log(event Event, kvPairs ...string) error {
-	logMu.Lock()
-	defer logMu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
 
-	if logFile == nil {
+	if !initialized {
 		return fmt.Errorf("log not initialized")
 	}
 
@@ -103,29 +102,58 @@ func Log(event Event, kvPairs ...string) error {
 	}
 	line += "\n"
 
-	// Write to file (O_SYNC ensures durability)
-	if _, err := logFile.WriteString(line); err != nil {
-		return fmt.Errorf("write log: %w", err)
-	}
-
+	buffer = append(buffer, line)
 	return nil
 }
 
-// Close flushes and closes the log file.
-// Must be called before switchroot.
+// Close flushes all buffered log lines to /boot/.vanguard.log.
+// This is the ONLY point where /boot is remounted read-write:
+//  1. Remount /boot RW
+//  2. Open log file (create/append)
+//  3. Write all buffered lines at once
+//  4. Sync and close
+//  5. Remount /boot RO
+//
+// Must be called before switchroot. If /boot is not mounted or the
+// remount fails, the buffered log is silently discarded (the boot
+// has already succeeded by this point).
 func Close() error {
-	logMu.Lock()
-	defer logMu.Unlock()
+	mu.Lock()
+	defer mu.Unlock()
 
-	if logFile == nil {
+	if !initialized {
 		return nil
 	}
 
-	// Sync and close
-	logFile.Sync()
-	logFile.Close()
-	logFile = nil
-	initialized = false
+	// Clear state regardless of whether the write succeeds
+	defer func() {
+		buffer = nil
+		initialized = false
+	}()
 
+	// Remount /boot read-write for the single write
+	if err := remountRW(); err != nil {
+		// /boot might not be mounted, or remount failed — silently discard
+		return nil
+	}
+
+	// Ensure we remount RO when done
+	defer func() { _ = remountRO() }()
+
+	// Open log file (create if not exists, append mode, sync writes)
+	f, err := os.OpenFile(logPath, os.O_WRONLY|os.O_CREATE|os.O_APPEND|os.O_SYNC, 0644)
+	if err != nil {
+		return nil // silently discard — boot has succeeded
+	}
+	defer f.Close()
+
+	// Write all buffered lines at once
+	for _, line := range buffer {
+		if _, err := f.WriteString(line); err != nil {
+			break // best-effort — stop on first error
+		}
+	}
+
+	f.Sync()
 	return nil
 }

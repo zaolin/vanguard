@@ -11,7 +11,9 @@ A minimal, security-focused initramfs generator for Linux systems with full disk
 - **Full Disk Encryption** — LUKS2 with TPM2 automatic unlock via systemd-cryptenroll
 - **Native Go TPM2** — Zero external dependencies; uses `google/go-tpm` for sealed key unseal with traditional PCR policy and PolicyAuthorizeNV (pcrlock)
 - **Native Go LUKS** — LUKS v1/v2 header parsing, Argon2/PBKDF2 key derivation, and dm-crypt mapper setup via ioctl — no libcryptsetup required at runtime
-- **TPM2 Integration** — Automatic token detection, PIN support, PCRLock policy binding with multi-branch PCR prediction (PolicyOR)
+- **TPM2 Integration** — Automatic token detection, PIN support, PCRLock policy binding with multi-branch PCR prediction (PolicyOR) for the LUKS token. TOTP recovery seed sealed to PCR 7 (Secure Boot state) with single-branch PolicyPCR — automatically re-provisioned after firmware updates via `--auto-reseed`
+- **TOTP Recovery** — Time-based one-time password recovery for strict mode; scan a QR code with your authenticator app to enable passphrase fallback when TPM unseal fails
+- **Strict Mode** — Always-on; disables passphrase fallback when TPM2 token is present. TOTP recovery provides secure fallback without weakening the threat model
 - **LVM Support** — Full LVM2 volume group and logical volume activation with persistent symlinks across switch_root
 - **Non-Root Filesystem Mounting** — Mounts `/home` and other non-root filesystems from fstab before switch_root, bypassing udev database corruption issues
 - **Boot TUI** — Bubble Tea-based terminal UI with spinner, stage progress, and password/PIN prompts during boot
@@ -40,14 +42,11 @@ make
 # Check system protection status
 sudo ./vanguard status
 
-# Generate initramfs
+# Generate initramfs (strict mode is always-on — TOTP recovery required for passphrase fallback)
 sudo ./vanguard generate -o /boot/initramfs-linux.img
 
 # With debug output enabled
 sudo ./vanguard generate -o /boot/initramfs-linux.img --debug
-
-# Strict mode — token-only unlock, no passphrase fallback
-sudo ./vanguard generate -o /boot/initramfs-linux.img -s
 ```
 
 ## Documentation
@@ -76,7 +75,6 @@ vanguard generate -o /boot/initramfs-linux.img [options]
 | `-m, --modules` | Comma-separated kernel modules |
 | `-c, --compression` | `zstd`, `gzip`, or `none` (default: zstd) |
 | `-d, --debug` | Enable verbose boot output |
-| `-s, --strict` | Strict mode: token-only unlock, no passphrase fallback |
 | `--config` | Path to TOML config file |
 
 ### update
@@ -127,7 +125,7 @@ This checks:
 
 ### status
 
-Show system protection status with security layering:
+Show system protection status as a threat-model-first view:
 
 ```bash
 vanguard status [options]
@@ -136,9 +134,61 @@ vanguard status [options]
 | Option | Description |
 |--------|-------------|
 | `--json` | Machine-readable JSON output |
-| `-v, --verbose` | Show full PCR hash values |
 
-Shows protection tier (HIGH/MEDIUM/LOW/WARNING), LUKS encryption status, TPM 2.0 presence and lockout state, PCRLock boot integrity with per-PCR classification (enforced/unbound), and Secure Boot (PCR 7) detection.
+Shows protection tier (PHYSICAL/HIGH/WARNING/CRITICAL/LOW) with 10 attack vectors:
+- Evil Maid, Boot Chain Tampering, TPM Key Extraction, DMA Attack, Kernel Runtime Attack
+- Cold Boot Attack (informational), Brute-Force / Key Theft
+- Physical Debug Attack, Firmware Tampering, SMM Attack (via fwupd HSI / AMD HSTI)
+
+Integrates with fwupd, sbctl, and AMD PSP HSTI for platform security checks.
+
+### recovery
+
+Manage TOTP-based boot recovery:
+
+```bash
+vanguard recovery [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--enable` | Generate TOTP seed, store in TPM NVRAM, display QR code for authenticator app |
+| `--show` | Display current TOTP seed and QR code (for re-enrollment). Also shows pending re-provisioned seed after firmware update |
+| `--disable` | Remove TOTP seed from TPM NVRAM |
+| `--clean` | Forcefully remove old/legacy recovery NV indexes (migration from older vanguard) |
+| `--auto-reseed` | Automatically re-provision recovery seed if unreadable (PCR 7 changed after firmware update). Non-interactive — for systemd service |
+| `-l, --luks-device` | LUKS device path (for re-enroll instructions) |
+| `--nv-index` | TPM NV index (default: 0x01C30001) |
+
+Without flags, prints recovery instructions. The seed is sealed to PCR 7 (Secure Boot state) — if Secure Boot keys change (firmware update), the seed becomes inaccessible and must be re-provisioned via `--auto-reseed` or `--clean --enable`.
+
+### enroll
+
+Enroll TPM2 token on a LUKS device (runs `vanguard update` + `systemd-cryptenroll`):
+
+```bash
+vanguard enroll -u <uki> -l <luks-device> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-u, --uki-path` | Path to UKI file (required) |
+| `-l, --luks-device` | LUKS device to enroll (required) |
+| `-p, --with-pin` | Require PIN for TPM2 unseal (recommended) |
+| `-v, --verbose` | Show verbose output |
+
+### inspect
+
+Inspect contents of a generated initramfs:
+
+```bash
+vanguard inspect -p <path> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `-p, --path` | Path to initramfs image (required) |
+| `-v, --verbose` | Show file sizes |
 
 ## Architecture
 
@@ -148,14 +198,12 @@ Vanguard has a **dual-binary design**:
 - **`init/`** — Init binary running inside the initramfs at boot (19-step sequence)
 - **`internal/`** — Shared libraries: native Go TPM2 client, native Go LUKS implementation, CPIO archive writer, compression, pcrlock integration
 
-Build produces **4 init variants** via Go build tags from a single source tree:
+Build produces **2 init variants** from a single source tree. Both have strict mode always-on (no passphrase fallback without TOTP recovery):
 
 | Tag(s) | Binary | Behavior |
 |--------|--------|---------|
-| (none) | `init` | Release: minimal output, passphrase fallback |
-| `debug` | `init-debug` | Verbose output for troubleshooting |
-| `strict` | `init-strict` | Token-only unlock, no passphrase fallback |
-| `debug,strict` | `init-debug-strict` | Verbose + strict mode |
+| (none) | `init` | Release: minimal output, strict mode |
+| `debug` | `init-debug` | Verbose output for troubleshooting, strict mode |
 
 The generator outputs a **chained CPIO**: an uncompressed early archive for firmware (available to built-in kernel drivers) followed by a zstd/gzip-compressed main archive. All init binaries are statically linked (`CGO_ENABLED=0`) with zero runtime dependencies.
 
@@ -272,7 +320,7 @@ See [docs/boot-flow.md](docs/boot-flow.md) for detailed documentation.
 
 **Optional (for fwupd coexistence on systemd 262+):**
 - systemd 262+ — enables the `io.systemd.PCRLock` Varlink interface for `Lock`/`MakePolicy` calls. On older systemd, vanguard falls back to the `systemd-pcrlock` CLI automatically.
-- fwupd 2.1.7+ — the `systemd-pcrlock` fwupd plugin loosens systemd's pcrlock policy before firmware updates. Vanguard's policy is separate (different NV index) and must be regenerated manually before rebooting after a firmware update.
+- fwupd 2.1.7+ — the `systemd-pcrlock` fwupd plugin loosens systemd's pcrlock policy before firmware updates. Vanguard's policy is separate (different NV index) but can be automatically re-locked and re-provisioned after reboot via the shipped `vanguard-pcrlock-relock.service` systemd unit. See [TPM2 Setup Guide](docs/tpm2-setup.md#automatic-re-lock-after-firmware-update) for details.
 
 **No external TPM or LUKS dependencies** — Vanguard's init binary uses native Go implementations for all crypto and TPM2 operations.
 
@@ -305,9 +353,29 @@ go test ./init/... -v              # Init token parsing
 | **TPM Binding** | Sealed keys bound to TPM with PCR policy enforcement |
 | **PIN Protection** | PBKDF2-derived authentication value for TPM2 tokens |
 | **Boot Integrity** | PCRLock with PolicyAuthorizeNV — enforces expected PCR values before unlock |
-| **Strict Mode** | Disables passphrase fallback when TPM2 token is present |
+| **TOTP Recovery** | Seed sealed to PCR 7 (Secure Boot) in TPM NVRAM; anti-evil-maid protection |
+| **Strict Mode** | Always-on; disables passphrase fallback when TPM2 token is present. TOTP recovery required for fallback |
 | **Process Isolation** | Static Go binary init (`CGO_ENABLED=0`) — no dynamic linking vulnerabilities |
 | **Minimal Surface** | Only essential binaries and modules included; no interpreters or package managers |
+
+### Threat Model
+
+`vanguard status` shows 10 attack vectors with per-mitigation status:
+
+| Vector | Key Mitigations |
+|--------|-----------------|
+| Evil Maid (initrd/UKI replacement) | Secure Boot, PCRLock PCR 7, sbctl, Platform Fused, PSB |
+| Boot Chain Tampering | PCRLock PCR binding, NV index, PCR0 reconstruction |
+| TPM Key Extraction | TPM 2.0, fTPM (no external bus), bus encryption, DA lockout |
+| DMA Attack | IOMMU, pre-boot DMA protection, Thunderbolt |
+| Kernel Runtime Attack | Lockdown, module sigs, CET, SMAP, kernel tainted |
+| Cold Boot Attack | Memory encryption (informational — doesn't affect tier) |
+| Brute-Force / Key Theft | TPM2 token, PIN, PCRLock binding, TOTP fallback |
+| Physical Debug Attack | Debug interface locked, fused part (fwupd/HSTI) |
+| Firmware Tampering | SPI write/replay protection, anti-rollback (fwupd/HSTI) |
+| SMM Attack | SMM locked (fwupd) |
+
+**Protection tiers:** PHYSICAL (all physical mitigations active) → HIGH (all software mitigations active) → WARNING (gaps) → CRITICAL (broken mitigation) → LOW (passphrase only)
 
 ### PCR Coverage
 

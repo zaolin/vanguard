@@ -143,21 +143,35 @@ sudo vanguard status
 
 Expected output:
 ```
-  PROTECTION TIER: █████████████  HIGH
-╭─ LUKS2  /dev/nvme0n1p2 ────────╮
-│  Token: systemd-tpm2 PIN pcrlock│
-│  NV:    0x1b8225b               │
-╰─────────────────────────────────╯
-╭─ TPM 2.0 ───────────────────────╮
-│  Device: /dev/tpmrm0 available  │
-╰─────────────────────────────────╯
-╭─ BOOT INTEGRITY ────────────────╮
-│  NV: 0x1b8225b present on TPM   │
-│  ✓ PCR 2  external-code         │
-│  ✓ PCR 3  external-config       │
-│  ✓ PCR 4  boot-loader-code      │
-│  ✓ PCR 7  secure-boot-policy    │
-╰─────────────────────────────────╯
+  PROTECTION TIER   ████████████████  HIGH
+
+  THREAT MODEL
+
+  ✓ Evil Maid (initrd/UKI replacement)
+    Secure Boot:                 ✓ enabled, custom keys
+    PCRLock PCR 7:               ✓ bound
+    Platform Fused:              ✓ locked (production part)
+    Hardware Validated Boot:     — not enabled (PHYSICAL→HIGH)
+    sbctl: booted UKI signed:    ✓ kernel.efi
+
+  ✓ Boot Chain Tampering (firmware/UKI change)
+    PCRLock PCR binding:         ✓ 6 PCRs bound, all match
+    PCRLock NV index:            ✓ 0x1a97310 present on TPM
+    PCR0 Reconstruction:         ✓ valid
+
+  ✓ TPM Key Extraction (bus sniffing)
+    TPM 2.0:                     ✓ /dev/tpmrm0
+    TPM type:                    ✓ fTPM (CRB) — no external bus
+    TPM bus encryption:          ✓ CONFIG_TCG_TPM2_HMAC active
+    Dictionary attack lockout:   ✓ 3/3 remaining
+
+  ⚠ Cold Boot Attack (RAM dump)
+    Memory encryption:           ⚠ AMD SME available, not enabled
+
+  ✓ Brute-Force / Key Theft (LUKS)
+    TPM2 token:                  ✓ systemd-tpm2 enrolled
+    PIN:                         ✓ additional auth factor
+    TOTP fallback:               ✓ recovery code enrolled
 ```
 
 ## Native Go TPM Stack
@@ -340,9 +354,10 @@ Vanguard loads `tpm_crb`, `tpm_tis`, and `tpm_tis_core` modules automatically.
 
 Vanguard uses its own pcrlock policy at `/boot/EFI/Gentoo/kernel.pcrlock.json` with a separate TPM NV index. fwupd's plugin only regenerates systemd's policy at `/var/lib/systemd/pcrlock.json` — it does **not** touch vanguard's policy.
 
-This means after a firmware/SecureBoot update, you must regenerate vanguard's policy **before rebooting**:
+With the `vanguard-pcrlock-relock.service` enabled (see [Automatic re-lock after firmware update](#automatic-re-lock-after-firmware-update)), vanguard's policy and recovery seed are re-provisioned automatically after reboot. The manual steps below are only needed if the service is not enabled:
 
 ```bash
+# MANUAL FALLBACK — only if vanguard-pcrlock-relock.service is not enabled:
 # After fwupd applies the update but BEFORE rebooting:
 sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2
 
@@ -351,6 +366,9 @@ sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto \
   --tpm2-with-pin=yes \
   --tpm2-pcrlock=/boot/EFI/Gentoo/kernel.pcrlock.json \
   /dev/nvme0n1p2
+
+# If Secure Boot keys changed, re-provision the recovery seed:
+sudo vanguard recovery --auto-reseed
 
 # Now it's safe to reboot
 sudo reboot
@@ -373,32 +391,152 @@ The `make-policy` step always uses the CLI path because:
 1. The Varlink `MakePolicy` method writes to systemd's default policy path (`/var/lib/systemd/pcrlock.json`), not vanguard's policy path
 2. Vanguard needs an interactive recovery PIN prompt (`--recovery-pin=query`), while the Varlink method only supports `RECOVERY_PIN_HIDE` mode
 
-### Automatic re-lock after firmware update (optional)
+### Automatic re-lock after firmware update
 
-To automatically regenerate vanguard's policy after a firmware update + reboot, install the following systemd units:
+Vanguard ships a systemd unit that automatically re-locks the pcrlock policy **and** re-provisions the TOTP recovery seed after a firmware update that changes Secure Boot keys (PCR 7).
 
-```ini
-# /etc/systemd/system/vanguard-pcrlock-relock.service
-[Unit]
-Description=Re-lock Vanguard TPM policy after firmware update
-After=systemd-pcrlock-secureboot-policy.service systemd-pcrlock-secureboot-authority.service
-ConditionPathExists=/boot/EFI/Gentoo/kernel.pcrlock.json
-
-[Service]
-Type=oneshot
-ExecStart=/usr/bin/vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 --no-verify
-
-[Install]
-WantedBy=sysinit.target
-```
+**Installation:**
 
 ```bash
+# Copy the example environment file and adjust paths
+sudo cp /etc/vanguard/vanguard.env.example /etc/vanguard/vanguard.env
+# Edit /etc/vanguard/vanguard.env with your UKI and LUKS paths
+
+# Enable the service
 sudo systemctl enable vanguard-pcrlock-relock.service
 ```
 
-This runs after systemd's own pcrlock re-lock services, ensuring the firmware components are fresh before vanguard reads them.
+**What it does after reboot:**
+
+1. `vanguard update -u <uki> -l <luks-dev> --no-verify` — regenerates the pcrlock policy against the new firmware measurements
+2. `vanguard recovery --auto-reseed` — detects if the recovery seed is unreadable (PCR 7 changed), generates a new seed, and writes it to TPM NVRAM. The new seed's `otpauth://` URI is saved to `/var/lib/vanguard/recovery-pending.uri`.
+
+**After the service runs:**
+
+Retrieve the new TOTP seed and re-enroll your authenticator app:
+
+```bash
+sudo vanguard recovery --show
+```
+
+This reads the pending file, displays the QR code, and on successful TOTP verification deletes the pending file.
+
+**Failure handling:** If `--auto-reseed` fails (e.g., TPM error), the service logs a warning but does not block boot. The recovery seed is a fallback — if it's unavailable, the user can manually run `vanguard recovery --clean --enable`.
+
+## TPM NVRAM Index Allocation
+
+Vanguard and systemd-pcrlock use TPM2 NVRAM indexes in the owner hierarchy range. The following table documents all index ranges:
+
+| Index Range | Purpose | Owner | Size | Notes |
+|---|---|---|---|---|
+| `0x01800000`–`0x01BFFFFF` | systemd-pcrlock policy indexes | systemd-pcrlock | 34 bytes (SHA256 digest + 2B header) | Auto-discovered by `FindPCRLockNVIndex` |
+| `0x01C20000` | Default pcrlock NV index (fallback) | systemd-pcrlock | 34 bytes | Used when token doesn't pin a specific index |
+| **`0x01C30001`** | **Vanguard TOTP recovery seed** | **vanguard** | **32 bytes** | PCR-bound (PolicyRead/PolicyWrite); only accessible with correct PCR 7 state |
+| **`0x01C30002`** | **Vanguard TOTP reference timestamp** | **vanguard** | **40 bytes** | Owner-auth (not secret); stores 8-byte timestamp + 32-byte enrollment branch digest |
+| `0x01C30003`–`0x01C3FFFF` | Reserved for future vanguard indexes | vanguard | — | Not yet used |
+
+### Recovery NV Index Details
+
+The TOTP recovery uses two separate NV indexes:
+
+**Seed index (`0x01C30001`):**
+- Attributes: `PolicyRead`, `PolicyWrite`, `NoDA`, `WriteAll`, `NT=Ordinary`
+- No `OwnerRead`/`OwnerWrite` — owner auth alone cannot read or write the seed
+- No `PolicyDelete` — owner auth can undefine the index (DoS only, not secret extraction)
+- `authPolicy` = `PolicyPCR(PCR 7)` — single branch: Secure Boot state. The seed is only released when PCR 7 matches the enrollment-time value. No `PolicyOR` is used (the TPM requires at least 2 branches for `PolicyOR`).
+- Reading/writing requires a policy session with `PolicyPCR` matching the `authPolicy`
+- Deletion uses `NVUndefineSpace` with owner auth (no policy session needed)
+- **Anti-evil-maid protection**: An attacker booting from a live USB has different PCR values → cannot read the seed → cannot generate valid TOTP codes
+
+**Timestamp index (`0x01C30002`):**
+- Attributes: `OwnerRead`, `OwnerWrite`, `NoDA`, `WriteAll`, `NT=Ordinary`
+- No policy — the timestamp is not secret and needs to be writable at boot
+- Layout: 40 bytes total — 8-byte big-endian Unix timestamp of last successful boot (for RTC drift detection) + 32-byte enrollment branch digest (for policy session reconstruction at boot)
+
+### Anti-Evil-Maid Protection
+
+The TOTP seed is **PCR-bound** — it can only be read when the current PCR state matches the `authPolicy` stored in the NV index. This prevents an attacker with physical access from reading the seed via a live USB:
+
+| Scenario | PCR state | Seed accessible? |
+|----------|-----------|-----------------|
+| Normal boot (genuine UKI + Secure Boot) | PCR 7 matches | Yes |
+| After kernel update (PCR 4 changed) | PCR 7 unchanged | Yes |
+| After firmware update (PCR 0 changed, Secure Boot keys stable) | PCR 7 unchanged | Yes |
+| **After firmware update (Secure Boot keys reset)** | **PCR 7 changed** | **No — re-provision via `--auto-reseed`** |
+| **Attacker boots from live USB** | **PCR 7 completely different** | **No** |
+| **Attacker replaces initrd (EvilAbigail)** | **PCR 4 changed, Secure Boot off → PCR 7 changed** | **No** |
+| **Secure Boot disabled** | **PCR 7 changes** | **No** |
+
+The single-branch policy binds the seed to PCR 7 (Secure Boot configuration). The seed is only released when Secure Boot is active and matches the enrollment-time state. When Secure Boot keys change (e.g., firmware update resets PK/KEK/db), the seed becomes inaccessible and must be re-provisioned.
+
+### Migration from 3-branch to single-branch policy
+
+Previous vanguard versions used a 3-branch `PolicyOR` (`{4,7}`, `{7}`, `{0,7}`). The `authPolicy` hash changed when switching to the single-branch `PolicyPCR(PCR 7)` policy. If upgrading from a previous version, re-enroll the recovery seed:
+
+```bash
+sudo vanguard recovery --clean
+sudo vanguard recovery --enable
+```
+
+If the `vanguard-pcrlock-relock.service` is enabled, `--auto-reseed` will handle this automatically on the next reboot (the old 3-branch seed will be unreadable, triggering re-provisioning).
 
 ## Recovery
+
+### TOTP Recovery (Recommended)
+
+TOTP recovery allows passphrase fallback in strict mode without weakening the security model. When the TPM2 unseal fails, the user enters a 6-digit TOTP code from their authenticator app. If correct, passphrase fallback is enabled for this boot only.
+
+**Parameters:** HMAC-SHA256, 30-second period, 6 digits, ±1 window tolerance (90s), ±10 window tolerance when RTC drift detected (±5 minutes).
+
+#### Enable TOTP Recovery
+
+```bash
+sudo vanguard recovery --enable
+```
+
+This generates a 32-byte random TOTP seed, stores it in TPM NVRAM at index `0x01C30001` (PCR-bound with anti-evil-maid protection), and displays:
+- A QR code for scanning with your authenticator app (Google Authenticator, Authy, 1Password, etc.)
+- The base32-encoded seed for manual entry
+- The `otpauth://` URI for enrollment
+
+Register the QR code in your authenticator app. The seed persists in TPM NVRAM and survives reboots.
+
+#### How TOTP Recovery Works at Boot
+
+1. TPM2 unseal fails (e.g. after firmware update without re-running `vanguard update`)
+2. Vanguard checks if TOTP recovery is configured (NV index `0x01C30001` exists)
+3. If configured, prompts: "Enter recovery TOTP code (attempt N/3):"
+4. User enters the 6-digit code from their authenticator app
+5. Vanguard validates the code using constant-time comparison
+6. If correct → passphrase fallback enabled for this boot
+7. If 3 failed attempts → halt
+
+**RTC drift handling:** If the hardware clock is wrong (e.g. dead CMOS battery), Vanguard automatically widens the TOTP tolerance to ±5 minutes. The reference timestamp in NVRAM is updated after each successful boot to keep it fresh.
+
+#### Manage TOTP Recovery
+
+```bash
+# Show current seed and QR code (for re-enrollment)
+sudo vanguard recovery --show
+
+# Disable TOTP recovery (removes seed from TPM NVRAM)
+sudo vanguard recovery --disable
+
+# Print recovery instructions
+vanguard recovery
+```
+
+#### Security Properties
+
+| Property | How |
+|----------|-----|
+| Can't be triggered via kernel cmdline | `vanguard.strict=0` cmdline override has been removed entirely |
+| Can't replay old codes | TOTP is time-based, codes expire after 30 seconds |
+| Can't brute-force | 3 attempts per 30s window = 3/1M = 0.0003% per window |
+| Seed stored in TPM NVRAM | Not on disk; PCR-bound (anti-evil-maid); only readable with correct PCR 7 state |
+| Anti-evil-maid | Attacker booting from live USB cannot read the seed (wrong PCR values) |
+| Anti-EvilAbigail | Attacker replacing initrd changes PCR 4 → seed still readable if Secure Boot (PCR 7) unchanged, but initrd validation prevents unseal |
+| Constant-time comparison | Uses `crypto/subtle.ConstantTimeCompare` to prevent timing attacks |
 
 ### Recovery PIN
 
@@ -406,7 +544,9 @@ When you run `vanguard update`, the `make-policy` step prompts for a recovery PI
 
 The recovery PIN is separate from the LUKS passphrase. It is stored in the TPM NV index, not on disk.
 
-### Passphrase fallback
+### Passphrase Fallback
+
+In strict mode (default), passphrase fallback requires TOTP recovery. Without TOTP recovery configured, a failed TPM unlock will halt the system.
 
 Always maintain a passphrase slot for emergency recovery:
 

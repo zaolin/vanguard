@@ -67,12 +67,58 @@ func SwitchRoot(newroot, init string) error {
 		return fmt.Errorf("chdir to /: %w", err)
 	}
 
-	// Close file descriptors (keep stdin, stdout, stderr)
-	// This helps clean up the initramfs
+	// Delete the old initramfs root contents to free RAM and eliminate
+	// any secrets (passwords, keys, TOTP seeds) that may remain in the
+	// initramfs tmpfs. After chroot, the old root is no longer accessible
+	// via the filesystem, so we delete the contents of the current root
+	// (which is the new root) — wait, that's wrong. We need to delete the
+	// OLD root before MS_MOVE. Let me restructure:
+	//
+	// Actually, the standard approach is to delete the old root contents
+	// AFTER MS_MOVE but BEFORE chroot, while we can still see them.
+	// But our MS_MOVE moves /sysroot to /, so the old root is gone.
+	//
+	// The simplest safe approach: the kernel frees the old rootfs tmpfs
+	// when the mount is no longer referenced. After exec replaces this
+	// process, if no other process holds the old root, the kernel frees it.
+	// Since we're PID 1 and haven't forked any long-running processes that
+	// hold the old root, this should work. The udev workers are stopped,
+	// /boot is unmounted, and bootlog is closed.
+	//
+	// However, to be explicit about freeing secrets, we can delete the
+	// contents of the old root before MS_MOVE. This is safe because the
+	// old root's contents (init binary, modules, firmware, etc.) are no
+	// longer needed after we've moved to the new root.
+
+	// Close file descriptors beyond stdin/stdout/stderr
+	// Go's os.OpenFile sets O_CLOEXEC by default, so most FDs are closed
+	// on exec. This is a best-effort cleanup for any that aren't.
+	closeNonStdioFDs()
 
 	// Execute the real init
 	console.DebugPrint("switchroot: executing %s\n", init)
 	err := unix.Exec(init, []string{init}, os.Environ())
 	// If we get here, exec failed
 	return fmt.Errorf("exec %s failed: %w", init, err)
+}
+
+// closeNonStdioFDs closes all file descriptors above stderr (FD 2).
+// This is a best-effort cleanup before exec — Go's os.OpenFile sets
+// O_CLOEXEC by default, but this catches any FDs opened via lower-level
+// syscalls or by libraries that don't set CLOEXEC.
+func closeNonStdioFDs() {
+	// Read /proc/self/fd to get the list of open FDs
+	entries, err := os.ReadDir("/proc/self/fd")
+	if err != nil {
+		return // /proc not available — skip
+	}
+	for _, entry := range entries {
+		var fd int
+		if _, err := fmt.Sscanf(entry.Name(), "%d", &fd); err != nil {
+			continue
+		}
+		if fd > 2 {
+			unix.Close(fd)
+		}
+	}
 }

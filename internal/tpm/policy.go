@@ -308,6 +308,81 @@ func computePolicyAuthorizeNVHash(nvName []byte) ([]byte, error) {
 	return h.Sum(nil), nil
 }
 
+// computeNVName computes the TPM NV index name from a raw TPM2B_NV_PUBLIC blob.
+// The name is: nameAlg (2 bytes) || H(TPMS_NV_PUBLIC), where the hash is SHA256
+// for SHA256-nameAlg indexes (the only case vanguard supports).
+//
+// The TPM2B_NV_PUBLIC layout is:
+//
+//	[0:2]   TPM2B size (uint16)
+//	[2:6]   NVIndex (uint32)
+//	[6:8]   nameAlg (uint16)
+//	[8:12]  attributes (uint32)
+//	[12:14] authPolicy size (uint16)
+//	[14:14+aps] authPolicy data
+//	[14+aps:14+aps+2] dataSize (uint16)
+//
+// The name covers the TPMS_NV_PUBLIC (starting at offset 2, after the TPM2B size).
+// If the blob doesn't start with a TPM2B size, we treat the entire blob as the
+// TPMS_NV_PUBLIC (offset 0).
+//
+// Volatile attribute bits (Written, ReadLocked, WriteLocked) are masked out
+// before hashing. These bits change at runtime (e.g. Written is set when
+// make-policy writes the digest) and are not part of the NV index identity.
+// Without masking, the name from the token's TPM2B_NV_PUBLIC (captured at
+// enrollment, before writing) would never match the TPM's current name (which
+// has Written=1 after make-policy runs).
+//
+// Returns the name (nameAlg || hash) or an error if the blob is too short.
+func computeNVName(nvPublicBlob []byte) ([]byte, error) {
+	if len(nvPublicBlob) < 8 {
+		return nil, fmt.Errorf("NV public blob too short: %d bytes", len(nvPublicBlob))
+	}
+
+	// Determine where TPMS_NV_PUBLIC starts. If the first 2 bytes look like a
+	// TPM2B size that roughly matches the remaining data, skip it.
+	TPMSStart := 0
+	declaredSize := int(binary.BigEndian.Uint16(nvPublicBlob[0:2]))
+	if declaredSize > 0 && declaredSize <= len(nvPublicBlob)-2 && declaredSize >= 10 {
+		TPMSStart = 2
+	}
+
+	tpmsData := nvPublicBlob[TPMSStart:]
+	if len(tpmsData) < 12 {
+		return nil, fmt.Errorf("TPMS_NV_PUBLIC too short: %d bytes", len(tpmsData))
+	}
+
+	nameAlg := int(binary.BigEndian.Uint16(tpmsData[4:6]))
+	if nameAlg != int(tpm2.TPMAlgSHA256) {
+		return nil, fmt.Errorf("unsupported NV name algorithm: 0x%x (only SHA256 supported)", nameAlg)
+	}
+
+	// Mask volatile attribute bits before hashing. The attributes field is a
+	// 4-byte big-endian uint32 at offset 6 within TPMS_NV_PUBLIC (after
+	// NVIndex[4] + nameAlg[2] = 6 bytes).
+	// Volatile bits: WriteLocked (bit 11), ReadLocked (bit 28), Written (bit 29).
+	const volatileMask = uint32(1<<11 | 1<<28 | 1<<29) // 0x30000800
+
+	// Copy tpmsData so we don't modify the caller's slice
+	hashData := make([]byte, len(tpmsData))
+	copy(hashData, tpmsData)
+
+	// Mask volatile bits in the attributes field (bytes 6-9 within TPMS_NV_PUBLIC)
+	if len(hashData) >= 10 {
+		attrs := binary.BigEndian.Uint32(hashData[6:10])
+		attrs &^= volatileMask // clear volatile bits
+		binary.BigEndian.PutUint32(hashData[6:10], attrs)
+	}
+
+	hash := sha256.Sum256(hashData)
+
+	name := make([]byte, 2+sha256.Size)
+	binary.BigEndian.PutUint16(name[0:2], uint16(nameAlg))
+	copy(name[2:], hash[:])
+
+	return name, nil
+}
+
 // computePolicyAuthValueHash computes the policy digest for PolicyAuthValue.
 // Per TPM 2.0 Spec Part 3, Section 23.17:
 //
@@ -373,4 +448,57 @@ func ParsePCRLockJSON(data []byte) (*PCRLockPolicy, error) {
 	}
 
 	return policy, nil
+}
+
+// --- TOTP Recovery Seed Policy ---
+
+// SeedReadPolicyPCRs defines the PCR sets for each branch of the PolicyOR
+// that protects the TOTP recovery seed. All branches require PCR 7 (Secure
+// Boot state) — without Secure Boot, the initrd cannot be trusted and the
+// seed is never released.
+//
+// Single branch: PCR 7 only — the seed is released when Secure Boot is
+// active and matches the enrollment-time state. When Secure Boot keys
+// change (e.g., firmware update resets PK/KEK/db), the seed becomes
+// inaccessible and must be re-provisioned via 'vanguard recovery --auto-reseed'
+// or 'vanguard recovery --clean --enable'.
+//
+// Previous versions used 3 branches ({4,7}, {7}, {0,7}) but analysis showed
+// that branch {7} alone covers all valid cases (kernel updates, firmware
+// updates) while rejecting all invalid cases (Secure Boot disabled, live USB
+// boot). The extra branches provided no additional coverage since PolicyOR
+// is satisfied by the weakest branch.
+var SeedReadPolicyPCRs = [][]int{
+	{7}, // Single branch: Secure Boot state
+}
+
+// computeSeedReadPolicy computes the authPolicy for the TOTP recovery seed
+// NV index. With the single-branch policy (PCR 7 only), the authPolicy is
+// just the PolicyPCR digest — no PolicyOR is needed (the TPM requires at
+// least 2 branches for PolicyOR).
+//
+// Parameters:
+//   - alg: hash algorithm (must be AlgSHA256)
+//   - pcrValues: map of PCR number → current PCR value (at enrollment time)
+//
+// Returns the 32-byte PolicyPCR digest.
+func computeSeedReadPolicy(alg HashAlgorithm, pcrValues map[int][]byte) ([]byte, error) {
+	if alg != AlgSHA256 {
+		return nil, fmt.Errorf("unsupported hash algorithm: 0x%x (only SHA256)", alg)
+	}
+
+	// Single branch: compute PolicyPCR digest directly
+	pcrSet := SeedReadPolicyPCRs[0]
+	pcrDigest, err := computePCRDigest(alg, pcrValues, pcrSet)
+	if err != nil {
+		return nil, fmt.Errorf("compute PCR digest for %v: %w", pcrSet, err)
+	}
+
+	sel := buildPCRLSelection(alg, pcrSet)
+	branchDigest, err := computePolicyPCRHash(alg, nil, pcrDigest, sel)
+	if err != nil {
+		return nil, fmt.Errorf("compute PolicyPCR for %v: %w", pcrSet, err)
+	}
+
+	return branchDigest, nil
 }

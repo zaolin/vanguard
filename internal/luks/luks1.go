@@ -127,6 +127,9 @@ func (d *deviceV1) UnlockAny(passphrase []byte, dmName string) error {
 			return err
 		}
 
+		// Wipe the master key after setting up the dm-crypt mapper.
+		// The kernel has its own copy; we don't need ours anymore.
+		defer clearSlice(volume.key)
 		return volume.SetupMapper(dmName)
 	}
 	return ErrPassphraseDoesNotMatch
@@ -191,8 +194,13 @@ func (d *deviceV1) UnsealVolume(keyslotIdx int, passphrase []byte) (*Volume, err
 
 func (d *deviceV1) decryptLuks1VolumeKey(keyslotIdx int, slot keySlot, afKey []byte, h func() hash.Hash) ([]byte, error) {
 	// decrypt keyslotIdx area using the derived key
-	keyslotSize := d.hdr.KeyBytes * stripesNum
-	if keyslotSize%storageSectorSize != 0 {
+	// Validate keyslot size to prevent integer overflow / OOM from a crafted header
+	const maxKeyslotSize = 64 * 1024 * 1024 // 64MB max keyslot area
+	keyslotSize := uint64(d.hdr.KeyBytes) * uint64(stripesNum)
+	if keyslotSize > maxKeyslotSize {
+		return nil, fmt.Errorf("keyslot[%v] size %d exceeds maximum %d — possible crafted header", keyslotIdx, keyslotSize, maxKeyslotSize)
+	}
+	if keyslotSize%uint64(storageSectorSize) != 0 {
 		return nil, fmt.Errorf("keyslot[%v] size %v is not multiple of the sector size %v", keyslotIdx, keyslotSize, storageSectorSize)
 	}
 	keyData := make([]byte, keyslotSize)
@@ -333,5 +341,11 @@ func luksMetaTokenType(uuid []byte) string {
 }
 
 func deriveLuks1AfKey(passphrase []byte, slot keySlot, keySize int, h func() hash.Hash) []byte {
-	return pbkdf2.Key(passphrase, slot.Salt[:], int(slot.Iterations), keySize, h)
+	// Bound iterations to prevent CPU DoS from a crafted header
+	const maxIterations = 10_000_000 // 10M (cryptsetup default is ~1000-10000)
+	iterations := int(slot.Iterations)
+	if iterations > maxIterations {
+		iterations = maxIterations // cap rather than refuse — the boot should proceed
+	}
+	return pbkdf2.Key(passphrase, slot.Salt[:], iterations, keySize, h)
 }
