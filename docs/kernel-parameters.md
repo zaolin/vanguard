@@ -38,7 +38,6 @@ boot=/dev/nvme0n1p1
 
 **Note:** UUID and PARTUUID formats are not currently supported for the `boot=` parameter. If not specified, Vanguard scans partitions to find one containing `pcrlock.json` by trying to mount each partition as FAT32.
 
----
 
 ## Resume (Hibernation) Parameters
 
@@ -71,7 +70,6 @@ resume=/dev/mapper/vg0-root resume_offset=12345678
 
 **Note:** The offset can be obtained using `filefrag -v /swapfile` and looking at the first physical offset.
 
----
 
 ## Vanguard-Specific Parameters
 
@@ -105,7 +103,6 @@ vanguard.gpt_auto=no    # Disable GPT autodiscovery
 | Root (x86-64) | `4f68bce3-e8cd-4db1-96e7-fbcaf984b709` |
 | ESP | `c12a7328-f81f-11d2-ba4b-00a0c93ec93b` |
 
----
 
 ## Vconsole Parameters
 
@@ -159,7 +156,6 @@ Sets the console font unicode map.
 vconsole.font_unimap=lat1u.uni
 ```
 
----
 
 ## Standard Linux Parameters
 
@@ -180,7 +176,6 @@ These affect kernel message verbosity but Vanguard's own debug output is control
 
 The first one that exists and executes successfully is used.
 
----
 
 ## Example Boot Configurations
 
@@ -215,7 +210,6 @@ root=/dev/mapper/vg0-root vanguard.fsck=0
 root=/dev/mapper/vg0-root resume=/dev/vg0/swap vconsole.keymap=us quiet
 ```
 
----
 
 ## Parameter Processing Order
 
@@ -238,10 +232,9 @@ flowchart TD
     K --> L[Continue boot]
 ```
 
----
 
 ## See Also
 
-- [Boot Flow](boot-flow.md) — Detailed boot sequence documentation
-- [Configuration](configuration.md) — CLI and configuration file options
-- [TPM2 Setup](tpm2-setup.md) — TPM2 enrollment and PCRLock policy setup
+- [Boot Flow](boot-flow.md) - Detailed boot sequence documentation
+- [Configuration](configuration.md) - CLI and configuration file options
+- [TPM2 Setup](tpm2-setup.md) - TPM2 enrollment and PCRLock policy setup

@@ -55,20 +55,20 @@ PCRLock provides fine-grained control over which boot measurements are validated
 | 4 | Boot loader code (UKI) | ✓ Enforced (up to 3 branches) | Multi-branch handles firmware variance |
 | 5 | GPT partition table | Optional (`-l` flag) | Auto-enabled with `--luks-device` |
 | 7 | Secure Boot state | ✓ Enforced (up to 2 branches) | Primary security PCR |
-| 13 | sysexts | — Unbound (all-zeros) | |
-| 14 | shim-policy | — Unbound (all-zeros) | |
+| 13 | sysexts | - Unbound (all-zeros) | |
+| 14 | shim-policy | - Unbound (all-zeros) | |
 
-**Unbound PCRs** (13, 14) appear in the policy as all-zeros because no measurements are made. They don't affect unlock — they're placeholders.
+**Unbound PCRs** (13, 14) appear in the policy as all-zeros because no measurements are made. They don't affect unlock - they're placeholders.
 
 ### PCR 4 Multi-Branch Prediction
 
 PCR 4 (boot-loader-code) uses **PolicyOR** with up to 3 predicted values covering firmware event variations:
 
-1. **`pe.pcrlock`** — `lock-pe` measurement of the UKI file (most reliable for PCR 4 when sd-stub uses LoadImage)
-2. **`uki.pcrlock`** — `lock-uki` measurement (includes PCR 11 measurements; may fail on some systems, treated as fallback)
-3. **`eventlog.pcrlock`** — Last `EV_EFI_BOOT_SERVICES_APPLICATION` event extracted from the current boot's CEL event log. This ensures the currently-booted kernel is recognized even if the file on disk has been replaced.
+1. **`pe.pcrlock`** - `lock-pe` measurement of the UKI file (most reliable for PCR 4 when sd-stub uses LoadImage)
+2. **`uki.pcrlock`** - `lock-uki` measurement (includes PCR 11 measurements; may fail on some systems, treated as fallback)
+3. **`eventlog.pcrlock`** - Last `EV_EFI_BOOT_SERVICES_APPLICATION` event extracted from the current boot's CEL event log. This ensures the currently-booted kernel is recognized even if the file on disk has been replaced.
 
-This means PCR 4 won't prevent unlock unless the UKI itself has been tampered with — legitimate firmware variations are handled by the multi-branch policy.
+This means PCR 4 won't prevent unlock unless the UKI itself has been tampered with - legitimate firmware variations are handled by the multi-branch policy.
 
 ### Secure Boot (PCR 7)
 
@@ -87,7 +87,7 @@ When `--luks-device` (`-l`) is specified, Vanguard automatically enables GPT par
 - Validates correct disk identity (partition layout + GUIDs)
 - Prevents attacks using a different disk with same UKI
 
-**Caveats:** Partition changes break unlock — re-run `vanguard update -l <device>` after.
+**Caveats:** Partition changes break unlock - re-run `vanguard update -l <device>` after.
 
 ## Setup Workflow
 
@@ -151,7 +151,7 @@ Expected output:
     Secure Boot:                 ✓ enabled, custom keys
     PCRLock PCR 7:               ✓ bound
     Platform Fused:              ✓ locked (production part)
-    Hardware Validated Boot:     — not enabled (PHYSICAL→HIGH)
+    Hardware Validated Boot:     - not enabled (PHYSICAL→HIGH)
     sbctl: booted UKI signed:    ✓ kernel.efi
 
   ✓ Boot Chain Tampering (firmware/UKI change)
@@ -161,7 +161,7 @@ Expected output:
 
   ✓ TPM Key Extraction (bus sniffing)
     TPM 2.0:                     ✓ /dev/tpmrm0
-    TPM type:                    ✓ fTPM (CRB) — no external bus
+    TPM type:                    ✓ fTPM (CRB) - no external bus
     TPM bus encryption:          ✓ CONFIG_TCG_TPM2_HMAC active
     Dictionary attack lockout:   ✓ 3/3 remaining
 
@@ -184,7 +184,7 @@ Vanguard's init binary uses **zero external TPM dependencies** at runtime:
 | Sealed key unseal | Native PolicyPCR + PolicyAuthorizeNV (pcrlock) |
 | PIN derivation | PBKDF2-HMAC-SHA256 with salt from LUKS token |
 | SRK management | Transient creation, persistent handle, or tpm2_srk data |
-| LUKS unlock | Native Go LUKS v1/v2 (`internal/luks/`) — no libcryptsetup |
+| LUKS unlock | Native Go LUKS v1/v2 (`internal/luks/`) - no libcryptsetup |
 
 All crypto is handled in-process. The only binaries included in the initramfs are `lvm`, `systemd-udevd`/`udevadm`, and `dmsetup`.
 
@@ -201,9 +201,9 @@ sudo vanguard verify -p /boot/EFI/Gentoo/kernel.pcrlock.json -l /dev/nvme0n1p2
 ```
 
 Three checks run:
-1. **NV Index sync** — TPM NV index auth policy + size match policy file
-2. **PCR validation** — Current PCR values against policy expectations
-3. **LUKS token** (with `-l`) — Token references correct NV index + enforces pcrlock
+1. **NV Index sync** - TPM NV index auth policy + size match policy file
+2. **PCR validation** - Current PCR values against policy expectations
+3. **LUKS token** (with `-l`) - Token references correct NV index + enforces pcrlock
 
 ## Updating Kernel/UKI
 
@@ -260,7 +260,7 @@ Vanguard keeps the current policy NV index and the LUKS token's NV index, removi
 
 ## Troubleshooting
 
-### TPM Unlock Fails — PCR Mismatch
+### TPM Unlock Fails - PCR Mismatch
 
 **Symptom:** Boot falls back to passphrase with TPM errors.
 
@@ -279,11 +279,11 @@ sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto \
   /dev/nvme0n1p2
 ```
 
-### "PCR 7 missing from policy" — Stale Firmware Components
+### "PCR 7 missing from policy" - Stale Firmware Components
 
 **Symptom:** `vanguard update` fails with `policy verification failed: PCR 7 missing from policy`. Verbose output shows `No PCRs kept in protection mask` or `PCR 0 event log contains unrecognized measurements`.
 
-**Root cause:** The auto-generated firmware component files in `/var/lib/pcrlock.d/` (e.g. `250-firmware-code-early.pcrlock.d/generated.pcrlock`) are stale — they were generated from a previous boot or firmware version and their digests no longer match the current event log. When `systemd-pcrlock make-policy` can't match a component, it drops the PCR from the protection mask. Since PCR 0/1 are at the root of the component dependency chain, dropping them cascades to drop ALL PCRs — including PCR 7.
+**Root cause:** The auto-generated firmware component files in `/var/lib/pcrlock.d/` (e.g. `250-firmware-code-early.pcrlock.d/generated.pcrlock`) are stale - they were generated from a previous boot or firmware version and their digests no longer match the current event log. When `systemd-pcrlock make-policy` can't match a component, it drops the PCR from the protection mask. Since PCR 0/1 are at the root of the component dependency chain, dropping them cascades to drop ALL PCRs - including PCR 7.
 
 **Fix:** Vanguard automatically regenerates firmware components before `make-policy` by running `systemd-pcrlock lock-firmware-code` and `lock-firmware-config` (or the Varlink `Lock` method on systemd 262+). If this still fails:
 
@@ -299,7 +299,7 @@ sudo systemd-pcrlock lock-firmware-config
 sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 -v
 ```
 
-### "PCR 0 touched by component we can't find" — Unmasked OS Separator
+### "PCR 0 touched by component we can't find" - Unmasked OS Separator
 
 **Symptom:** Verbose output shows `PCR 0 is touched by component we can't find in event log` even after firmware component regeneration.
 
@@ -352,12 +352,12 @@ Vanguard loads `tpm_crb`, `tpm_tis`, and `tpm_tis_core` modules automatically.
 
 ### Vanguard's separate policy
 
-Vanguard uses its own pcrlock policy at `/boot/EFI/Gentoo/kernel.pcrlock.json` with a separate TPM NV index. fwupd's plugin only regenerates systemd's policy at `/var/lib/systemd/pcrlock.json` — it does **not** touch vanguard's policy.
+Vanguard uses its own pcrlock policy at `/boot/EFI/Gentoo/kernel.pcrlock.json` with a separate TPM NV index. fwupd's plugin only regenerates systemd's policy at `/var/lib/systemd/pcrlock.json` - it does **not** touch vanguard's policy.
 
 With the `vanguard-pcrlock-relock.service` enabled (see [Automatic re-lock after firmware update](#automatic-re-lock-after-firmware-update)), vanguard's policy and recovery seed are re-provisioned automatically after reboot. The manual steps below are only needed if the service is not enabled:
 
 ```bash
-# MANUAL FALLBACK — only if vanguard-pcrlock-relock.service is not enabled:
+# MANUAL FALLBACK - only if vanguard-pcrlock-relock.service is not enabled:
 # After fwupd applies the update but BEFORE rebooting:
 sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2
 
@@ -408,8 +408,8 @@ sudo systemctl enable vanguard-pcrlock-relock.service
 
 **What it does after reboot:**
 
-1. `vanguard update -u <uki> -l <luks-dev> --no-verify` — regenerates the pcrlock policy against the new firmware measurements
-2. `vanguard recovery --auto-reseed` — detects if the recovery seed is unreadable (PCR 7 changed), generates a new seed, and writes it to TPM NVRAM. The new seed's `otpauth://` URI is saved to `/var/lib/vanguard/recovery-pending.uri`.
+1. `vanguard update -u <uki> -l <luks-dev> --no-verify` - regenerates the pcrlock policy against the new firmware measurements
+2. `vanguard recovery --auto-reseed` - detects if the recovery seed is unreadable (PCR 7 changed), generates a new seed, and writes it to TPM NVRAM. The new seed's `otpauth://` URI is saved to `/var/lib/vanguard/recovery-pending.uri`.
 
 **After the service runs:**
 
@@ -421,7 +421,7 @@ sudo vanguard recovery --show
 
 This reads the pending file, displays the QR code, and on successful TOTP verification deletes the pending file.
 
-**Failure handling:** If `--auto-reseed` fails (e.g., TPM error), the service logs a warning but does not block boot. The recovery seed is a fallback — if it's unavailable, the user can manually run `vanguard recovery --clean --enable`.
+**Failure handling:** If `--auto-reseed` fails (e.g., TPM error), the service logs a warning but does not block boot. The recovery seed is a fallback - if it's unavailable, the user can manually run `vanguard recovery --clean --enable`.
 
 ## TPM NVRAM Index Allocation
 
@@ -433,7 +433,7 @@ Vanguard and systemd-pcrlock use TPM2 NVRAM indexes in the owner hierarchy range
 | `0x01C20000` | Default pcrlock NV index (fallback) | systemd-pcrlock | 34 bytes | Used when token doesn't pin a specific index |
 | **`0x01C30001`** | **Vanguard TOTP recovery seed** | **vanguard** | **32 bytes** | PCR-bound (PolicyRead/PolicyWrite); only accessible with correct PCR 7 state |
 | **`0x01C30002`** | **Vanguard TOTP reference timestamp** | **vanguard** | **40 bytes** | Owner-auth (not secret); stores 8-byte timestamp + 32-byte enrollment branch digest |
-| `0x01C30003`–`0x01C3FFFF` | Reserved for future vanguard indexes | vanguard | — | Not yet used |
+| `0x01C30003`–`0x01C3FFFF` | Reserved for future vanguard indexes | vanguard | - | Not yet used |
 
 ### Recovery NV Index Details
 
@@ -441,28 +441,28 @@ The TOTP recovery uses two separate NV indexes:
 
 **Seed index (`0x01C30001`):**
 - Attributes: `PolicyRead`, `PolicyWrite`, `NoDA`, `WriteAll`, `NT=Ordinary`
-- No `OwnerRead`/`OwnerWrite` — owner auth alone cannot read or write the seed
-- No `PolicyDelete` — owner auth can undefine the index (DoS only, not secret extraction)
-- `authPolicy` = `PolicyPCR(PCR 7)` — single branch: Secure Boot state. The seed is only released when PCR 7 matches the enrollment-time value. No `PolicyOR` is used (the TPM requires at least 2 branches for `PolicyOR`).
+- No `OwnerRead`/`OwnerWrite` - owner auth alone cannot read or write the seed
+- No `PolicyDelete` - owner auth can undefine the index (DoS only, not secret extraction)
+- `authPolicy` = `PolicyPCR(PCR 7)` - single branch: Secure Boot state. The seed is only released when PCR 7 matches the enrollment-time value. No `PolicyOR` is used (the TPM requires at least 2 branches for `PolicyOR`).
 - Reading/writing requires a policy session with `PolicyPCR` matching the `authPolicy`
 - Deletion uses `NVUndefineSpace` with owner auth (no policy session needed)
 - **Anti-evil-maid protection**: An attacker booting from a live USB has different PCR values → cannot read the seed → cannot generate valid TOTP codes
 
 **Timestamp index (`0x01C30002`):**
 - Attributes: `OwnerRead`, `OwnerWrite`, `NoDA`, `WriteAll`, `NT=Ordinary`
-- No policy — the timestamp is not secret and needs to be writable at boot
-- Layout: 40 bytes total — 8-byte big-endian Unix timestamp of last successful boot (for RTC drift detection) + 32-byte enrollment branch digest (for policy session reconstruction at boot)
+- No policy - the timestamp is not secret and needs to be writable at boot
+- Layout: 40 bytes total - 8-byte big-endian Unix timestamp of last successful boot (for RTC drift detection) + 32-byte enrollment branch digest (for policy session reconstruction at boot)
 
 ### Anti-Evil-Maid Protection
 
-The TOTP seed is **PCR-bound** — it can only be read when the current PCR state matches the `authPolicy` stored in the NV index. This prevents an attacker with physical access from reading the seed via a live USB:
+The TOTP seed is **PCR-bound** - it can only be read when the current PCR state matches the `authPolicy` stored in the NV index. This prevents an attacker with physical access from reading the seed via a live USB:
 
 | Scenario | PCR state | Seed accessible? |
 |----------|-----------|-----------------|
 | Normal boot (genuine UKI + Secure Boot) | PCR 7 matches | Yes |
 | After kernel update (PCR 4 changed) | PCR 7 unchanged | Yes |
 | After firmware update (PCR 0 changed, Secure Boot keys stable) | PCR 7 unchanged | Yes |
-| **After firmware update (Secure Boot keys reset)** | **PCR 7 changed** | **No — re-provision via `--auto-reseed`** |
+| **After firmware update (Secure Boot keys reset)** | **PCR 7 changed** | **No - re-provision via `--auto-reseed`** |
 | **Attacker boots from live USB** | **PCR 7 completely different** | **No** |
 | **Attacker replaces initrd (EvilAbigail)** | **PCR 4 changed, Secure Boot off → PCR 7 changed** | **No** |
 | **Secure Boot disabled** | **PCR 7 changes** | **No** |
@@ -540,7 +540,7 @@ vanguard recovery
 
 ### Recovery PIN
 
-When you run `vanguard update`, the `make-policy` step prompts for a recovery PIN. This PIN is sealed into the TPM alongside the PCR policy. If the PCR values change (e.g. after a firmware update without re-running `vanguard update`), the TPM will not unseal the key automatically — but the recovery PIN can be used to unseal it manually via `systemd-pcrlock recover`.
+When you run `vanguard update`, the `make-policy` step prompts for a recovery PIN. This PIN is sealed into the TPM alongside the PCR policy. If the PCR values change (e.g. after a firmware update without re-running `vanguard update`), the TPM will not unseal the key automatically - but the recovery PIN can be used to unseal it manually via `systemd-pcrlock recover`.
 
 The recovery PIN is separate from the LUKS passphrase. It is stored in the TPM NV index, not on disk.
 

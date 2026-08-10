@@ -4,7 +4,7 @@ This document describes the complete boot sequence executed by the Vanguard init
 
 ## Overview
 
-Vanguard's init process is designed for systems with encrypted root filesystems using LUKS + LVM, with TPM2-based automatic unlocking via PCRLock policy. The init binary is a **static Go binary** (`CGO_ENABLED=0`) with native Go LUKS and TPM2 implementations — no external crypto or TPM binaries are needed at runtime.
+Vanguard's init process is designed for systems with encrypted root filesystems using LUKS + LVM, with TPM2-based automatic unlocking via PCRLock policy. The init binary is a **static Go binary** (`CGO_ENABLED=0`) with native Go LUKS and TPM2 implementations - no external crypto or TPM binaries are needed at runtime.
 
 ## Boot Sequence Overview
 
@@ -165,9 +165,9 @@ flowchart TD
 ```
 
 **Token strategy detection** (`init/luks/detect.go`):
-- **PIN-only** — no PCRs, no pcrlock → skips policy hash verification
-- **PCR policy** — traditional PCR binding → validates against enrolled PCRs
-- **PCRLock** — pcrlock.json found → builds super-PCR policy with PolicyAuthorizeNV
+- **PIN-only** - no PCRs, no pcrlock → skips policy hash verification
+- **PCR policy** - traditional PCR binding → validates against enrolled PCRs
+- **PCRLock** - pcrlock.json found → builds super-PCR policy with PolicyAuthorizeNV
 
 ### Step 12: LVM Activation
 
@@ -182,7 +182,7 @@ flowchart TD
     G --> H[Verify volume accessibility]
 ```
 
-**No `DM_DISABLE_UDEV=1` is set** — udev handles device node creation through `10-dm.rules` and `11-dm-lvm.rules`. The db_persist rule ensures state survives switch_root.
+**No `DM_DISABLE_UDEV=1` is set** - udev handles device node creation through `10-dm.rules` and `11-dm-lvm.rules`. The db_persist rule ensures state survives switch_root.
 
 ## Phase 4: Mount Root
 
@@ -203,7 +203,7 @@ flowchart TD
     G -->|No| I[Write to /sys/power/resume]
     H --> I
     I --> J{Hibernation image?}
-    J -->|Yes| K[Kernel restores memory — never returns]
+    J -->|Yes| K[Kernel restores memory - never returns]
     J -->|No| B
     B --> M[Continue boot]
 ```
@@ -256,7 +256,7 @@ flowchart TD
     I --> J[Systemd finds them already mounted after switch_root]
 ```
 
-**Why this matters:** After switch_root, the udev database may have `SYSTEMD_READY=0` on DM devices from coldplug non-primary events. By mounting `/home` and other non-root filesystems in the initramfs, systemd inherits pre-mounted filesystems and doesn't wait for device nodes that may never become "ready."
+**Why:** After switch_root, the udev database may have `SYSTEMD_READY=0` on DM devices from coldplug non-primary events. By mounting `/home` and other non-root filesystems in the initramfs, systemd inherits pre-mounted filesystems and doesn't wait for device nodes that may never become "ready."
 
 ### Step 16b: Create LVM Symlinks
 

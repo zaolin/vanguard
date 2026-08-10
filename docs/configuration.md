@@ -66,11 +66,11 @@ vanguard update [options]
 
 #### 5-Phase Execution
 
-1. **PCR Masks** — Masks noisy/unstable PCRs, unmaskes stable PCRs 2, 3
-2. **Lock PCRs** — Locks Secure Boot (PCR 7), GPT (PCR 5, with `-l`), UKI (PCR 4 with PE fallback)
-3. **Make Policy** — Runs `systemd-pcrlock make-policy` with recovery PIN
-4. **Verify** — Validates that PCR 7 is present in the generated policy
-5. **Integrity Check** — Verifies NV index sync and PCR values against the TPM
+1. **PCR Masks** - Masks noisy/unstable PCRs, unmaskes stable PCRs 2, 3
+2. **Lock PCRs** - Locks Secure Boot (PCR 7), GPT (PCR 5, with `-l`), UKI (PCR 4 with PE fallback)
+3. **Make Policy** - Runs `systemd-pcrlock make-policy` with recovery PIN
+4. **Verify** - Validates that PCR 7 is present in the generated policy
+5. **Integrity Check** - Verifies NV index sync and PCR values against the TPM
 
 #### Examples
 
@@ -108,9 +108,9 @@ vanguard verify [options]
 
 #### Checks Performed
 
-1. **NV Index Synchronization** — TPM auth policy + size vs policy file
-2. **PCR Validation** — Current PCR values against policy expectations
-3. **LUKS Token** — Token NV index match + pcrlock enforcement (with `-l`)
+1. **NV Index Synchronization** - TPM auth policy + size vs policy file
+2. **PCR Validation** - Current PCR values against policy expectations
+3. **LUKS Token** - Token NV index match + pcrlock enforcement (with `-l`)
 
 #### Examples
 
@@ -140,19 +140,19 @@ vanguard status [options]
 
 A threat-model-first view organized by attack vectors:
 
-- **Protection tier** — PHYSICAL / HIGH / WARNING / CRITICAL / LOW with visual bar
-- **Threat vectors** — 10 attack vectors with per-mitigation status:
-  - Evil Maid (initrd/UKI replacement) — Secure Boot, PCRLock PCR 7, sbctl, Platform Fused, PSB
-  - Boot Chain Tampering — PCRLock PCR binding, NV index, PCR0 reconstruction
-  - TPM Key Extraction — TPM 2.0, fTPM detection, bus encryption, DA lockout
-  - DMA Attack — IOMMU, pre-boot DMA protection, Thunderbolt
-  - Kernel Runtime Attack — lockdown, module sigs, CET, SMAP, kernel tainted
-  - Cold Boot Attack — memory encryption (informational, doesn't affect tier)
-  - Brute-Force / Key Theft — TPM2 token, PIN, PCRLock binding, TOTP fallback
-  - Physical Debug Attack — debug interface locked, fused part (via fwupd/HSTI)
-  - Firmware Tampering — SPI write/replay protection, anti-rollback (via fwupd/HSTI)
-  - SMM Attack — SMM locked (via fwupd)
-- **Platform integration** — fwupd HSI attributes, sbctl signature verification, AMD HSTI sysfs
+- **Protection tier** - PHYSICAL / HIGH / WARNING / CRITICAL / LOW with visual bar
+- **Threat vectors** - 10 attack vectors with per-mitigation status:
+  - Evil Maid (initrd/UKI replacement) - Secure Boot, PCRLock PCR 7, sbctl, Platform Fused, PSB
+  - Boot Chain Tampering - PCRLock PCR binding, NV index, PCR0 reconstruction
+  - TPM Key Extraction - TPM 2.0, fTPM detection, bus encryption, DA lockout
+  - DMA Attack - IOMMU, pre-boot DMA protection, Thunderbolt
+  - Kernel Runtime Attack - lockdown, module sigs, CET, SMAP, kernel tainted
+  - Cold Boot Attack - memory encryption (informational, doesn't affect tier)
+  - Brute-Force / Key Theft - TPM2 token, PIN, PCRLock binding, TOTP fallback
+  - Physical Debug Attack - debug interface locked, fused part (via fwupd/HSTI)
+  - Firmware Tampering - SPI write/replay protection, anti-rollback (via fwupd/HSTI)
+  - SMM Attack - SMM locked (via fwupd)
+- **Platform integration** - fwupd HSI attributes, sbctl signature verification, AMD HSTI sysfs
 
 #### Examples
 
@@ -180,14 +180,14 @@ vanguard recovery [options]
 | `--show` | Show current TOTP seed and QR code (for re-enrollment). Also displays pending re-provisioned seed if `--auto-reseed` ran after firmware update |
 | `--disable` | Remove TOTP recovery seed from TPM NVRAM |
 | `--clean` | Forcefully remove old/legacy recovery NV indexes (for migration from older vanguard versions) |
-| `--auto-reseed` | Automatically re-provision recovery seed if unreadable (PCR 7 changed after firmware update). Non-interactive — for systemd service use |
+| `--auto-reseed` | Automatically re-provision recovery seed if unreadable (PCR 7 changed after firmware update). Non-interactive - for systemd service use |
 | `-l, --luks-device` | LUKS device path (used in recovery instructions) |
 | `--nv-index` | TPM NV index for recovery data (default: 0x01C30001) |
 
 #### Examples
 
 ```bash
-# Enable TOTP recovery (interactive — displays QR code, prompts for verification)
+# Enable TOTP recovery (interactive - displays QR code, prompts for verification)
 sudo vanguard recovery --enable
 
 # Show current seed and QR code
@@ -196,7 +196,7 @@ sudo vanguard recovery --show
 # Disable recovery
 sudo vanguard recovery --disable
 
-# Re-provision after firmware update (non-interactive — for systemd services)
+# Re-provision after firmware update (non-interactive - for systemd services)
 sudo vanguard recovery --auto-reseed
 
 # Clean legacy NV indexes (migration from older vanguard)
@@ -311,7 +311,7 @@ The generator automatically includes these binaries and their library dependenci
 | `fsck` | Generic filesystem check wrapper | Optional |
 | `fsck.ext4` / `e2fsck` | ext4 filesystem check | Optional |
 
-**LUKS and TPM2 operations use native Go** — no `cryptsetup` or `tpm2-tools` binaries are needed at runtime. The init binary handles LUKS header parsing, key derivation, dm-crypt setup, and TPM2 sealed key unseal internally.
+**LUKS and TPM2 operations use native Go** - no `cryptsetup` or `tpm2-tools` binaries are needed at runtime. The init binary handles LUKS header parsing, key derivation, dm-crypt setup, and TPM2 sealed key unseal internally.
 
 ## Included Files
 
