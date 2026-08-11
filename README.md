@@ -1,3 +1,5 @@
+
+
 <p align="center">
   <img src="assets/logo.png" alt="Vanguard Logo" width="200"/>
 </p>
@@ -83,7 +85,7 @@ For the full setup guide including partition layout, kernel command line, and fi
 |---------|-------------|
 | `vanguard generate` | Generate an initramfs image |
 | `vanguard update` | Update TPM2 PCRLock policy for a new UKI |
-| `vanguard enroll` | Enroll TPM2 token on a LUKS device (runs update + systemd-cryptenroll) |
+| `vanguard enroll` | Enroll TPM2 token on a LUKS device (runs update + systemd-cryptenroll; requires `-u` UKI path and `-l` block device) |
 | `vanguard verify` | Verify TPM2 pcrlock setup (PCRs, NV index, LUKS token) |
 | `vanguard status` | Show system protection status as a threat-model view |
 | `vanguard recovery` | Manage TOTP-based boot recovery (`--enable`, `--show`, `--disable`, `--clean`, `--auto-reseed`) |
