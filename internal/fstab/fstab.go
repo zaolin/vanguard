@@ -44,9 +44,14 @@ func Parse(path string) ([]Entry, error) {
 	return entries, scanner.Err()
 }
 
-// FindRoot returns the device for the root mountpoint from /etc/fstab
-func FindRoot() (string, error) {
-	entries, err := Parse("/etc/fstab")
+// FindRoot returns the device for the root mountpoint from the given fstab file.
+// If no path is provided, /etc/fstab is used.
+func FindRoot(path ...string) (string, error) {
+	fstabPath := "/etc/fstab"
+	if len(path) > 0 {
+		fstabPath = path[0]
+	}
+	entries, err := Parse(fstabPath)
 	if err != nil {
 		return "", err
 	}

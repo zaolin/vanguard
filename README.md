@@ -22,9 +22,8 @@ Vanguard binds disk encryption keys to the measured boot state of the platform. 
 | Physical debug attack (JTAG/DCI) | Debug interface lock, fused production part (via fwupd HSI / AMD HSTI) |
 | Firmware tampering (SPI flash/replay) | SPI write protection, replay protection, anti-rollback (via fwupd HSI / AMD HSTI) |
 | SMM attack (ring -2 rootkit) | SMM lock enforcement (via fwupd) |
+| Cold boot attack (RAM dump) | Memory encryption (AMD SME/TSME, Intel TME) - informational, does not affect tier |
 | Brute-force / key theft | TPM2 token with PIN, PCRLock binding, TOTP recovery fallback |
-
-Cold boot attack (RAM dump) is shown as informational - memory encryption (AMD SME/TSME, Intel TME) mitigates it but does not affect the protection tier.
 
 ### Protection Tiers
 

@@ -13,7 +13,7 @@ import (
 	"github.com/ulikunitz/xz"
 )
 
-const FirmwareBaseDir = "/lib/firmware"
+var FirmwareBaseDir = "/lib/firmware"
 
 // Supported compression extensions in order of preference
 var compressionExts = []string{"", ".zst", ".xz", ".gz"}
