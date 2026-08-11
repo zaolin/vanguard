@@ -205,18 +205,20 @@ func printEntry(hdr *cpio.Header, verbose bool) {
 
 // fileType returns a human-readable file type string from the CPIO mode.
 func fileType(mode cpio.FileMode) string {
-	switch {
-	case mode&cpio.TypeReg != 0:
+	// Mask off permission bits, keep only the type field (S_IFMT = 0170000)
+	typ := mode & 0170000
+	switch typ {
+	case cpio.TypeReg:
 		return "file"
-	case mode&cpio.TypeDir != 0:
+	case cpio.TypeDir:
 		return "dir"
-	case mode&cpio.TypeSymlink != 0:
+	case cpio.TypeSymlink:
 		return "symlink"
-	case mode&cpio.TypeChar != 0:
+	case cpio.TypeChar:
 		return "char"
-	case mode&cpio.TypeBlock != 0:
+	case cpio.TypeBlock:
 		return "block"
-	case mode&cpio.TypeFifo != 0:
+	case cpio.TypeFifo:
 		return "fifo"
 	default:
 		return "?"
