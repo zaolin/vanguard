@@ -175,12 +175,29 @@ jobs:
           echo "=== Go Test Coverage ==="
           go tool cover -func=test/gotest.out | tail -1
 
+          echo "=== Combined Coverage ==="
+          if [ -f test/qemu-cover.out ]; then
+            $(go env GOPATH)/bin/gocovmerge test/gotest.out test/qemu-cover.out > test/combined.out 2>/dev/null || \
+              go tool cover -func=test/gotest.out > /dev/null 2>&1
+            if [ -f test/combined.out ]; then
+              go tool cover -func=test/combined.out | tail -1
+            fi
+          fi
+
+      - name: Install gocovmerge
+        run: go install github.com/wadey/gocovmerge@latest
+
       - name: Check threshold
         run: |
+          # Merge coverage profiles for combined report
+          $(go env GOPATH)/bin/gocovmerge test/gotest.out test/qemu-cover.out > test/combined.out 2>/dev/null || cp test/gotest.out test/combined.out
+
+          COMBINED_COV=$(go tool cover -func=test/combined.out | tail -1 | awk '{print $3}' | tr -d '%')
           GOTEST_COV=$(go tool cover -func=test/gotest.out | tail -1 | awk '{print $3}' | tr -d '%')
           echo "Go test coverage: ${GOTEST_COV}%"
-          if [ $(echo "${GOTEST_COV} < 30" | bc) -eq 1 ]; then
-            echo "FAIL: Go test coverage ${GOTEST_COV}% < 30%"
+          echo "Combined coverage: ${COMBINED_COV}%"
+          if [ $(echo "${COMBINED_COV} < 30" | bc) -eq 1 ]; then
+            echo "FAIL: Combined coverage ${COMBINED_COV}% < 30%"
             exit 1
           fi
           echo "Coverage check passed"
@@ -191,6 +208,7 @@ jobs:
           path: |
             test/qemu-cover.out
             test/gotest.out
+            test/combined.out
             /tmp/cover-boot.log
 
       - name: Cleanup
