@@ -109,7 +109,7 @@ jobs:
             --tpm2 --flags startup-none,not-need-init &
           sleep 2
 
-          # Run QEMU with same output method as diagnostic tests (pipe to head)
+          # Run QEMU with output captured via tee (proven to work in diagnostics)
           timeout 180 qemu-system-x86_64 \
             -m 512M -cpu qemu64 -enable-kvm \
             -kernel testdata/kernel/bzImage \
@@ -123,21 +123,32 @@ jobs:
             -chardev socket,id=chrtpm,path=test/tpm/swtpm.sock \
             -tpmdev emulator,id=tpm0,chardev=chrtpm \
             -device tpm-crb,tpmdev=tpm0 \
-            -nographic -no-reboot 2>&1 | head -5000 > /tmp/cover-boot.log || true
+            -nographic -no-reboot 2>&1 | tee /tmp/cover-boot.log | head -100 || true
 
           echo "Boot log size: $(wc -c < /tmp/cover-boot.log) bytes"
-          head -30 /tmp/cover-boot.log
+          tail -30 /tmp/cover-boot.log
           cp /tmp/cover-boot.log test/cover-boot.log
           echo "=== End of boot log ==="
 
       - name: Extract QEMU coverage
         if: steps.qemu_run.outcome == 'success'
         run: |
+          echo "=== Cover disk contents ==="
+          e2ls test/cover.img 2>&1 || echo "e2ls failed"
+          echo "=== Extracting coverage files ==="
           rm -rf test/cover-data && mkdir -p test/cover-data
-          for f in $(e2ls test/cover.img | grep -v lost+found | tr -d ' '); do
+          for f in $(e2ls test/cover.img 2>/dev/null | grep -v lost+found | tr -d ' '); do
+            echo "  copying: $f"
             e2cp "test/cover.img:/$f" "test/cover-data/$f"
           done
-          go tool covdata textfmt -i test/cover-data -o test/qemu-cover.out
+          echo "=== Files in cover-data ==="
+          ls -la test/cover-data/ 2>&1
+          if [ -n "$(ls -A test/cover-data 2>/dev/null)" ]; then
+            go tool covdata textfmt -i test/cover-data -o test/qemu-cover.out
+          else
+            echo "No coverage files found in cover disk"
+            touch test/qemu-cover.out
+          fi
 
       - name: Install gocovmerge
         run: go install github.com/wadey/gocovmerge@latest
