@@ -67,7 +67,7 @@ PART="${LOOP}p2"; [ -e "${PART}" ] || PART="${LOOP}p1"
 
 echo -n "${LUKS_PASS}" | systemd-cryptenroll \
     --tpm2-device="swtpm:path=${TPM_SOCKET}" \
-    --wipe-slot=tpm2 --tpm2-with-pin=yes \
+    --wipe-slot=tpm2 --wipe-slot=tpm2 \
     --unlock-key-file=/dev/stdin "${PART}"
 
 echo "[INFO] Generating pcrlock policy..."
@@ -106,7 +106,7 @@ timeout 120 qemu-system-x86_64 \
     -m 512M -cpu host -enable-kvm \
     -kernel "${KERNEL}" \
     -initrd test/initramfs.img \
-    -append "root=/dev/vg0/root console=ttyS0 vanguard.testmode=1 panic=1 vanguard.testpin=${TPM_PIN} GOCOVERDIR=/cover" \
+    -append "root=/dev/vg0/root console=ttyS0 vanguard.testmode=1 panic=1 GOCOVERDIR=/cover" \
     -device virtio-scsi-pci,id=scsi0 \
     -device scsi-hd,drive=hd0,bus=scsi0.0 \
     -drive file=test/test-disk.raw,format=raw,id=hd0,if=none \

@@ -19,7 +19,7 @@ jobs:
             qemu-system-x86 swtpm swtpm-tools cryptsetup lvm2 \
             busybox gcc make mtools e2tools \
             efitools sbsigntool ovmf fwupd \
-            systemd systemd-ukify systemd-boot-efi
+            systemd systemd-cryptsetup systemd-ukify systemd-boot-efi
 
       - name: Build vanguard
         run: |
@@ -43,32 +43,27 @@ jobs:
         id: tpm_enroll
         run: |
           mkdir -p test/tpm
+          # Start swtpm with both server and ctrl sockets
           swtpm socket --tpmstate dir=test/tpm \
             --server type=unixio,path=test/tpm/swtpm.sock \
             --ctrl type=unixio,path=test/tpm/swtpm-ctrl.sock \
             --tpm2 --flags startup-clear,not-need-init &
-          sleep 1
+          sleep 2
 
           LOOP=$(sudo losetup -f --show test/test-disk.raw)
           sudo partprobe $LOOP; sleep 1
           PART="${LOOP}p2"; [ -e "$PART" ] || PART="${LOOP}p1"
 
-          # Non-interactive PIN enrollment using a PIN file
-          echo -n "1234" > /tmp/tpm-pin
+          # Enroll TPM token WITHOUT PIN (non-interactive)
           echo -n "testpass" | sudo systemd-cryptenroll \
             --tpm2-device="swtpm:path=test/tpm/swtpm.sock" \
-            --wipe-slot=tpm2 --tpm2-with-pin=yes \
-            --tpm2-pin-file=/tmp/tpm-pin \
-            --unlock-key-file=/dev/stdin "$PART" || {
-            # Fallback: enroll without PIN
-            echo -n "testpass" | sudo systemd-cryptenroll \
-              --tpm2-device="swtpm:path=test/tpm/swtpm.sock" \
-              --wipe-slot=tpm2 \
-              --unlock-key-file=/dev/stdin "$PART"
-          }
+            --wipe-slot=tpm2 \
+            --unlock-key-file=/dev/stdin "$PART"
 
+          # Generate pcrlock policy
           sudo SYSTEMD_TPM2_DEVICE="swtpm:path=test/tpm/swtpm.sock" \
-            /usr/lib/systemd/systemd-pcrlock make-policy --policy=test/pcrlock.json --pcr=23 --force || true
+            /usr/lib/systemd/systemd-pcrlock make-policy \
+            --policy=test/pcrlock.json --pcr=23 --force || true
 
           sudo pkill swtpm; sleep 1
           sudo losetup -d $LOOP
@@ -90,17 +85,18 @@ jobs:
         continue-on-error: true
         id: qemu_run
         run: |
+          # Restart swtpm with preserved state
           swtpm socket --tpmstate dir=test/tpm \
             --server type=unixio,path=test/tpm/swtpm.sock \
             --ctrl type=unixio,path=test/tpm/swtpm-ctrl.sock \
             --tpm2 --flags startup-none,not-need-init &
-          sleep 1
+          sleep 2
 
           timeout 120 qemu-system-x86_64 \
             -m 512M -cpu host -enable-kvm \
             -kernel testdata/kernel/bzImage \
             -initrd test/initramfs.img \
-            -append "root=/dev/vg0/root console=ttyS0 vanguard.testmode=1 panic=1 vanguard.testpin=1234 GOCOVERDIR=/cover" \
+            -append "root=/dev/vg0/root console=ttyS0 vanguard.testmode=1 panic=1 GOCOVERDIR=/cover" \
             -device virtio-scsi-pci,id=scsi0 \
             -device scsi-hd,drive=hd0,bus=scsi0.0 \
             -drive file=test/test-disk.raw,format=raw,id=hd0,if=none \
