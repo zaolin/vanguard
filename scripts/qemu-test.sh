@@ -20,13 +20,30 @@ TPM_PIN="1234"  # PIN for TPM-protected unlock
 TPM_DIR="${TEST_DIR}/tpm"
 TPM_SOCKET="${TEST_DIR}/swtpm.sock"
 
-# OVMF / Secure Boot test paths
+# OVMF / Secure Boot test paths (auto-detect Gentoo vs Ubuntu paths)
+detect_ovmf_paths() {
+    for dir in /usr/share/edk2/OvmfX64 /usr/share/OVMF; do
+        if [ -f "${dir}/OVMF_CODE.secboot.fd" ]; then
+            OVMF_CODE_SECBOOT="${dir}/OVMF_CODE.secboot.fd"
+            OVMF_VARS_SECBOOT_TEMPLATE="${dir}/OVMF_VARS.secboot.fd"
+            OVMF_CODE_NONSECURE="${dir}/OVMF_CODE.fd"
+            OVMF_VARS_NONSECURE_TEMPLATE="${dir}/OVMF_VARS.fd"
+            return 0
+        fi
+    done
+    # Fallback: try ovmf package paths (Ubuntu)
+    if [ -f "/usr/share/OVMF/OVMF_CODE.secboot.fd" ]; then
+        OVMF_CODE_SECBOOT="/usr/share/OVMF/OVMF_CODE.secboot.fd"
+        OVMF_VARS_SECBOOT_TEMPLATE="/usr/share/OVMF/OVMF_VARS.secboot.fd"
+        OVMF_CODE_NONSECURE="/usr/share/OVMF/OVMF_CODE.fd"
+        OVMF_VARS_NONSECURE_TEMPLATE="/usr/share/OVMF/OVMF_VARS.fd"
+    fi
+}
+detect_ovmf_paths
+
+# Test data directories
 KEY_DIR="${TEST_DIR}/keys"
 OVMF_DIR="${TEST_DIR}/ovmf"
-OVMF_CODE_SECBOOT="/usr/share/edk2/OvmfX64/OVMF_CODE.secboot.fd"
-OVMF_VARS_SECBOOT_TEMPLATE="/usr/share/edk2/OvmfX64/OVMF_VARS.secboot.fd"
-OVMF_CODE_NONSECURE="/usr/share/edk2/OvmfX64/OVMF_CODE.fd"
-OVMF_VARS_NONSECURE_TEMPLATE="/usr/share/edk2/OvmfX64/OVMF_VARS.fd"
 PROVISION_INITRAMFS="${OVMF_DIR}/provision-initramfs.img"
 PROVISION_KERNEL="${OVMF_DIR}/provision-vmlinuz"
 TEST_UKI="${TEST_DIR}/test-uki.efi"
