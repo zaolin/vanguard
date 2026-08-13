@@ -592,9 +592,12 @@ func mountTestCoverDisk() error {
 		return fmt.Errorf("mkdir /cover: %w", err)
 	}
 
-	// Mount as vfat (read-write)
-	if err := unix.Mount(coverDev, "/cover", "vfat", 0, ""); err != nil {
-		return fmt.Errorf("mount %s: %w", coverDev, err)
+	// Mount as ext4 or vfat (read-write) - try ext4 first, then vfat
+	if err := unix.Mount(coverDev, "/cover", "ext4", 0, ""); err != nil {
+		buildtags.Debug("vanguard: ext4 mount failed (%v), trying vfat\n", err)
+		if err := unix.Mount(coverDev, "/cover", "vfat", 0, ""); err != nil {
+			return fmt.Errorf("mount %s: %w", coverDev, err)
+		}
 	}
 
 	// Set GOCOVERDIR so Go runtime writes coverage data here
