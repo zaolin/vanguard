@@ -122,7 +122,7 @@ jobs:
             -chardev socket,id=chrtpm,path=test/tpm/swtpm.sock \
             -tpmdev emulator,id=tpm0,chardev=chrtpm \
             -device tpm-crb,tpmdev=tpm0 \
-            -serial stdio -display none -no-reboot > test/cover-boot.log 2>&1 || true
+            -nographic -no-reboot 2>&1 | tee test/cover-boot.log || true
 
           echo "Boot log size: $(wc -c < test/cover-boot.log) bytes"
           head -30 test/cover-boot.log
