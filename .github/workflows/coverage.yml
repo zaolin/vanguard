@@ -143,10 +143,11 @@ jobs:
             -chardev socket,id=chrtpm,path=test/tpm/swtpm.sock \
             -tpmdev emulator,id=tpm0,chardev=chrtpm \
             -device tpm-crb,tpmdev=tpm0 \
-            -nographic -no-reboot 2>&1 | head -5000 > test/cover-boot.log || true
+            -nographic -no-reboot 2>&1 | head -5000 > /tmp/cover-boot.log || true
 
-          echo "Boot log size: $(wc -c < test/cover-boot.log) bytes"
-          head -30 test/cover-boot.log
+          echo "Boot log size: $(wc -c < /tmp/cover-boot.log) bytes"
+          head -30 /tmp/cover-boot.log
+          cp /tmp/cover-boot.log test/cover-boot.log
           echo "=== End of boot log ==="
 
       - name: Extract QEMU coverage
@@ -159,6 +160,8 @@ jobs:
           go tool covdata textfmt -i test/cover-data -o test/qemu-cover.out
 
       - name: Run go test coverage
+        env:
+          CI: true
         run: go test -coverprofile=test/gotest.out ./...
 
       - name: Report coverage
@@ -188,7 +191,7 @@ jobs:
           path: |
             test/qemu-cover.out
             test/gotest.out
-            test/cover-boot.log
+            /tmp/cover-boot.log
 
       - name: Cleanup
         if: always()

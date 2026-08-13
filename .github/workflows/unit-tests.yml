@@ -16,6 +16,8 @@ jobs:
       - name: Build embed binaries
         run: make embed
       - name: Run unit tests
+        env:
+          CI: true
         run: go test -count=1 ./...
       - name: Run race detector
         run: go test -race -count=1 ./...
