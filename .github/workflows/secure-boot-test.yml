@@ -18,7 +18,9 @@ jobs:
             systemd systemd-boot-efi
 
       - name: Build vanguard
-        run: go build -o vanguard ./cmd/vanguard/
+        run: |
+          make embed
+          go build -o vanguard ./cmd/vanguard/
 
       - name: Provision OVMF Secure Boot keys
         run: |
