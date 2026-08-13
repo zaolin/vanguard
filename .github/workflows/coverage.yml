@@ -98,12 +98,11 @@ jobs:
           sleep 2
 
           # QEMU with KVM, serial output captured to boot log
-          # Use -serial mon:stdio for proper serial capture
           timeout 180 qemu-system-x86_64 \
             -m 512M -cpu host -enable-kvm \
             -kernel testdata/kernel/bzImage \
             -initrd test/initramfs.img \
-            -append "root=/dev/vg0/root console=ttyS0 vanguard.testmode=1 panic=1 GOCOVERDIR=/cover" \
+            -append "root=/dev/vg0/root console=ttyS0,115200 earlyprintk=serial vanguard.testmode=1 panic=1 GOCOVERDIR=/cover" \
             -device virtio-scsi-pci,id=scsi0 \
             -device scsi-hd,drive=hd0,bus=scsi0.0 \
             -drive file=test/test-disk.raw,format=raw,id=hd0,if=none \
@@ -112,10 +111,11 @@ jobs:
             -chardev socket,id=chrtpm,path=test/tpm/swtpm.sock \
             -tpmdev emulator,id=tpm0,chardev=chrtpm \
             -device tpm-crb,tpmdev=tpm0 \
-            -serial mon:stdio -display none -no-reboot > test/cover-boot.log 2>&1 || true
+            -nographic -no-reboot > test/cover-boot.log 2>&1 || true
 
           echo "Boot log size: $(wc -c < test/cover-boot.log) bytes"
-          head -20 test/cover-boot.log
+          head -30 test/cover-boot.log
+          echo "=== End of boot log ==="
 
       - name: Extract QEMU coverage
         if: steps.qemu_run.outcome == 'success'
