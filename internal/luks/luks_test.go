@@ -173,7 +173,6 @@ func TestLuks2PassphrasePBKDF2(t *testing.T) {
 
 func TestLuks2MultipleKeyslots(t *testing.T) {
 	skipIfNoCryptsetup(t)
-	
 
 	password1 := "firstpass"
 	disk := prepareLuks2Disk(t, password1)
