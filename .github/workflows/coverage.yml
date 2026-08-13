@@ -177,8 +177,8 @@ jobs:
           GOTEST_COV=$(go tool cover -func=test/gotest.out | tail -1 | awk '{print $3}' | tr -d '%')
           echo "Go test coverage: ${GOTEST_COV}%"
           echo "Combined coverage: ${COMBINED_COV}%"
-          if [ $(echo "${COMBINED_COV} < 30" | bc) -eq 1 ]; then
-            echo "FAIL: Combined coverage ${COMBINED_COV}% < 30%"
+          if [ $(echo "${COMBINED_COV} < 34" | bc) -eq 1 ]; then
+            echo "FAIL: Combined coverage ${COMBINED_COV}% < 34%"
             exit 1
           fi
           echo "Coverage check passed"
