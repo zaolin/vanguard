@@ -129,8 +129,7 @@ jobs:
             --tpm2 --flags startup-none,not-need-init &
           sleep 2
 
-          # Run QEMU in background, capture output to file
-          # Use process substitution to avoid pipe buffering issues
+          # Run QEMU with same output method as diagnostic tests (pipe to head)
           timeout 180 qemu-system-x86_64 \
             -m 512M -cpu qemu64 -enable-kvm \
             -kernel testdata/kernel/bzImage \
@@ -144,12 +143,7 @@ jobs:
             -chardev socket,id=chrtpm,path=test/tpm/swtpm.sock \
             -tpmdev emulator,id=tpm0,chardev=chrtpm \
             -device tpm-crb,tpmdev=tpm0 \
-            -nographic -no-reboot &> test/cover-boot.log &
-          QEMU_PID=$!
-
-          # Wait for QEMU to finish or timeout
-          sleep 180 && kill $QEMU_PID 2>/dev/null || true
-          wait $QEMU_PID 2>/dev/null || true
+            -nographic -no-reboot 2>&1 | head -5000 > test/cover-boot.log || true
 
           echo "Boot log size: $(wc -c < test/cover-boot.log) bytes"
           head -30 test/cover-boot.log
