@@ -125,8 +125,17 @@ A systemd unit (`vanguard-pcrlock-relock.service`) is shipped for automatic poli
 ## Testing
 
 ```bash
-# QEMU test with software TPM
+# QEMU test with software TPM (direct kernel boot, no UEFI)
 ./scripts/qemu-test.sh all-tpm
+
+# Full UEFI test (OVMF non-secure + swtpm + UKI on ESP)
+./scripts/qemu-test.sh all-uefi
+
+# Full Secure Boot test (OVMF secboot + swtpm + signed UKI)
+# First provision OVMF with self-generated keys:
+./scripts/qemu-test.sh provision-ovmf
+# Then run the full chain:
+./scripts/qemu-test.sh all-secure
 
 # Unit tests
 go test ./internal/tpm/...    # TPM2 policy + recovery

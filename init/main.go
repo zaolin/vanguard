@@ -7,6 +7,8 @@ import (
 	"strings"
 	"time"
 
+	"golang.org/x/sys/unix"
+
 	"github.com/zaolin/vanguard/init/bootlog"
 	"github.com/zaolin/vanguard/init/buildtags"
 	"github.com/zaolin/vanguard/init/console"
@@ -27,6 +29,32 @@ import (
 // earlyBootMounted tracks whether /boot was mounted during early init.
 // Used by cleanupAndHalt to know whether to unmount on failure paths.
 var earlyBootMounted bool
+
+// init runs before main(). In test mode, we need to set GOCOVERDIR
+// from the kernel cmdline before the Go coverage runtime tries to emit data.
+// The coverage runtime checks GOCOVERDIR on process exit, so setting it
+// here (before main) ensures it's available.
+func init() {
+	// /proc/cmdline is available because the kernel mounts procfs
+	// before running init (PID 1). This init() runs before main()
+	// and before Go's coverage runtime tries to emit data.
+	data, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		return
+	}
+	cmdline := string(data)
+	// Check for GOCOVERDIR= in cmdline
+	for _, param := range strings.Fields(cmdline) {
+		if strings.HasPrefix(param, "GOCOVERDIR=") {
+			dir := strings.TrimPrefix(param, "GOCOVERDIR=")
+			// Create the directory on the rootfs (initramfs tmpfs).
+			// The cover disk will be mounted on top later.
+			os.MkdirAll(dir, 0755)
+			os.Setenv("GOCOVERDIR", dir)
+			return
+		}
+	}
+}
 
 func main() {
 	// 1. Setup early console for debugging and passphrase prompts
@@ -54,6 +82,16 @@ func main() {
 	if err := mount.Essential(); err != nil {
 		console.Print("vanguard: failed to mount filesystems: %v\n", err)
 		halt()
+	}
+
+	// Check for test mode (vanguard.testmode=1 in kernel cmdline)
+	testMode := isTestMode()
+	if testMode {
+		console.Print("vanguard: test mode enabled\n")
+		// Mount the cover disk (FAT-formatted virtio-blk at /dev/vdb)
+		if err := mountTestCoverDisk(); err != nil {
+			console.Print("vanguard: warning: cover disk mount failed: %v\n", err)
+		}
 	}
 
 	// 3. Configure vconsole (keymap + font) BEFORE any password prompts
@@ -322,6 +360,15 @@ func main() {
 	// 18. Close boot log and unmount /boot before switchroot
 	bootlog.Log(bootlog.EventSwitchroot, "target", "/sysroot")
 	bootlog.Close()
+
+	// In test mode: flush coverage data and exit instead of switchroot
+	if testMode {
+		console.Print("vanguard: test mode — flushing coverage data and exiting\n")
+		// Sync filesystems to ensure coverage data is written
+		unix.Sync()
+		// os.Exit triggers Go runtime to flush coverage data to GOCOVERDIR
+		os.Exit(0)
+	}
 	if earlyBootMounted {
 		buildtags.Debug("vanguard: unmounting early /boot\n")
 		if err := mount.UnmountBootEarly(); err != nil {
@@ -416,6 +463,17 @@ func discoverModules() []string {
 }
 
 func halt() {
+	if isTestMode() {
+		console.Print("vanguard: test mode — flushing coverage data\n")
+		// os.Exit(0) triggers Go's coverage flush (writes .cov files to GOCOVERDIR).
+		// The kernel will panic ("Attempted to kill init!") but the coverage
+		// files are written synchronously before the exit syscall returns.
+		// The kernel panic happens AFTER the process exits, so the files
+		// should already be on the FAT disk.
+		// We call unix.Sync() first to flush any pending FAT metadata writes.
+		unix.Sync()
+		os.Exit(0)
+	}
 	console.Print("vanguard: system halted\n")
 	console.Print("vanguard: press Ctrl+Alt+Del to reboot\n")
 	for {
@@ -471,4 +529,77 @@ func loadTPMModulesIfNeeded() {
 			buildtags.Debug("vanguard: tpm module %s loaded\n", mod)
 		}
 	}
+}
+
+// isTestMode checks the kernel command line for vanguard.testmode=1.
+func isTestMode() bool {
+	data, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), "vanguard.testmode=1")
+}
+
+// mountTestCoverDisk mounts a FAT-formatted virtio-blk disk for Go coverage
+// data export. Scans /dev for the cover disk (vda, vdb, sda, sdb).
+func mountTestCoverDisk() error {
+	// If /cover is already mounted (by the C wrapper), just set GOCOVERDIR
+	if mount.IsMounted("/cover") {
+		os.Setenv("GOCOVERDIR", "/cover")
+		console.Print("vanguard: cover disk already mounted at /cover\n")
+		return nil
+	}
+
+	// Try common device names for the cover disk
+	// virtio-blk-pci shows up as /dev/vda, /dev/vdb, etc.
+	// The test disk is on virtio-scsi, so virtio-blk should be /dev/vda
+	candidates := []string{"/dev/vda", "/dev/vdb", "/dev/sda", "/dev/sdb"}
+
+	// Wait for devtmpfs to populate (up to 3 seconds)
+	var coverDev string
+	for attempt := 0; attempt < 30; attempt++ {
+		for _, dev := range candidates {
+			if _, err := os.Stat(dev); err == nil {
+				// Skip the root disk - check if it's already the LUKS disk
+				// by reading the first few bytes (LUKS magic)
+				f, err := os.Open(dev)
+				if err != nil {
+					continue
+				}
+				magic := make([]byte, 6)
+				f.Read(magic)
+				f.Close()
+				if string(magic[:4]) == "LUKS" {
+					continue // This is the LUKS disk, not the cover disk
+				}
+				coverDev = dev
+				break
+			}
+		}
+		if coverDev != "" {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+
+	if coverDev == "" {
+		console.Print("vanguard: no cover disk found after waiting\n")
+		return nil
+	}
+
+	// Create mount point on rootfs (initramfs tmpfs, always writable)
+	if err := os.MkdirAll("/cover", 0755); err != nil {
+		return fmt.Errorf("mkdir /cover: %w", err)
+	}
+
+	// Mount as vfat (read-write)
+	if err := unix.Mount(coverDev, "/cover", "vfat", 0, ""); err != nil {
+		return fmt.Errorf("mount %s: %w", coverDev, err)
+	}
+
+	// Set GOCOVERDIR so Go runtime writes coverage data here
+	os.Setenv("GOCOVERDIR", "/cover")
+	console.Print("vanguard: cover disk mounted at /cover (%s)\n", coverDev)
+
+	return nil
 }

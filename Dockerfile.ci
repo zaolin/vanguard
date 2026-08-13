@@ -1,0 +1,34 @@
+FROM ubuntu:24.04
+
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    golang \
+    qemu-system-x86 \
+    swtpm \
+    swtpm-tools \
+    cryptsetup \
+    lvm2 \
+    busybox \
+    gcc \
+    make \
+    mtools \
+    e2tools \
+    ca-certificates \
+    curl \
+    git \
+    efitools \
+    sbsigntool \
+    && rm -rf /var/lib/apt/lists/*
+
+# systemd (includes systemd-pcrlock and ukify)
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    systemd \
+    systemd-boot-efi \
+    && rm -rf /var/lib/apt/lists/*
+
+# Verify key tools
+RUN go version && \
+    qemu-system-x86_64 --version | head -1 && \
+    swtpm --version | head -1 && \
+    cryptsetup --version | head -1
+
+WORKDIR /workspace

@@ -1,6 +1,9 @@
 package mount
 
-import "testing"
+import (
+	"os"
+	"testing"
+)
 
 func TestHasOption(t *testing.T) {
 	tests := []struct {
@@ -71,4 +74,61 @@ func TestGetRootFromCmdline(t *testing.T) {
 
 func TestGetBootFromCmdline(t *testing.T) {
 	_ = getBootFromCmdline()
+}
+
+func TestDetectFSTypeExt4(t *testing.T) {
+	// Create a temp file with ext4 magic at offset 0x438
+	f, err := os.CreateTemp("", "ext4-test-*.img")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+
+	// ext4 magic: 0x53 0xEF at offset 0x438 (big-endian: 0xEF53)
+	data := make([]byte, 0x43A+1)
+	data[0x438] = 0x53
+	data[0x439] = 0xEF
+	if _, err := f.Write(data); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.Close()
+
+	fsType, err := detectFSType(f.Name())
+	if err != nil {
+		t.Fatalf("detectFSType: %v", err)
+	}
+	if fsType != "ext4" {
+		t.Errorf("detectFSType ext4: got %q, want ext4", fsType)
+	}
+}
+
+func TestDetectFSTypeXFS(t *testing.T) {
+	// XFS magic: "XFSB" at offset 0
+	f, err := os.CreateTemp("", "xfs-test-*.img")
+	if err != nil {
+		t.Fatalf("CreateTemp: %v", err)
+	}
+	defer os.Remove(f.Name())
+
+	data := make([]byte, 4096)
+	copy(data[0:4], []byte("XFSB"))
+	if _, err := f.Write(data); err != nil {
+		t.Fatalf("Write: %v", err)
+	}
+	f.Close()
+
+	fsType, err := detectFSType(f.Name())
+	if err != nil {
+		t.Fatalf("detectFSType: %v", err)
+	}
+	if fsType != "xfs" {
+		t.Errorf("detectFSType xfs: got %q, want xfs", fsType)
+	}
+}
+
+func TestDetectFSTypeMissing(t *testing.T) {
+	_, err := detectFSType("/nonexistent/device")
+	if err == nil {
+		t.Error("expected error for missing file")
+	}
 }

@@ -5,7 +5,9 @@ import (
 	"crypto/sha256"
 	"crypto/sha512"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -283,4 +285,66 @@ func TestBytesEqualUtil(t *testing.T) {
 	if bytes.Equal(a, c) {
 		t.Error("different slices should not match")
 	}
+}
+
+func TestTryOpenLUKS(t *testing.T) {
+	skipIfNoCryptsetup(t)
+	// Create a real LUKS2 image
+	disk := prepareLuks2DiskForTesting(t, "testpass")
+	defer os.Remove(disk.Name())
+	disk.Close()
+
+	dev, err := tryOpenLUKS(disk.Name())
+	if err != nil {
+		t.Fatalf("tryOpenLUKS: %v", err)
+	}
+	if dev.Path == "" {
+		t.Error("expected non-empty path")
+	}
+	if dev.UUID == "" {
+		t.Error("expected non-empty UUID")
+	}
+}
+
+func TestTryOpenLUKSNotLUKS(t *testing.T) {
+	f, _ := os.CreateTemp("", "notluks-*.bin")
+	f.Write([]byte("not a LUKS device"))
+	f.Close()
+	defer os.Remove(f.Name())
+
+	_, err := tryOpenLUKS(f.Name())
+	if err == nil {
+		t.Error("expected error for non-LUKS file")
+	}
+}
+
+func TestTryOpenLUKSMissing(t *testing.T) {
+	_, err := tryOpenLUKS("/nonexistent/device")
+	if err == nil {
+		t.Error("expected error for missing file")
+	}
+}
+
+func TestDetect(t *testing.T) {
+	// Detect scans /sys/block - on a real system this should work
+	// Just verify it doesn't panic
+	_, err := Detect()
+	// It might return empty on test systems without block devices
+	_ = err
+}
+
+func prepareLuks2DiskForTesting(t *testing.T, password string) *os.File {
+	t.Helper()
+	disk, _ := os.CreateTemp("", "vanguard-luks-test-*.img")
+	disk.Truncate(24 * 1024 * 1024)
+	disk.Close()
+
+	cmd := exec.Command("cryptsetup", "luksFormat", "--type", "luks2", "-q", "--iter-time", "5", disk.Name())
+	cmd.Stdin = strings.NewReader(password)
+	if err := cmd.Run(); err != nil {
+		t.Fatalf("cryptsetup luksFormat: %v", err)
+	}
+
+	f, _ := os.Open(disk.Name())
+	return f
 }

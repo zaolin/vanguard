@@ -85,8 +85,9 @@ type LockoutStatus struct {
 
 // Client provides TPM 2.0 operations.
 type Client struct {
-	device string
-	mu     sync.Mutex // protects device field during openTPM fallback
+	device    string
+	transport transport.TPMCloser // if non-nil, used instead of opening a device
+	mu        sync.Mutex          // protects device field during openTPM fallback
 }
 
 // DefaultDevice is the default TPM device path.
@@ -108,9 +109,18 @@ func NewWithDevice(device string) *Client {
 	return &Client{device: device}
 }
 
+// NewWithTransport creates a new TPM client backed by an injectable transport.
+// This is used for testing with swtpm or other TPM simulators.
+func NewWithTransport(t transport.TPMCloser) *Client {
+	return &Client{transport: t}
+}
+
 // WaitForDevice waits for the TPM device to become available.
 // Returns true if the device is ready, false if timeout.
 func (c *Client) WaitForDevice(timeout time.Duration) bool {
+	if c.transport != nil {
+		return true // transport already connected
+	}
 	deadline := time.Now().Add(timeout)
 	devices := []string{c.device, FallbackDevice}
 
@@ -130,6 +140,11 @@ func (c *Client) WaitForDevice(timeout time.Duration) bool {
 func (c *Client) openTPM() (transport.TPMCloser, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
+
+	// If an injectable transport is set, use it directly
+	if c.transport != nil {
+		return c.transport, nil
+	}
 
 	tpm, err := linuxtpm.Open(c.device)
 	if err != nil {

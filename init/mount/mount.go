@@ -32,6 +32,10 @@ func Essential() error {
 		if err := os.MkdirAll(m.target, 0755); err != nil {
 			return fmt.Errorf("mkdir %s: %w", m.target, err)
 		}
+		// Skip if already mounted (e.g. by a test wrapper)
+		if IsMounted(m.target) {
+			continue
+		}
 		if err := unix.Mount(m.source, m.target, m.fstype, m.flags, m.data); err != nil {
 			return fmt.Errorf("mount %s on %s: %w", m.source, m.target, err)
 		}

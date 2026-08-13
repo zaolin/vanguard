@@ -20,6 +20,18 @@ TPM_PIN="1234"  # PIN for TPM-protected unlock
 TPM_DIR="${TEST_DIR}/tpm"
 TPM_SOCKET="${TEST_DIR}/swtpm.sock"
 
+# OVMF / Secure Boot test paths
+KEY_DIR="${TEST_DIR}/keys"
+OVMF_DIR="${TEST_DIR}/ovmf"
+OVMF_CODE_SECBOOT="/usr/share/edk2/OvmfX64/OVMF_CODE.secboot.fd"
+OVMF_VARS_SECBOOT_TEMPLATE="/usr/share/edk2/OvmfX64/OVMF_VARS.secboot.fd"
+OVMF_CODE_NONSECURE="/usr/share/edk2/OvmfX64/OVMF_CODE.fd"
+OVMF_VARS_NONSECURE_TEMPLATE="/usr/share/edk2/OvmfX64/OVMF_VARS.fd"
+PROVISION_INITRAMFS="${OVMF_DIR}/provision-initramfs.img"
+PROVISION_KERNEL="${OVMF_DIR}/provision-vmlinuz"
+TEST_UKI="${TEST_DIR}/test-uki.efi"
+ESP_IMG="${TEST_DIR}/esp.img"
+
 # Console size simulation (rows cols)
 # Default to 128x48 (approx 1024x768 standard console) if not set
 CONSOLE_SIZE="${CONSOLE_SIZE:-48 128}"
@@ -65,6 +77,11 @@ find_kernel() {
             realpath "${PROJECT_DIR}/${kernel}"
             return
         fi
+    fi
+    # Check for pre-compiled test kernel
+    if [ -f "${PROJECT_DIR}/testdata/kernel/bzImage" ]; then
+        realpath "${PROJECT_DIR}/testdata/kernel/bzImage"
+        return
     fi
     for k in /boot/vmlinuz-* /boot/vmlinuz; do
         [ -f "$k" ] && realpath "$k" && return
@@ -559,6 +576,271 @@ clean() {
 }
 
 #=============================================================================
+# OVMF / Secure Boot Functions
+#=============================================================================
+
+check_ovmf_deps() {
+    for cmd in openssl cert-to-efi-sig-list sign-efi-sig-list efi-updatevar sbsign ukify objcopy; do
+        command -v "$cmd" &>/dev/null || missing+=("$cmd")
+    done
+    [ -f "$OVMF_CODE_SECBOOT" ] || error "OVMF Secure Boot CODE not found: $OVMF_CODE_SECBOOT"
+    [ -f "$OVMF_VARS_SECBOOT_TEMPLATE" ] || error "OVMF Secure Boot VARS template not found: $OVMF_VARS_SECBOOT_TEMPLATE"
+}
+
+generate_secureboot_keys() {
+    info "Generating Secure Boot test keys..."
+    mkdir -p "$KEY_DIR"
+
+    # PK (Platform Key - root of trust)
+    openssl req -new -x509 -newkey rsa:2048 -keyout "${KEY_DIR}/PK.key" \
+        -out "${KEY_DIR}/PK.crt" -days 3650 -nodes \
+        -subj "/CN=Vanguard Test PK" 2>/dev/null
+
+    # KEK (Key Exchange Key)
+    openssl req -new -x509 -newkey rsa:2048 -keyout "${KEY_DIR}/KEK.key" \
+        -out "${KEY_DIR}/KEK.crt" -days 3650 -nodes \
+        -subj "/CN=Vanguard Test KEK" 2>/dev/null
+
+    # db (signature database)
+    openssl req -new -x509 -newkey rsa:2048 -keyout "${KEY_DIR}/db.key" \
+        -out "${KEY_DIR}/db.crt" -days 3650 -nodes \
+        -subj "/CN=Vanguard Test db" 2>/dev/null
+
+    # Create ESL files
+    local EFI_GLOBAL_GUID="8be4df61-93ca-11d2-aa0d-00e098032b8c"
+    local EFI_DB_GUID="d719b2cb-3d3a-4596-a3bc-dad00e67656f"
+
+    cert-to-efi-sig-list -g "$EFI_GLOBAL_GUID" "${KEY_DIR}/PK.crt" "${KEY_DIR}/PK.esl"
+    cert-to-efi-sig-list -g "$EFI_GLOBAL_GUID" "${KEY_DIR}/KEK.crt" "${KEY_DIR}/KEK.esl"
+    cert-to-efi-sig-list -g "$EFI_DB_GUID" "${KEY_DIR}/db.crt" "${KEY_DIR}/db.esl"
+
+    # Create signed auth files
+    sign-efi-sig-list -k "${KEY_DIR}/PK.key" -c "${KEY_DIR}/PK.crt" \
+        PK "${KEY_DIR}/PK.esl" "${KEY_DIR}/PK.auth" 2>/dev/null
+    sign-efi-sig-list -k "${KEY_DIR}/PK.key" -c "${KEY_DIR}/PK.crt" \
+        KEK "${KEY_DIR}/KEK.esl" "${KEY_DIR}/KEK.auth" 2>/dev/null
+    sign-efi-sig-list -k "${KEY_DIR}/KEK.key" -c "${KEY_DIR}/KEK.crt" \
+        db "${KEY_DIR}/db.esl" "${KEY_DIR}/db.auth" 2>/dev/null
+
+    info "Keys generated: ${KEY_DIR}/"
+}
+
+build_provision_initramfs() {
+    info "Building OVMF provisioning initramfs..."
+    mkdir -p "$OVMF_DIR"
+
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    mkdir -p "$tmpdir"/{bin,dev,proc,sys,etc/keys,var,run,tmp}
+
+    # Busybox
+    local BB=$(which busybox)
+    cp "$BB" "$tmpdir/bin/busybox"
+    for cmd in sh mount umount ls cat echo sleep poweroff mkdir cp od; do
+        ln -sf busybox "$tmpdir/bin/$cmd"
+    done
+
+    # efi-updatevar
+    local EFI_UPDATEVAR=$(which efi-updatevar)
+    cp "$EFI_UPDATEVAR" "$tmpdir/bin/efi-updatevar"
+    ldd "$EFI_UPDATEVAR" 2>/dev/null | grep -o '/[^ ]*' | while read lib; do
+        mkdir -p "$tmpdir$(dirname "$lib")"
+        cp "$lib" "$tmpdir$lib" 2>/dev/null || true
+    done
+
+    # Copy auth files
+    cp "${KEY_DIR}/PK.auth" "${KEY_DIR}/KEK.auth" "${KEY_DIR}/db.auth" "$tmpdir/etc/keys/"
+
+    # Init script
+    cat > "$tmpdir/init" << 'PROVISION_INIT'
+#!/bin/sh
+mount -t proc proc /proc
+mount -t sysfs sysfs /sys
+mount -t devtmpfs devtmpfs /dev
+mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null
+
+echo "=== OVMF Secure Boot Key Provisioning ==="
+[ -d /sys/firmware/efi/efivars ] || { echo "ERROR: efivarfs not available"; poweroff -f; }
+
+# Check Setup Mode
+SM="/sys/firmware/efi/efivars/SetupMode-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+[ -f "$SM" ] && echo "Setup Mode: $(od -A n -t u1 -j 4 "$SM" 2>/dev/null | tr -d ' ')"
+
+echo "Enrolling keys..."
+efi-updatevar -f /etc/keys/db.auth db 2>&1 && echo "db: OK"
+efi-updatevar -f /etc/keys/KEK.auth KEK 2>&1 && echo "KEK: OK"
+efi-updatevar -f /etc/keys/PK.auth PK 2>&1 && echo "PK: OK (locked)"
+
+# Verify
+SB="/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c"
+[ -f "$SB" ] && echo "Secure Boot: $(od -A n -t u1 -j 4 "$SB" 2>/dev/null | tr -d ' ')"
+
+sleep 2
+echo "Powering off..."
+poweroff -f
+PROVISION_INIT
+    chmod +x "$tmpdir/init"
+
+    cd "$tmpdir"
+    find . -print0 | cpio --null -o -H newc 2>/dev/null | gzip -9 > "$PROVISION_INITRAMFS"
+    cd - > /dev/null
+    rm -rf "$tmpdir"
+    info "Provisioning initramfs: ${PROVISION_INITRAMFS}"
+}
+
+find_helper_kernel() {
+    info "Finding kernel for helper VM..."
+    if [ -f /boot/EFI/Gentoo/kernel.efi ]; then
+        cp /boot/EFI/Gentoo/kernel.efi /tmp/extract-uki.efi 2>/dev/null
+        if objcopy --dump-section .linux="$PROVISION_KERNEL" /tmp/extract-uki.efi 2>/dev/null; then
+            rm -f /tmp/extract-uki.efi
+            info "Kernel extracted from UKI: $PROVISION_KERNEL"
+            return 0
+        fi
+        rm -f /tmp/extract-uki.efi
+    fi
+    for k in /boot/vmlinuz-* /boot/vmlinuz; do
+        [ -f "$k" ] && { cp "$k" "$PROVISION_KERNEL"; info "Using kernel: $k"; return 0; }
+    done
+    error "No kernel found"
+}
+
+provision_ovmf() {
+    check_ovmf_deps
+    generate_secureboot_keys
+    build_provision_initramfs
+    find_helper_kernel
+
+    info "Booting helper VM to provision OVMF..."
+    cp "$OVMF_VARS_SECBOOT_TEMPLATE" "${OVMF_DIR}/OVMF_VARS.secboot.fd"
+
+    pkill -f "swtpm socket.*${TPM_SOCKET}" 2>/dev/null || true
+    rm -f "$TPM_SOCKET" "${TPM_SOCKET}.ctrl"
+    rm -rf "$TPM_DIR"; mkdir -p "$TPM_DIR"
+
+    swtpm socket \
+        --tpmstate dir="$TPM_DIR" \
+        --ctrl type=unixio,path="$TPM_SOCKET" \
+        --tpm2 \
+        --flags startup-clear,not-need-init \
+        --log level=1,file="${TPM_DIR}/swtpm.log" &
+
+    local swtpm_pid=$!
+    sleep 1
+    [ -S "$TPM_SOCKET" ] || error "swtpm failed"
+
+    timeout 30 qemu-system-x86_64 \
+        -machine q35,smm=on \
+        -m 256M \
+        -nographic -no-reboot \
+        -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE_SECBOOT" \
+        -drive if=pflash,format=raw,file="${OVMF_DIR}/OVMF_VARS.secboot.fd" \
+        -kernel "$PROVISION_KERNEL" \
+        -initrd "$PROVISION_INITRAMFS" \
+        -append "console=ttyS0" \
+        -chardev socket,id=chrtpm,path="$TPM_SOCKET" \
+        -tpmdev emulator,id=tpm0,chardev=chrtpm \
+        -device tpm-crb,tpmdev=tpm0 \
+        -serial mon:stdio 2>&1 | tail -20
+
+    kill "$swtpm_pid" 2>/dev/null || true
+    wait "$swtpm_pid" 2>/dev/null || true
+
+    info "OVMF provisioned: ${OVMF_DIR}/OVMF_VARS.secboot.fd"
+    info "Signing keys: ${KEY_DIR}/"
+}
+
+build_test_uki() {
+    [ -f "$INITRAMFS" ] || error "Initramfs not found. Run: $0 build"
+    [ -f "$PROVISION_KERNEL" ] || find_helper_kernel
+    [ -f "${KEY_DIR}/db.key" ] || error "Keys not found. Run: $0 provision-ovmf"
+
+    info "Building test UKI..."
+    local os_release="/usr/lib/os-release"
+    [ -f "$os_release" ] || os_release="/etc/os-release"
+
+    ukify build \
+        --linux "$PROVISION_KERNEL" \
+        --initrd "$INITRAMFS" \
+        --cmdline "root=/dev/vg0/root console=ttyS0" \
+        --os-release "$os_release" \
+        --signtool sbsign \
+        --signing-key "${KEY_DIR}/db.key" \
+        --secureboot-certificate "${KEY_DIR}/db.crt" \
+        -o "$TEST_UKI" 2>&1
+
+    [ -f "$TEST_UKI" ] || error "UKI build failed"
+    info "Test UKI: ${TEST_UKI} ($(du -h "$TEST_UKI" | cut -f1))"
+}
+
+create_esp_image() {
+    [ -f "$TEST_UKI" ] || error "Test UKI not found. Run: $0 build-uki"
+
+    info "Creating ESP image with test UKI..."
+    # Create 200MB FAT32 ESP image
+    dd if=/dev/zero of="$ESP_IMG" bs=1M count=200 2>/dev/null
+    mkfs.vfat -F 32 "$ESP_IMG" 2>/dev/null
+
+    # Create directory structure and copy UKI
+    mmd -i "$ESP_IMG" ::/EFI
+    mmd -i "$ESP_IMG" ::/EFI/BOOT
+    mmd -i "$ESP_IMG" ::/EFI/GENTOO
+    mcopy -i "$ESP_IMG" "$TEST_UKI" ::/EFI/BOOT/BOOTX64.EFI
+    mcopy -i "$ESP_IMG" "$TEST_UKI" ::/EFI/GENTOO/kernel.efi
+
+    info "ESP image: ${ESP_IMG} ($(du -h "$ESP_IMG" | cut -f1))"
+}
+
+run_qemu_uefi() {
+    [ -f "$INITRAMFS" ] || error "Initramfs not found. Run: $0 build"
+    [ -f "$ESP_IMG" ] || error "ESP not found. Run: $0 build-uki"
+
+    cp "$OVMF_VARS_NONSECURE_TEMPLATE" "${OVMF_DIR}/OVMF_VARS.fd"
+
+    start_swtpm
+    trap stop_swtpm EXIT
+
+    info "Starting QEMU with OVMF (non-secure) + TPM..."
+    timeout 60 qemu-system-x86_64 \
+        -machine q35,smm=on \
+        -m 2G -cpu host -enable-kvm \
+        -nographic -no-reboot \
+        -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE_NONSECURE" \
+        -drive if=pflash,format=raw,file="${OVMF_DIR}/OVMF_VARS.fd" \
+        -drive id=esp,format=raw,if=none,file="$ESP_IMG" \
+        -device ich9-ahci,id=ahci \
+        -device ide-hd,drive=esp,bus=ahci.0 \
+        -chardev socket,id=chrtpm,path="$TPM_SOCKET" \
+        -tpmdev emulator,id=tpm0,chardev=chrtpm \
+        -device tpm-crb,tpmdev=tpm0 \
+        -serial mon:stdio
+}
+
+run_qemu_secure() {
+    [ -f "$INITRAMFS" ] || error "Initramfs not found. Run: $0 build"
+    [ -f "$ESP_IMG" ] || error "ESP not found. Run: $0 build-uki"
+    [ -f "${OVMF_DIR}/OVMF_VARS.secboot.fd" ] || error "OVMF not provisioned. Run: $0 provision-ovmf"
+
+    start_swtpm
+    trap stop_swtpm EXIT
+
+    info "Starting QEMU with OVMF Secure Boot + TPM..."
+    timeout 60 qemu-system-x86_64 \
+        -machine q35,smm=on \
+        -m 2G -cpu host -enable-kvm \
+        -nographic -no-reboot \
+        -drive if=pflash,format=raw,readonly=on,file="$OVMF_CODE_SECBOOT" \
+        -drive if=pflash,format=raw,file="${OVMF_DIR}/OVMF_VARS.secboot.fd" \
+        -drive id=esp,format=raw,if=none,file="$ESP_IMG" \
+        -device ich9-ahci,id=ahci \
+        -device ide-hd,drive=esp,bus=ahci.0 \
+        -chardev socket,id=chrtpm,path="$TPM_SOCKET" \
+        -tpmdev emulator,id=tpm0,chardev=chrtpm \
+        -device tpm-crb,tpmdev=tpm0 \
+        -serial mon:stdio
+}
+
+#=============================================================================
 # Main
 #=============================================================================
 
@@ -613,6 +895,124 @@ case "${1:-}" in
         build_initramfs_tui; run_qemu_tpm "${2:-}" ;;
     export-token)
         export_token ;;
+    provision-ovmf)
+        check_ovmf_deps; provision_ovmf ;;
+    build-uki)
+        build_test_uki; create_esp_image ;;
+    run-uefi)
+        run_qemu_uefi ;;
+    run-secure)
+        run_qemu_secure ;;
+    all-uefi)
+        check_deps; check_ovmf_deps; setup_test_dir
+        create_test_disk; enroll_tpm
+        start_swtpm_for_enrollment; generate_pcrlock; stop_swtpm
+        build_initramfs; build_test_uki; create_esp_image
+        run_qemu_uefi ;;
+    all-secure)
+        check_deps; check_ovmf_deps; setup_test_dir
+        provision_ovmf
+        create_test_disk; enroll_tpm
+        start_swtpm_for_enrollment; generate_pcrlock; stop_swtpm
+        build_initramfs; build_test_uki; create_esp_image
+        run_qemu_secure ;;
+    cover)
+        # Coverage test: build init with -cover, run QEMU, collect coverage
+        check_deps; setup_test_dir
+        info "Building vanguard CLI..."
+        go build -o vanguard ./cmd/vanguard/
+        info "Building covered init binary..."
+        CGO_ENABLED=0 go build -cover -tags debug -o "${TEST_DIR}/init-cover" ./init/
+        info "Covered init binary built (${TEST_DIR}/init-cover)"
+
+        # Create cover disk (small FAT image for .cov files)
+        info "Creating cover disk..."
+        dd if=/dev/zero of="${TEST_DIR}/cover.img" bs=1M count=10 2>/dev/null
+        mkfs.vfat -F 32 "${TEST_DIR}/cover.img" 2>/dev/null
+
+        # Generate initramfs with covered init binary
+        info "Generating initramfs with covered init..."
+        ./vanguard generate -o "${INITRAMFS}" --debug --init-binary "${TEST_DIR}/init-cover"
+        replace_initramfs_fstab
+
+        # Set up test disk if needed
+        [ ! -f "${DISK_IMG}" ] && create_test_disk
+
+        # Find kernel
+        kernel=$(find_kernel "${2:-}") || error "Kernel not found"
+
+        # Start swtpm
+        start_swtpm
+        trap stop_swtpm EXIT
+
+        info "Starting QEMU for coverage collection..."
+        timeout 120 qemu-system-x86_64 \
+            -m 2G -cpu host -enable-kvm \
+            -kernel "${kernel}" -initrd "${INITRAMFS}" \
+            -append "root=/dev/vg0/root console=ttyS0 vanguard.testmode=1" \
+            -device virtio-scsi-pci,id=scsi0 \
+            -device scsi-hd,drive=hd0,bus=scsi0.0 \
+            -drive file="${DISK_IMG}",format=qcow2,id=hd0,if=none \
+            -drive id=cover,format=raw,if=none,file="${TEST_DIR}/cover.img" \
+            -device virtio-blk-pci,drive=cover \
+            -chardev socket,id=chrtpm,path="${TPM_SOCKET}" \
+            -tpmdev emulator,id=tpm0,chardev=chrtpm \
+            -device tpm-crb,tpmdev=tpm0 \
+            -nographic -no-reboot 2>&1 | tee "${TEST_DIR}/cover-boot.log"
+
+        # Extract coverage data from cover disk
+        info "Extracting coverage data..."
+        mkdir -p "${TEST_DIR}/cover-data"
+        mcopy -s -i "${TEST_DIR}/cover.img" ::/ "${TEST_DIR}/cover-data/" 2>/dev/null || true
+
+        # Check if coverage data was collected
+        cover_files=$(find "${TEST_DIR}/cover-data" -name "*.cov" 2>/dev/null | wc -l)
+        if [ "$cover_files" -eq 0 ]; then
+            warn "No .cov files found. Coverage collection may have failed."
+            warn "Check boot log: ${TEST_DIR}/cover-boot.log"
+        else
+            info "Collected ${cover_files} coverage files"
+
+            # Convert QEMU coverage to text format
+            go tool covdata textfmt -i "${TEST_DIR}/cover-data" -o "${TEST_DIR}/qemu-cover.out" 2>/dev/null
+            if [ -f "${TEST_DIR}/qemu-cover.out" ]; then
+                info "QEMU coverage:"
+                go tool cover -func="${TEST_DIR}/qemu-cover.out" 2>&1 | tail -1
+            fi
+        fi
+
+        # Run go test coverage
+        info "Running go test coverage..."
+        go test -coverprofile="${TEST_DIR}/gotest.out" ./... 2>&1 | tail -5
+        if [ -f "${TEST_DIR}/gotest.out" ]; then
+            info "Go test coverage:"
+            go tool cover -func="${TEST_DIR}/gotest.out" 2>&1 | tail -1
+        fi
+
+        # Report combined estimate
+        info "=== Combined Coverage Estimate ==="
+        if [ -f "${TEST_DIR}/qemu-cover.out" ] && [ -f "${TEST_DIR}/gotest.out" ]; then
+            # Merge coverage profiles
+            # Go 1.20+ covdata merge can combine .cov directories
+            # But we have text .out files, not .cov directories
+            # So we report both separately
+            echo ""
+            echo "QEMU boot coverage:"
+            go tool cover -func="${TEST_DIR}/qemu-cover.out" 2>&1 | tail -1
+            echo ""
+            echo "Go test coverage:"
+            go tool cover -func="${TEST_DIR}/gotest.out" 2>&1 | tail -1
+            echo ""
+            echo "Note: These are separate measurements. QEMU covers init/* code,"
+            echo "go test covers internal/* and cmd/* code."
+        elif [ -f "${TEST_DIR}/qemu-cover.out" ]; then
+            go tool cover -func="${TEST_DIR}/qemu-cover.out" 2>&1 | tail -1
+        elif [ -f "${TEST_DIR}/gotest.out" ]; then
+            go tool cover -func="${TEST_DIR}/gotest.out" 2>&1 | tail -1
+        else
+            warn "No coverage data collected"
+        fi
+        ;;
     clean)
         clean ;;
     *)
@@ -649,6 +1049,14 @@ Run Commands:
 Debug Commands:
   export-token       Export TPM token from test disk and sleep 2s for capture
 
+UEFI / Secure Boot Commands:
+  provision-ovmf      Generate Secure Boot keys + provision OVMF NVRAM
+  build-uki           Build signed test UKI with ukify + sbsign
+  run-uefi            Boot QEMU with OVMF (non-secure) + swtpm + ESP
+  run-secure          Boot QEMU with OVMF Secure Boot + swtpm + signed UKI
+  all-uefi            Full UEFI test: disk, enroll, build, run-uefi
+  all-secure          Full Secure Boot test: provision, disk, enroll, build, run-secure
+
 Maintenance:
   clean              Remove all test files
 
@@ -658,6 +1066,9 @@ Examples:
   $0 all-tpm
   $0 all-tpm-pin-tui   # Test PIN entry in TUI mode
   $0 run /boot/vmlinuz
+  $0 provision-ovmf    # Provision OVMF with Secure Boot keys
+  $0 all-secure        # Full Secure Boot + TPM test
+  $0 cover [kernel]    # Coverage test: build -cover init, run QEMU, collect coverage
 HELP
         exit 1
         ;;

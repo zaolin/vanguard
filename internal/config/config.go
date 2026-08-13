@@ -13,6 +13,7 @@ type Config struct {
 	Firmware    []string `toml:"firmware"`
 	Modules     []string `toml:"modules"`
 	Debug       bool     `toml:"debug"`
+	InitBinary  string   `toml:"-"` // Not from TOML - set from CLI flag
 }
 
 // DefaultConfig returns a config with sensible defaults

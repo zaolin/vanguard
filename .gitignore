@@ -6,8 +6,12 @@
 cmd/vanguard/embed/init*
 
 
-# Test directory
+# Test directory (artifacts, not test data)
 test/
+
+# Test data (kernel is committed, but not test artifacts)
+testdata/kernel/*.cov
+testdata/kernel/*.log
 
 # Temporary files
 tmp/

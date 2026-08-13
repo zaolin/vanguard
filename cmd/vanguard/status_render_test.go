@@ -163,8 +163,8 @@ func TestFindPCRLockPolicyWithTempDir(t *testing.T) {
 
 func TestRenderVectorCollapsed(t *testing.T) {
 	v := &threatVector{
-		Name: "Test Vector",
-		Status: "ok",
+		Name:      "Test Vector",
+		Status:    "ok",
 		Collapsed: true,
 		Mitigations: []mitigation{
 			{Name: "A", Status: "ok", Detail: "active"},
@@ -185,8 +185,8 @@ func TestRenderVectorCollapsed(t *testing.T) {
 
 func TestRenderVectorExpanded(t *testing.T) {
 	v := &threatVector{
-		Name: "Warning Vector",
-		Status: "warning",
+		Name:      "Warning Vector",
+		Status:    "warning",
 		Collapsed: false,
 		Mitigations: []mitigation{
 			{Name: "A", Status: "ok", Detail: "active"},
@@ -209,7 +209,7 @@ func TestStatusJSON(t *testing.T) {
 	// Verify that statusData can be marshaled to JSON
 	data := statusData{
 		Tier: "HIGH",
-		TPM: tpmStatus{Present: true, Device: "/dev/tpmrm0"},
+		TPM:  tpmStatus{Present: true, Device: "/dev/tpmrm0"},
 	}
 	jsonData, err := json.Marshal(data)
 	if err != nil {
@@ -265,3 +265,29 @@ func TestVectorStatusMixed(t *testing.T) {
 	}
 }
 
+func TestExtractSeedFromURI(t *testing.T) {
+	tests := []struct {
+		uri  string
+		want string
+	}{
+		{"otpauth://totp/Vanguard:recovery?secret=JBSWY3DPEHPK3PXP&issuer=Vanguard", "JBSWY3DPEHPK3PXP"},
+		{"otpauth://totp/Test:test?secret=ABCDEF&issuer=Test", "ABCDEF"},
+		{"otpauth://totp/Test:test?issuer=Test&secret=GHIJKL", "GHIJKL"},
+		{"otpauth://totp/Test:test?secret=", ""},
+		{"no secret here", ""},
+		{"", ""},
+	}
+	for _, tt := range tests {
+		got := extractSeedFromURI(tt.uri)
+		if got != tt.want {
+			t.Errorf("extractSeedFromURI(%q) = %q, want %q", tt.uri, got, tt.want)
+		}
+	}
+}
+
+func TestIsTerminal(t *testing.T) {
+	// os.Stdout might or might not be a terminal depending on test runner
+	// Just verify it doesn't panic
+	_ = isTerminal(os.Stdout)
+	_ = isTerminal(os.Stderr)
+}

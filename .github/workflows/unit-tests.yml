@@ -1,0 +1,23 @@
+name: Unit Tests
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    container: ghcr.io/zaolin/vanguard/ci:latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run unit tests
+        run: go test -count=1 ./...
+      - name: Run race detector
+        run: go test -race -count=1 ./...
+      - name: Run vet
+        run: go vet ./...
+      - name: Check formatting
+        run: |
+          FILES=$(gofmt -l $(find . -name "*.go" -not -path "./.git/*" -not -path "./testdata/*"))
+          if [ -n "$FILES" ]; then
+            echo "gofmt found unformatted files:"
+            echo "$FILES"
+            exit 1
+          fi

@@ -23,9 +23,14 @@ import (
 // Run executes the generate command
 func (c *GenerateCmd) Run() error {
 	// Generate reads /etc/passwd, /etc/group, /etc/fstab, /etc/vconsole.conf
-	// and writes to /boot — requires root.
-	if os.Geteuid() != 0 {
+	// and writes to /boot — requires root for production use.
+	// When --init-binary is set (testing), skip the root check since
+	// the test output goes to a temp file and system files are optional.
+	if os.Geteuid() != 0 && c.InitBinary == "" {
 		return fmt.Errorf("this command must be run as root")
+	}
+	if os.Geteuid() != 0 {
+		fmt.Fprintln(os.Stderr, "vanguard: warning: not running as root — some files may be missing from initramfs")
 	}
 
 	// Load config file if specified
@@ -49,6 +54,9 @@ func (c *GenerateCmd) Run() error {
 	}
 	if c.Debug {
 		cfg.Debug = true
+	}
+	if c.InitBinary != "" {
+		cfg.InitBinary = c.InitBinary
 	}
 
 	return runGenerate(cfg)
@@ -229,11 +237,17 @@ func runGenerate(cfg *config.Config) error {
 		fmt.Printf("  root device: %s\n", rootDev)
 	}
 
-	// Get embedded init binary based on configuration
-	// Both variants have strict mode always-on (no passphrase fallback without TOTP)
-	fmt.Printf("vanguard: using embedded init binary...\n")
+	// Get init binary: custom (for -cover testing), embedded debug, or embedded release
 	var initContent []byte
 	switch {
+	case cfg.InitBinary != "":
+		// Custom init binary (e.g. covered binary for QEMU coverage testing)
+		fmt.Printf("vanguard: using custom init binary from %s\n", cfg.InitBinary)
+		initContent, err = os.ReadFile(cfg.InitBinary)
+		if err != nil {
+			return fmt.Errorf("failed to read custom init binary: %w", err)
+		}
+		fmt.Printf("  custom init (%d bytes)\n", len(initContent))
 	case cfg.Debug:
 		initContent = embed.InitDebugBinary
 		fmt.Printf("  using debug init (%d bytes, strict mode)\n", len(initContent))
@@ -470,8 +484,44 @@ func runGenerate(cfg *config.Config) error {
 	}
 
 	// Add init binary
-	if err := archive.AddFile("init", initContent, 0755); err != nil {
-		return fmt.Errorf("failed to add init: %w", err)
+	if cfg.InitBinary != "" {
+		// When using a custom init binary (e.g. covered binary for testing),
+		// use a C wrapper as /init that mounts the cover disk and sets
+		// GOCOVERDIR before exec-ing the Go binary at /init-go.
+		// This ensures GOCOVERDIR is set before Go's coverage runtime initializes.
+		// Check for C wrapper at common locations
+		wrapperPath := "/tmp/init-cover-wrapper"
+		if _, err := os.Stat(wrapperPath); err != nil {
+			// Try project-relative path
+			wrapperPath = "scripts/helpers/init-cover-wrapper"
+		}
+		if _, err := os.Stat(wrapperPath); err != nil {
+			// Wrapper not found - fall back to direct init binary
+			if err := archive.AddFile("init", initContent, 0755); err != nil {
+				return fmt.Errorf("failed to add init: %w", err)
+			}
+		} else {
+			wrapperContent, err := os.ReadFile(wrapperPath)
+			if err != nil {
+				return fmt.Errorf("failed to read cover wrapper: %w", err)
+			}
+			archive.AddFile("init", wrapperContent, 0755)
+			archive.AddFile("init-go", initContent, 0755)
+			fmt.Printf("  using cover wrapper + covered init-go\n")
+		}
+		archive.AddDirectory("cover", 0755)
+		archive.AddDirectory("tmp", 0755)
+		archive.AddDirectory("run", 0755)
+		archive.AddDirectory("proc", 0755)
+		archive.AddDirectory("sys", 0755)
+		archive.AddDirectory("dev", 0755)
+	} else {
+		if err := archive.AddFile("init", initContent, 0755); err != nil {
+			return fmt.Errorf("failed to add init: %w", err)
+		}
+		archive.AddDirectory("cover", 0755)
+		archive.AddDirectory("tmp", 0755)
+		archive.AddDirectory("run", 0755)
 	}
 
 	// Add required binaries

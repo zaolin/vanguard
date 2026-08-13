@@ -1,0 +1,123 @@
+name: Coverage
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  coverage:
+    runs-on: ubuntu-latest
+    container:
+      image: ghcr.io/zaolin/vanguard/ci:latest
+      options: --privileged
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build vanguard
+        run: go build -o vanguard ./cmd/vanguard/
+
+      - name: Build covered init + C wrapper
+        run: |
+          CGO_ENABLED=0 go build -cover -tags debug -o test/init-cover ./init/
+          gcc -static -o /tmp/init-cover-wrapper scripts/helpers/init-cover-wrapper.c
+
+      - name: Create test disk
+        run: |
+          dd if=/dev/zero of=test/test-disk.raw bs=1G count=1
+          scripts/helpers/create-disk.sh test/test-disk.raw testpass
+
+      - name: Enroll TPM + generate pcrlock
+        run: |
+          mkdir -p test/tpm
+          swtpm socket --tpmstate dir=test/tpm \
+            --server type=unixio,path=test/tpm/swtpm.sock \
+            --ctrl type=unixio,path=test/tpm/swtpm-ctrl.sock \
+            --tpm2 --flags startup-clear,not-need-init &
+          sleep 1
+
+          LOOP=$(losetup -f --show test/test-disk.raw)
+          partprobe $LOOP; sleep 1
+          PART="${LOOP}p2"; [ -e "$PART" ] || PART="${LOOP}p1"
+
+          echo -n "testpass" | systemd-cryptenroll \
+            --tpm2-device="swtpm:path=test/tpm/swtpm.sock" \
+            --wipe-slot=tpm2 --tpm2-with-pin=yes \
+            --unlock-key-file=/dev/stdin "$PART"
+
+          SYSTEMD_TPM2_DEVICE="swtpm:path=test/tpm/swtpm.sock" \
+            systemd-pcrlock make-policy --policy=test/pcrlock.json --pcr=23 --force
+
+          pkill swtpm; sleep 1
+          losetup -d $LOOP
+
+      - name: Generate initramfs
+        run: |
+          ./vanguard generate -o test/initramfs.img --debug --init-binary test/init-cover
+
+      - name: Create cover disk
+        run: |
+          dd if=/dev/zero of=test/cover.img bs=1M count=10
+          mkfs.ext4 -q test/cover.img
+
+      - name: Run QEMU coverage
+        run: |
+          swtpm socket --tpmstate dir=test/tpm \
+            --server type=unixio,path=test/tpm/swtpm.sock \
+            --ctrl type=unixio,path=test/tpm/swtpm-ctrl.sock \
+            --tpm2 --flags startup-none,not-need-init &
+          sleep 1
+
+          timeout 120 qemu-system-x86_64 \
+            -m 512M -cpu host -enable-kvm \
+            -kernel testdata/kernel/bzImage \
+            -initrd test/initramfs.img \
+            -append "root=/dev/vg0/root console=ttyS0 vanguard.testmode=1 panic=1 vanguard.testpin=1234 GOCOVERDIR=/cover" \
+            -device virtio-scsi-pci,id=scsi0 \
+            -device scsi-hd,drive=hd0,bus=scsi0.0 \
+            -drive file=test/test-disk.raw,format=raw,id=hd0,if=none \
+            -drive id=cover,format=raw,if=none,file=test/cover.img \
+            -device virtio-blk-pci,drive=cover \
+            -chardev socket,id=chrtpm,path=test/tpm/swtpm.sock \
+            -tpmdev emulator,id=tpm0,chardev=chrtpm \
+            -device tpm-crb,tpmdev=tpm0 \
+            -nographic -no-reboot 2>&1 | tee test/cover-boot.log
+
+      - name: Extract QEMU coverage
+        run: |
+          rm -rf test/cover-data && mkdir -p test/cover-data
+          for f in $(e2ls test/cover.img | grep -v lost+found | tr -d ' '); do
+            e2cp "test/cover.img:/$f" "test/cover-data/$f"
+          done
+          go tool covdata textfmt -i test/cover-data -o test/qemu-cover.out
+
+      - name: Run go test coverage
+        run: go test -coverprofile=test/gotest.out ./...
+
+      - name: Report coverage
+        run: |
+          echo "=== QEMU Boot Coverage ==="
+          go tool cover -func=test/qemu-cover.out | tail -1
+          echo "=== Go Test Coverage ==="
+          go tool cover -func=test/gotest.out | tail -1
+
+      - name: Check threshold
+        run: |
+          GOTEST_COV=$(go tool cover -func=test/gotest.out | tail -1 | awk '{print $3}' | tr -d '%')
+          echo "Go test coverage: ${GOTEST_COV}%"
+          if [ $(echo "${GOTEST_COV} < 30" | bc) -eq 1 ]; then
+            echo "FAIL: Go test coverage ${GOTEST_COV}% < 30%"
+            exit 1
+          fi
+          echo "Coverage check passed"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: coverage-reports
+          path: |
+            test/qemu-cover.out
+            test/gotest.out
+            test/cover-boot.log
+
+      - name: Cleanup
+        if: always()
+        run: pkill swtpm 2>/dev/null || true

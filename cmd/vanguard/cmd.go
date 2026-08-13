@@ -24,6 +24,7 @@ type GenerateCmd struct {
 	Debug       bool     `short:"d" help:"Enable debug output in init binary"`
 	Verbose     bool     `short:"v" help:"Show verbose output during generation"`
 	Config      string   `type:"path" help:"Path to TOML config file"`
+	InitBinary  string   `help:"Path to custom init binary (for testing with -cover). If not set, uses the embedded binary."`
 }
 
 // UpdatePolicyCmd updates TPM2 pcrlock policy

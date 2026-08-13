@@ -366,7 +366,12 @@ func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, pc
 	for attempt := 1; attempt <= maxPINAttempts; attempt++ {
 		// Prompt for PIN
 		if attempt == 1 {
-			if tui.IsEnabled() {
+			// In test mode, auto-enter PIN from kernel cmdline (vanguard.testpin=)
+			testPin := getTestPin()
+			if testPin != "" {
+				pin = testPin
+				Debug("luks: using test PIN from cmdline\n")
+			} else if tui.IsEnabled() {
 				pin, err = tui.PromptPassword(d.Path + " (TPM PIN)")
 			} else {
 				pin, err = console.ReadPassword(fmt.Sprintf("Enter TPM2 PIN for %s: ", d.Path))
@@ -680,4 +685,19 @@ func ensureMapperNode(name string) error {
 		return nil
 	}
 	return fmt.Errorf("device node %s not created", mappedPath)
+}
+
+// getTestPin reads the test PIN from the kernel cmdline (vanguard.testpin=).
+// Returns empty string if not set.
+func getTestPin() string {
+	data, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		return ""
+	}
+	for _, param := range strings.Fields(string(data)) {
+		if strings.HasPrefix(param, "vanguard.testpin=") {
+			return strings.TrimPrefix(param, "vanguard.testpin=")
+		}
+	}
+	return ""
 }
