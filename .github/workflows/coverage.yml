@@ -87,34 +87,14 @@ jobs:
       - name: Test QEMU
         if: steps.tpm_enroll.outcome == 'success'
         run: |
-          echo "=== Test 1: Kernel only ==="
-          timeout 30 qemu-system-x86_64 \
-            -m 256M -cpu qemu64 -enable-kvm \
+          echo "=== Smoke test: Kernel + initrd ==="
+          timeout 60 qemu-system-x86_64 \
+            -m 512M -cpu qemu64 -enable-kvm \
             -kernel testdata/kernel/bzImage \
-            -append "console=ttyS0 panic=1" \
+            -initrd test/initramfs.img \
+            -append "console=ttyS0 panic=1 vanguard.testmode=1" \
             -nographic -no-reboot 2>&1 | head -10 || true
-
-          echo "=== Test 2: Kernel + initrd ==="
-          timeout 60 qemu-system-x86_64 \
-            -m 512M -cpu qemu64 -enable-kvm \
-            -kernel testdata/kernel/bzImage \
-            -initrd test/initramfs.img \
-            -append "console=ttyS0 panic=1 vanguard.testmode=1" \
-            -nographic -no-reboot 2>&1 | head -30 || true
-
-          echo "=== Test 3: Kernel + initrd + disks ==="
-          timeout 60 qemu-system-x86_64 \
-            -m 512M -cpu qemu64 -enable-kvm \
-            -kernel testdata/kernel/bzImage \
-            -initrd test/initramfs.img \
-            -append "console=ttyS0 panic=1 vanguard.testmode=1" \
-            -device virtio-scsi-pci,id=scsi0 \
-            -device scsi-hd,drive=hd0,bus=scsi0.0 \
-            -drive file=test/test-disk.raw,format=raw,id=hd0,if=none \
-            -drive id=cover,format=raw,if=none,file=test/cover.img \
-            -device virtio-blk-pci,drive=cover \
-            -nographic -no-reboot 2>&1 | head -30 || true
-          echo "=== Tests complete ==="
+          echo "=== Smoke test complete ==="
 
       - name: Run QEMU coverage
         if: steps.tpm_enroll.outcome == 'success'
@@ -159,6 +139,9 @@ jobs:
           done
           go tool covdata textfmt -i test/cover-data -o test/qemu-cover.out
 
+      - name: Install gocovmerge
+        run: go install github.com/wadey/gocovmerge@latest
+
       - name: Run go test coverage
         env:
           CI: true
@@ -177,21 +160,15 @@ jobs:
 
           echo "=== Combined Coverage ==="
           if [ -f test/qemu-cover.out ]; then
-            $(go env GOPATH)/bin/gocovmerge test/gotest.out test/qemu-cover.out > test/combined.out 2>/dev/null || \
-              go tool cover -func=test/gotest.out > /dev/null 2>&1
-            if [ -f test/combined.out ]; then
-              go tool cover -func=test/combined.out | tail -1
-            fi
+            $(go env GOPATH)/bin/gocovmerge test/gotest.out test/qemu-cover.out > test/combined.out
+            go tool cover -func=test/combined.out | tail -1
+          else
+            echo "No QEMU coverage to merge"
+            cp test/gotest.out test/combined.out
           fi
-
-      - name: Install gocovmerge
-        run: go install github.com/wadey/gocovmerge@latest
 
       - name: Check threshold
         run: |
-          # Merge coverage profiles for combined report
-          $(go env GOPATH)/bin/gocovmerge test/gotest.out test/qemu-cover.out > test/combined.out 2>/dev/null || cp test/gotest.out test/combined.out
-
           COMBINED_COV=$(go tool cover -func=test/combined.out | tail -1 | awk '{print $3}' | tr -d '%')
           GOTEST_COV=$(go tool cover -func=test/gotest.out | tail -1 | awk '{print $3}' | tr -d '%')
           echo "Go test coverage: ${GOTEST_COV}%"
