@@ -31,7 +31,7 @@ func Setup(t *testing.T) (transport.TPMCloser, func()) {
 	// Create temp directory for swtpm state
 	tmpDir := t.TempDir()
 	socketPath := filepath.Join(tmpDir, "swtpm.sock")
-	ctrlPath := filepath.Join(tmpDir, "swtpm-ctrl.sock")
+	ctrlPath := filepath.Join(tmpDir, "swtpm.sock.ctrl")
 	tpmStateDir := filepath.Join(tmpDir, "tpm-state")
 	if err := os.MkdirAll(tpmStateDir, 0755); err != nil {
 		t.Fatalf("mkdir tpm-state: %v", err)
@@ -106,7 +106,7 @@ func TrySetup() (transport.TPMCloser, func(), error) {
 	}
 
 	socketPath := filepath.Join(tmpDir, "swtpm.sock")
-	ctrlPath := filepath.Join(tmpDir, "swtpm-ctrl.sock")
+	ctrlPath := filepath.Join(tmpDir, "swtpm.sock.ctrl")
 	tpmStateDir := filepath.Join(tmpDir, "tpm-state")
 	if err := os.MkdirAll(tpmStateDir, 0755); err != nil {
 		os.RemoveAll(tmpDir)
