@@ -19,7 +19,7 @@ jobs:
             qemu-system-x86 swtpm swtpm-tools cryptsetup lvm2 \
             busybox gcc make mtools e2tools \
             efitools sbsigntool ovmf fwupd \
-            systemd systemd-cryptsetup systemd-ukify systemd-boot-efi
+            systemd systemd-ukify systemd-boot-efi
 
       - name: Build vanguard
         run: |
