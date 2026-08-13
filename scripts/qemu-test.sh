@@ -600,8 +600,14 @@ check_ovmf_deps() {
     for cmd in openssl cert-to-efi-sig-list sign-efi-sig-list efi-updatevar sbsign ukify objcopy; do
         command -v "$cmd" &>/dev/null || missing+=("$cmd")
     done
-    [ -f "$OVMF_CODE_SECBOOT" ] || error "OVMF Secure Boot CODE not found: $OVMF_CODE_SECBOOT"
-    [ -f "$OVMF_VARS_SECBOOT_TEMPLATE" ] || error "OVMF Secure Boot VARS template not found: $OVMF_VARS_SECBOOT_TEMPLATE"
+    if [ -z "$OVMF_CODE_SECBOOT" ] || [ ! -f "$OVMF_CODE_SECBOOT" ]; then
+        warn "OVMF Secure Boot firmware not found (tried /usr/share/edk2/OvmfX64 and /usr/share/OVMF)"
+        warn "Install 'edk2-ovmf' (Gentoo) or 'ovmf' (Ubuntu) package"
+        warn "On Ubuntu, you may also need 'ovmf-sev' for secboot variant"
+        return 1
+    fi
+    [ -f "$OVMF_VARS_SECBOOT_TEMPLATE" ] || { warn "OVMF VARS template not found"; return 1; }
+    return 0
 }
 
 generate_secureboot_keys() {
