@@ -99,7 +99,7 @@ jobs:
 
           # QEMU with KVM, serial output captured to boot log
           timeout 180 qemu-system-x86_64 \
-            -m 512M -cpu host -enable-kvm \
+            -m 512M -cpu qemu64 -enable-kvm \
             -kernel testdata/kernel/bzImage \
             -initrd test/initramfs.img \
             -append "root=/dev/vg0/root console=ttyS0,115200 earlyprintk=serial vanguard.testmode=1 panic=1 GOCOVERDIR=/cover" \
@@ -111,7 +111,7 @@ jobs:
             -chardev socket,id=chrtpm,path=test/tpm/swtpm.sock \
             -tpmdev emulator,id=tpm0,chardev=chrtpm \
             -device tpm-crb,tpmdev=tpm0 \
-            -nographic -no-reboot > test/cover-boot.log 2>&1 || true
+            -serial stdio -display none -no-reboot > test/cover-boot.log 2>&1 || true
 
           echo "Boot log size: $(wc -c < test/cover-boot.log) bytes"
           head -30 test/cover-boot.log
