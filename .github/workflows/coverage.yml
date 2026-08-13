@@ -87,13 +87,21 @@ jobs:
       - name: Test QEMU
         if: steps.tpm_enroll.outcome == 'success'
         run: |
-          echo "Testing QEMU with a simple kernel boot..."
+          echo "=== Test 1: Kernel only ==="
           timeout 30 qemu-system-x86_64 \
             -m 256M -cpu qemu64 -enable-kvm \
             -kernel testdata/kernel/bzImage \
             -append "console=ttyS0 panic=1" \
+            -nographic -no-reboot 2>&1 | head -10 || true
+
+          echo "=== Test 2: Kernel + initrd ==="
+          timeout 60 qemu-system-x86_64 \
+            -m 512M -cpu qemu64 -enable-kvm \
+            -kernel testdata/kernel/bzImage \
+            -initrd test/initramfs.img \
+            -append "console=ttyS0 panic=1 vanguard.testmode=1" \
             -nographic -no-reboot 2>&1 | head -30 || true
-          echo "QEMU test complete"
+          echo "=== Tests complete ==="
 
       - name: Run QEMU coverage
         if: steps.tpm_enroll.outcome == 'success'
