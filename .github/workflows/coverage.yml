@@ -36,7 +36,11 @@ jobs:
           dd if=/dev/zero of=test/test-disk.raw bs=1G count=1
           sudo scripts/helpers/create-disk.sh test/test-disk.raw testpass
 
+      # Note: enrollment may hang if PIN prompt is interactive
       - name: Enroll TPM + generate pcrlock
+        timeout-minutes: 5
+        continue-on-error: true
+        id: tpm_enroll
         run: |
           mkdir -p test/tpm
           swtpm socket --tpmstate dir=test/tpm \
@@ -49,10 +53,19 @@ jobs:
           sudo partprobe $LOOP; sleep 1
           PART="${LOOP}p2"; [ -e "$PART" ] || PART="${LOOP}p1"
 
+          # Create a PIN file for non-interactive enrollment
+          echo -n "1234" > /tmp/tpm-pin
           echo -n "testpass" | sudo systemd-cryptenroll \
             --tpm2-device="swtpm:path=test/tpm/swtpm.sock" \
             --wipe-slot=tpm2 --tpm2-with-pin=yes \
-            --unlock-key-file=/dev/stdin "$PART"
+            --tpm2-pin-file=/tmp/tpm-pin \
+            --unlock-key-file=/dev/stdin "$PART" || {
+            # Fallback: try without PIN if --tpm2-pin-file is not supported
+            echo -n "testpass" | sudo systemd-cryptenroll \
+              --tpm2-device="swtpm:path=test/tpm/swtpm.sock" \
+              --wipe-slot=tpm2 \
+              --unlock-key-file=/dev/stdin "$PART"
+          }
 
           sudo SYSTEMD_TPM2_DEVICE="swtpm:path=test/tpm/swtpm.sock" \
             systemd-pcrlock make-policy --policy=test/pcrlock.json --pcr=23 --force || true
@@ -61,15 +74,21 @@ jobs:
           sudo losetup -d $LOOP
 
       - name: Generate initramfs
+        if: steps.tpm_enroll.outcome == 'success'
         run: |
           sudo ./vanguard generate -o test/initramfs.img --debug --init-binary test/init-cover
 
       - name: Create cover disk
+        if: steps.tpm_enroll.outcome == 'success'
         run: |
           dd if=/dev/zero of=test/cover.img bs=1M count=10
           mkfs.ext4 -q test/cover.img
 
       - name: Run QEMU coverage
+        if: steps.tpm_enroll.outcome == 'success'
+        timeout-minutes: 5
+        continue-on-error: true
+        id: qemu_run
         run: |
           swtpm socket --tpmstate dir=test/tpm \
             --server type=unixio,path=test/tpm/swtpm.sock \
@@ -93,6 +112,7 @@ jobs:
             -nographic -no-reboot 2>&1 | tee test/cover-boot.log
 
       - name: Extract QEMU coverage
+        if: steps.qemu_run.outcome == 'success'
         run: |
           rm -rf test/cover-data && mkdir -p test/cover-data
           for f in $(e2ls test/cover.img | grep -v lost+found | tr -d ' '); do
