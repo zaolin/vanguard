@@ -92,8 +92,8 @@ jobs:
             --tpm2 --flags startup-none,not-need-init &
           sleep 2
 
-          timeout 120 qemu-system-x86_64 \
-            -m 512M -cpu qemu64 \
+          timeout 180 qemu-system-x86_64 \
+            -m 512M -cpu host -enable-kvm \
             -kernel testdata/kernel/bzImage \
             -initrd test/initramfs.img \
             -append "root=/dev/vg0/root console=ttyS0 vanguard.testmode=1 panic=1 GOCOVERDIR=/cover" \
