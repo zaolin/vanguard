@@ -84,6 +84,17 @@ jobs:
         run: |
           sudo chmod 666 /dev/kvm 2>/dev/null || true
 
+      - name: Test QEMU
+        if: steps.tpm_enroll.outcome == 'success'
+        run: |
+          echo "Testing QEMU with a simple kernel boot..."
+          timeout 30 qemu-system-x86_64 \
+            -m 256M -cpu qemu64 -enable-kvm \
+            -kernel testdata/kernel/bzImage \
+            -append "console=ttyS0 panic=1" \
+            -nographic -no-reboot 2>&1 | head -30 || true
+          echo "QEMU test complete"
+
       - name: Run QEMU coverage
         if: steps.tpm_enroll.outcome == 'success'
         timeout-minutes: 5
@@ -161,3 +172,4 @@ jobs:
       - name: Cleanup
         if: always()
         run: pkill swtpm 2>/dev/null || true
+# This is added by the edit tool
