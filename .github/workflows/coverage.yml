@@ -102,15 +102,11 @@ jobs:
         continue-on-error: true
         id: qemu_run
         run: |
-          # Restart swtpm with preserved state
-          swtpm socket --tpmstate dir=test/tpm \
-            --server type=unixio,path=test/tpm/swtpm.sock \
-            --ctrl type=unixio,path=test/tpm/swtpm.sock.ctrl \
-            --tpm2 --flags startup-none,not-need-init &
-          sleep 2
-
-          # Run QEMU with output captured via tee (proven to work in diagnostics)
-          timeout 180 qemu-system-x86_64 \
+          # Run QEMU WITHOUT TPM device - the TPM causes QEMU to hang on CI.
+          # In test mode, the init binary will fail at PCR 7 check (no TPM)
+          # but still flush coverage data via halt() -> os.Exit(0).
+          # The C wrapper handles cover disk mount + power off.
+          timeout 120 qemu-system-x86_64 \
             -m 512M -cpu qemu64 -enable-kvm \
             -kernel testdata/kernel/bzImage \
             -initrd test/initramfs.img \
@@ -120,10 +116,7 @@ jobs:
             -drive file=test/test-disk.raw,format=raw,id=hd0,if=none \
             -drive id=cover,format=raw,if=none,file=test/cover.img \
             -device virtio-blk-pci,drive=cover \
-            -chardev socket,id=chrtpm,path=test/tpm/swtpm.sock \
-            -tpmdev emulator,id=tpm0,chardev=chrtpm \
-            -device tpm-crb,tpmdev=tpm0 \
-            -nographic -no-reboot 2>&1 | tee /tmp/cover-boot.log | head -100 || true
+            -nographic -no-reboot 2>&1 | tee /tmp/cover-boot.log | head -200 || true
 
           echo "Boot log size: $(wc -c < /tmp/cover-boot.log) bytes"
           tail -30 /tmp/cover-boot.log
