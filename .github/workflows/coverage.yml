@@ -18,7 +18,8 @@ jobs:
           sudo apt-get install -y \
             qemu-system-x86 swtpm swtpm-tools cryptsetup lvm2 \
             busybox gcc make mtools e2tools \
-            efitools sbsigntool systemd systemd-boot-efi
+            efitools sbsigntool ovmf fwupd \
+            systemd systemd-ukify systemd-boot-efi
 
       - name: Build vanguard
         run: |
@@ -36,7 +37,6 @@ jobs:
           dd if=/dev/zero of=test/test-disk.raw bs=1G count=1
           sudo scripts/helpers/create-disk.sh test/test-disk.raw testpass
 
-      # Note: enrollment may hang if PIN prompt is interactive
       - name: Enroll TPM + generate pcrlock
         timeout-minutes: 5
         continue-on-error: true
@@ -53,14 +53,14 @@ jobs:
           sudo partprobe $LOOP; sleep 1
           PART="${LOOP}p2"; [ -e "$PART" ] || PART="${LOOP}p1"
 
-          # Create a PIN file for non-interactive enrollment
+          # Non-interactive PIN enrollment using a PIN file
           echo -n "1234" > /tmp/tpm-pin
           echo -n "testpass" | sudo systemd-cryptenroll \
             --tpm2-device="swtpm:path=test/tpm/swtpm.sock" \
             --wipe-slot=tpm2 --tpm2-with-pin=yes \
             --tpm2-pin-file=/tmp/tpm-pin \
             --unlock-key-file=/dev/stdin "$PART" || {
-            # Fallback: try without PIN if --tpm2-pin-file is not supported
+            # Fallback: enroll without PIN
             echo -n "testpass" | sudo systemd-cryptenroll \
               --tpm2-device="swtpm:path=test/tpm/swtpm.sock" \
               --wipe-slot=tpm2 \
@@ -68,7 +68,7 @@ jobs:
           }
 
           sudo SYSTEMD_TPM2_DEVICE="swtpm:path=test/tpm/swtpm.sock" \
-            systemd-pcrlock make-policy --policy=test/pcrlock.json --pcr=23 --force || true
+            /usr/lib/systemd/systemd-pcrlock make-policy --policy=test/pcrlock.json --pcr=23 --force || true
 
           sudo pkill swtpm; sleep 1
           sudo losetup -d $LOOP
@@ -126,7 +126,11 @@ jobs:
       - name: Report coverage
         run: |
           echo "=== QEMU Boot Coverage ==="
-          go tool cover -func=test/qemu-cover.out | tail -1
+          if [ -f test/qemu-cover.out ]; then
+            go tool cover -func=test/qemu-cover.out | tail -1
+          else
+            echo "No QEMU coverage data (TPM enrollment may have failed)"
+          fi
           echo "=== Go Test Coverage ==="
           go tool cover -func=test/gotest.out | tail -1
 

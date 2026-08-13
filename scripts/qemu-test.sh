@@ -22,7 +22,11 @@ TPM_SOCKET="${TEST_DIR}/swtpm.sock"
 
 # OVMF / Secure Boot test paths (auto-detect Gentoo vs Ubuntu paths)
 detect_ovmf_paths() {
+    # Gentoo: /usr/share/edk2/OvmfX64/OVMF_CODE.secboot.fd
+    # Ubuntu 24.04: /usr/share/OVMF/OVMF_CODE.secboot.fd
+    # Ubuntu 25.04: /usr/share/OVMF/OVMF_CODE_4M.secboot.fd
     for dir in /usr/share/edk2/OvmfX64 /usr/share/OVMF; do
+        # Try standard naming
         if [ -f "${dir}/OVMF_CODE.secboot.fd" ]; then
             OVMF_CODE_SECBOOT="${dir}/OVMF_CODE.secboot.fd"
             OVMF_VARS_SECBOOT_TEMPLATE="${dir}/OVMF_VARS.secboot.fd"
@@ -30,14 +34,15 @@ detect_ovmf_paths() {
             OVMF_VARS_NONSECURE_TEMPLATE="${dir}/OVMF_VARS.fd"
             return 0
         fi
+        # Try Ubuntu 25.04 4M naming
+        if [ -f "${dir}/OVMF_CODE_4M.secboot.fd" ]; then
+            OVMF_CODE_SECBOOT="${dir}/OVMF_CODE_4M.secboot.fd"
+            OVMF_VARS_SECBOOT_TEMPLATE="${dir}/OVMF_VARS_4M.secboot.fd"
+            OVMF_CODE_NONSECURE="${dir}/OVMF_CODE_4M.fd"
+            OVMF_VARS_NONSECURE_TEMPLATE="${dir}/OVMF_VARS_4M.fd"
+            return 0
+        fi
     done
-    # Fallback: try ovmf package paths (Ubuntu)
-    if [ -f "/usr/share/OVMF/OVMF_CODE.secboot.fd" ]; then
-        OVMF_CODE_SECBOOT="/usr/share/OVMF/OVMF_CODE.secboot.fd"
-        OVMF_VARS_SECBOOT_TEMPLATE="/usr/share/OVMF/OVMF_VARS.secboot.fd"
-        OVMF_CODE_NONSECURE="/usr/share/OVMF/OVMF_CODE.fd"
-        OVMF_VARS_NONSECURE_TEMPLATE="/usr/share/OVMF/OVMF_VARS.fd"
-    fi
 }
 detect_ovmf_paths
 

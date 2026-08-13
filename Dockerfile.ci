@@ -1,4 +1,4 @@
-FROM ubuntu:24.04
+FROM ubuntu:25.04
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     golang \
@@ -17,11 +17,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     efitools \
     sbsigntool \
-    && rm -rf /var/lib/apt/lists/*
-
-# systemd (includes systemd-pcrlock and ukify)
-RUN apt-get update && apt-get install -y --no-install-recommends \
+    ovmf \
+    fwupd \
     systemd \
+    systemd-ukify \
     systemd-boot-efi \
     && rm -rf /var/lib/apt/lists/*
 
@@ -29,6 +28,9 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 RUN go version && \
     qemu-system-x86_64 --version | head -1 && \
     swtpm --version | head -1 && \
-    cryptsetup --version | head -1
+    cryptsetup --version | head -1 && \
+    fwupdmgr --version | head -1 && \
+    ukify --version | head -1 && \
+    /usr/lib/systemd/systemd-pcrlock --version | head -1
 
 WORKDIR /workspace
