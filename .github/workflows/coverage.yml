@@ -79,6 +79,11 @@ jobs:
           dd if=/dev/zero of=test/cover.img bs=1M count=10
           mkfs.ext4 -q test/cover.img
 
+      - name: Enable KVM access
+        if: steps.tpm_enroll.outcome == 'success'
+        run: |
+          sudo chmod 666 /dev/kvm 2>/dev/null || true
+
       - name: Run QEMU coverage
         if: steps.tpm_enroll.outcome == 'success'
         timeout-minutes: 5
