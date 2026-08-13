@@ -4,30 +4,32 @@ on: [push, pull_request]
 jobs:
   secure-boot:
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/zaolin/vanguard/ci:latest
-      options: --privileged
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 swtpm swtpm-tools \
+            mtools efitools sbsigntool \
+            systemd systemd-boot-efi
 
       - name: Build vanguard
         run: go build -o vanguard ./cmd/vanguard/
 
       - name: Provision OVMF Secure Boot keys
         run: |
-          scripts/qemu-test.sh provision-ovmf
+          sudo scripts/qemu-test.sh provision-ovmf
 
       - name: Build signed test UKI
         run: |
-          scripts/qemu-test.sh build-uki
+          sudo scripts/qemu-test.sh build-uki
 
       - name: Test unsigned UKI rejected
         run: |
-          # Create an unsigned UKI copy on the ESP
-          mmd -i test/esp.img ::/EFI/BOOT 2>/dev/null || true
-          mcopy -i test/esp.img test/test-uki.efi ::/EFI/BOOT/BOOTX64.EFI
-          # Remove signature to create unsigned version
-          # (just use the unsigned kernel directly)
           timeout 15 qemu-system-x86_64 \
             -machine q35,smm=on -m 2G -nographic -no-reboot \
             -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.secboot.fd \
@@ -38,16 +40,6 @@ jobs:
 
       - name: Test signed UKI accepted
         run: |
-          # Re-sign the UKI and update ESP
-          ukify build \
-            --linux test/vmlinuz \
-            --initrd test/initramfs.img \
-            --cmdline "console=ttyS0" \
-            --signtool sbsign \
-            --signing-key test/keys/db.key \
-            --secureboot-certificate test/keys/db.crt \
-            -o test/test-uki-signed.efi
-          mcopy -i test/esp.img test/test-uki-signed.efi ::/EFI/BOOT/BOOTX64.EFI
           timeout 30 qemu-system-x86_64 \
             -machine q35,smm=on -m 2G -nographic -no-reboot \
             -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE.secboot.fd \

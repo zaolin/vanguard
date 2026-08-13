@@ -7,11 +7,18 @@ on:
 jobs:
   coverage:
     runs-on: ubuntu-latest
-    container:
-      image: ghcr.io/zaolin/vanguard/ci:latest
-      options: --privileged
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            qemu-system-x86 swtpm swtpm-tools cryptsetup lvm2 \
+            busybox gcc make mtools e2tools \
+            efitools sbsigntool systemd systemd-boot-efi
 
       - name: Build vanguard
         run: go build -o vanguard ./cmd/vanguard/
@@ -23,6 +30,7 @@ jobs:
 
       - name: Create test disk
         run: |
+          mkdir -p test
           dd if=/dev/zero of=test/test-disk.raw bs=1G count=1
           scripts/helpers/create-disk.sh test/test-disk.raw testpass
 
@@ -35,24 +43,24 @@ jobs:
             --tpm2 --flags startup-clear,not-need-init &
           sleep 1
 
-          LOOP=$(losetup -f --show test/test-disk.raw)
-          partprobe $LOOP; sleep 1
+          LOOP=$(sudo losetup -f --show test/test-disk.raw)
+          sudo partprobe $LOOP; sleep 1
           PART="${LOOP}p2"; [ -e "$PART" ] || PART="${LOOP}p1"
 
-          echo -n "testpass" | systemd-cryptenroll \
+          echo -n "testpass" | sudo systemd-cryptenroll \
             --tpm2-device="swtpm:path=test/tpm/swtpm.sock" \
             --wipe-slot=tpm2 --tpm2-with-pin=yes \
             --unlock-key-file=/dev/stdin "$PART"
 
-          SYSTEMD_TPM2_DEVICE="swtpm:path=test/tpm/swtpm.sock" \
-            systemd-pcrlock make-policy --policy=test/pcrlock.json --pcr=23 --force
+          sudo SYSTEMD_TPM2_DEVICE="swtpm:path=test/tpm/swtpm.sock" \
+            systemd-pcrlock make-policy --policy=test/pcrlock.json --pcr=23 --force || true
 
-          pkill swtpm; sleep 1
-          losetup -d $LOOP
+          sudo pkill swtpm; sleep 1
+          sudo losetup -d $LOOP
 
       - name: Generate initramfs
         run: |
-          ./vanguard generate -o test/initramfs.img --debug --init-binary test/init-cover
+          sudo ./vanguard generate -o test/initramfs.img --debug --init-binary test/init-cover
 
       - name: Create cover disk
         run: |

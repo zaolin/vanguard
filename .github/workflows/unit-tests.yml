@@ -4,9 +4,15 @@ on: [push, pull_request]
 jobs:
   test:
     runs-on: ubuntu-latest
-    container: ghcr.io/zaolin/vanguard/ci:latest
     steps:
       - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.23'
+      - name: Install swtpm
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y swtpm swtpm-tools
       - name: Run unit tests
         run: go test -count=1 ./...
       - name: Run race detector
