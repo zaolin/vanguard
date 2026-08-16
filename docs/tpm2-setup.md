@@ -55,6 +55,7 @@ PCRLock provides fine-grained control over which boot measurements are validated
 | 4 | Boot loader code (UKI) | ✓ Enforced (up to 3 branches) | Multi-branch handles firmware variance |
 | 5 | GPT partition table | Optional (`-l` flag) | Auto-enabled with `--luks-device` |
 | 7 | Secure Boot state | ✓ Enforced (up to 2 branches) | Primary security PCR |
+| 11 | LUKS header | Optional (`-l` flag) | Auto-enabled with `--luks-device`; measures LUKS2 header hash |
 | 13 | sysexts | - Unbound (all-zeros) | |
 | 14 | shim-policy | - Unbound (all-zeros) | |
 
@@ -89,6 +90,25 @@ When `--luks-device` (`-l`) is specified, Vanguard automatically enables GPT par
 
 **Caveats:** Partition changes break unlock - re-run `vanguard update -l <device>` after.
 
+### LUKS Header Binding (PCR 11)
+
+When `--luks-device` (`-l`) is specified, Vanguard automatically enables LUKS header binding in addition to GPT binding:
+
+**How it works:**
+1. During `vanguard update`, the LUKS2 header (binary header + JSON metadata area) is hashed with SHA256 and a `.pcrlock` component file (`755-vanguard-luks-header.pcrlock`) is created with the expected PCR 11 extension digest.
+2. During boot, vanguard's init hashes the LUKS2 header **before** attempting unlock and extends PCR 11 with the hash. A CEL-JSON record is written to `/run/log/systemd/tpm2-measure.log` so `systemd-pcrlock make-policy` can match the measurement.
+3. The pcrlock policy predicts the PCR 11 value after the extension. If the header matches, unseal succeeds. If the header was tampered, PCR 11 won't match and unseal fails.
+
+**Benefits:**
+- Detects LUKS header tampering (e.g., attacker adds a keyslot, modifies cipher parameters)
+- Prevents offline attacks that modify the header to weaken encryption
+- Binds the disk encryption state to the TPM policy
+
+**Caveats:**
+- LUKS header changes (adding/removing keyslots, re-encrypting) break unlock - re-run `vanguard update -l <device>` after.
+- Use `--no-luks-header` to disable LUKS header binding if needed.
+- The measurement is read-only: vanguard never writes to the LUKS device during measurement.
+
 ## Setup Workflow
 
 ```mermaid
@@ -105,8 +125,11 @@ flowchart TD
 # Basic policy (PCRs 2, 3, 4, 7)
 sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi
 
-# With GPT binding (adds PCR 5)
+# With GPT + LUKS header binding (adds PCR 5 + PCR 11)
 sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2
+
+# With GPT binding but without LUKS header binding
+sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 --no-luks-header
 
 # With old NV index cleanup
 sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 -c
@@ -319,6 +342,43 @@ sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 -v
 ### TPM Device Not Found
 
 **Symptom:** TPM not available, boot uses passphrase.
+
+### "PCR 11 missing from policy" - LUKS Header Component Not Matching
+
+**Symptom:** `vanguard update` succeeds but PCR 11 is not in the policy, or verbose output shows `PCR 11 is touched by component we can't find in event log`.
+
+**Root cause:** The `755-vanguard-luks-header.pcrlock` component expects a PCR 11 extension from the LUKS header measurement, but the event log (`/run/log/systemd/tpm2-measure.log`) doesn't contain a matching record. This can happen if:
+
+1. The initrd didn't write the event log record (e.g., TPM was unavailable during boot)
+2. The LUKS header changed since the last `vanguard update` (stale `.pcrlock` component)
+3. `systemd-pcrlock make-policy` can't match the component against the event log
+
+**Fix:**
+
+```bash
+# Check if the component file exists
+ls -la /etc/pcrlock.d/755-vanguard-luks-header.pcrlock.d/luks-header.pcrlock
+
+# Re-run vanguard update to regenerate the component with the current header
+sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 -v
+
+# If PCR 11 still doesn't appear, check if the event log has the record
+# (run after boot, before vanguard update)
+cat /run/log/systemd/tpm2-measure.log | python3 -c "
+import sys, json
+for line in sys.stdin.read().split('\x1e'):
+    line = line.strip()
+    if not line: continue
+    obj = json.loads(line)
+    if obj.get('pcr') == 11:
+        print(json.dumps(obj, indent=2))
+"
+
+# If no PCR 11 record, the initrd may not have measured the header
+# Check vanguard debug output (vanguard.debug=1) for "luks: measured LUKS2 header"
+```
+
+### TPM Device Not Found
 
 **Check:**
 ```bash
