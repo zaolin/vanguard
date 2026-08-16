@@ -60,6 +60,15 @@ func UnlockDevices() (bool, error) {
 	}
 
 	for _, dev := range devices {
+		// Measure the LUKS header into PCR 11 before unlocking.
+		// This binds the pcrlock policy to the on-disk LUKS header state.
+		// Skip in test mode (no TPM available in QEMU coverage tests).
+		if !isTestMode() {
+			if err := dev.MeasureHeader(); err != nil {
+				Debug("luks: header measurement failed for %s: %v (continuing)\n", dev.Path, err)
+			}
+		}
+
 		Debug("luks: unlocking %s\n", dev.Path)
 		if err := dev.Unlock(); err != nil {
 			// Close device on error before returning
@@ -700,4 +709,13 @@ func getTestPin() string {
 		}
 	}
 	return ""
+}
+
+// isTestMode checks the kernel command line for vanguard.testmode=1.
+func isTestMode() bool {
+	data, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), "vanguard.testmode=1")
 }

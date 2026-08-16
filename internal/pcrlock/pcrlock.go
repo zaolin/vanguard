@@ -14,10 +14,11 @@ import (
 	"strings"
 )
 
-const (
-	// PCRLockDir is the directory for pcrlock policy files
-	PCRLockDir = "/etc/pcrlock.d"
+// PCRLockDir is the directory for pcrlock policy files.
+// This is a var (not const) so tests can override it.
+var PCRLockDir = "/etc/pcrlock.d"
 
+const (
 	// NV index range used by systemd-pcrlock (owner hierarchy, ordinary index)
 	// These are in the range 0x01800000 - 0x01BFFFFF (TPM_HT_NV_INDEX | TPM_RH_OWNER)
 	nvIndexMin = 0x01800000
@@ -401,6 +402,125 @@ func LockGPT(device string) error {
 		}
 	}
 	return nil
+}
+
+// LockLUKSHeader creates a pcrlock component file that predicts the PCR 11
+// extension from the LUKS2 header measurement. During boot, vanguard's init
+// hashes the LUKS2 header and extends PCR 11 with the hash. This component
+// tells systemd-pcrlock make-policy what to expect, so PCR 11 is included
+// in the predicted policy.
+//
+// The component file is placed at:
+//   /etc/pcrlock.d/755-vanguard-luks-header.pcrlock.d/luks-header.pcrlock
+//
+// The 755- prefix places it between 750-enter-initrd (masked) and
+// 800-leave-initrd (masked), reflecting that the measurement happens
+// during initrd phase.
+//
+// If the LUKS header changes (e.g., keyslot added/removed), the hash changes
+// and the user must re-run `vanguard update` to regenerate this component.
+func LockLUKSHeader(devicePath string) error {
+	digest, err := computeLUKSHeaderDigest(devicePath)
+	if err != nil {
+		return fmt.Errorf("failed to hash LUKS2 header: %w", err)
+	}
+
+	// Create variant directory
+	variantDir := filepath.Join(PCRLockDir, "755-vanguard-luks-header.pcrlock.d")
+	if err := os.MkdirAll(variantDir, 0755); err != nil {
+		return fmt.Errorf("failed to create LUKS header variant directory: %w", err)
+	}
+
+	// Create the .pcrlock file with the expected PCR 11 extension record.
+	// Format matches the CEL-JSON subset used by systemd-pcrlock:
+	// { "records": [{ "pcr": 11, "digests": [{ "hashAlg": "sha256", "digest": "<hex>" }] }] }
+	pcrlockFile := map[string]interface{}{
+		"records": []map[string]interface{}{
+			{
+				"pcr": 11,
+				"digests": []map[string]interface{}{
+					{
+						"hashAlg": "sha256",
+						"digest":  fmt.Sprintf("%x", digest),
+					},
+				},
+			},
+		},
+	}
+
+	data, err := json.MarshalIndent(pcrlockFile, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal LUKS header pcrlock: %w", err)
+	}
+
+	pcrlockPath := filepath.Join(variantDir, "luks-header.pcrlock")
+	if err := os.WriteFile(pcrlockPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write LUKS header pcrlock: %w", err)
+	}
+
+	if Verbose {
+		fmt.Printf("[+] Locked LUKS header for %s (PCR 11, digest: %x)\n", devicePath, digest)
+	}
+
+	return nil
+}
+
+// MaskLUKSHeader removes the LUKS header pcrlock component by symlinking to
+// /dev/null, so make-policy ignores it. Used when --no-luks-header is passed
+// or when the device is not LUKS-encrypted.
+func MaskLUKSHeader() error {
+	return MaskPolicy("755-vanguard-luks-header.pcrlock")
+}
+
+// computeLUKSHeaderDigest reads the LUKS2 header from the device and returns
+// its SHA256 hash. The header size is determined from the hdr_len field at
+// offset 8 in the binary header.
+func computeLUKSHeaderDigest(devicePath string) ([]byte, error) {
+	f, err := os.Open(devicePath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to open device: %w", err)
+	}
+	defer f.Close()
+
+	// Read binary header (first 32 bytes for magic + version + hdr_len)
+	binHeader := make([]byte, 32)
+	if _, err := f.ReadAt(binHeader, 0); err != nil {
+		return nil, fmt.Errorf("failed to read binary header: %w", err)
+	}
+
+	// Check LUKS magic
+	if string(binHeader[0:4]) != "LUKS" {
+		return nil, fmt.Errorf("not a LUKS device: %s", devicePath)
+	}
+
+	// Check version (offset 6, big-endian uint16)
+	version := uint16(binHeader[6])<<8 | uint16(binHeader[7])
+	if version != 2 {
+		return nil, fmt.Errorf("only LUKS2 is supported (found version %d)", version)
+	}
+
+	// hdr_len at offset 8 (big-endian uint64)
+	hdrLen := uint64(binHeader[8])<<56 |
+		uint64(binHeader[9])<<48 |
+		uint64(binHeader[10])<<40 |
+		uint64(binHeader[11])<<32 |
+		uint64(binHeader[12])<<24 |
+		uint64(binHeader[13])<<16 |
+		uint64(binHeader[14])<<8 |
+		uint64(binHeader[15])
+
+	if hdrLen < 0x1000 || hdrLen > 16*1024*1024 {
+		return nil, fmt.Errorf("invalid LUKS2 header length: %d", hdrLen)
+	}
+
+	// Read the full header (binary header + JSON area)
+	fullHeader := make([]byte, hdrLen)
+	if _, err := f.ReadAt(fullHeader, 0); err != nil {
+		return nil, fmt.Errorf("failed to read full LUKS2 header: %w", err)
+	}
+
+	hash := sha256.Sum256(fullHeader)
+	return hash[:], nil
 }
 
 // MakePolicy generates policy with recovery PIN prompt.

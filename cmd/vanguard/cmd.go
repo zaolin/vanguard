@@ -33,6 +33,7 @@ type UpdatePolicyCmd struct {
 	PolicyOutput string `short:"p" help:"Output path for policy JSON (default: <uki-path>.pcrlock.json)"`
 	LUKSDevice   string `short:"l" help:"LUKS device to measure (e.g., /dev/nvme0n1p2)"`
 	NoGPT        bool   `help:"Disable GPT partition table binding (PCR 5). GPT binding is auto-enabled when --luks-device is specified."`
+	NoLUKSHeader bool   `help:"Disable LUKS header measurement (PCR 11). LUKS header binding is auto-enabled when --luks-device is specified."`
 	NoVerify     bool   `help:"Skip policy verification"`
 	Verbose      bool   `short:"v" help:"Show verbose output from pcrlock tools"`
 	Cleanup      bool   `short:"c" help:"Remove old unused pcrlock NV indices from TPM"`

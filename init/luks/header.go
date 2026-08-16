@@ -1,8 +1,10 @@
 package luks
 
 import (
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
+	"encoding/hex"
 	"fmt"
 	"io"
 	"os"
@@ -194,4 +196,47 @@ func getBlockDeviceSize(devicePath string) (uint64, error) {
 	// For block devices, use stat.Size()
 	// This works for regular files too (like disk images)
 	return uint64(stat.Size()), nil
+}
+
+// HashLUKS2Header reads the full LUKS2 header (binary header + JSON area)
+// from the device and returns its SHA256 hash as a 32-byte digest.
+// The header size is determined from the hdr_len field at offset 8.
+//
+// This hash is extended into PCR 11 to bind the pcrlock policy to the
+// on-disk LUKS header state. Any change to the header (e.g., adding or
+// removing a keyslot) will change the hash and cause a PCR mismatch.
+func HashLUKS2Header(devicePath string) ([]byte, error) {
+	// Read the binary header to get hdr_len
+	binHeader, err := readDeviceRange(devicePath, 0, 32)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read LUKS2 binary header: %w", err)
+	}
+
+	// Check LUKS magic
+	if len(binHeader) < 8 || string(binHeader[0:4]) != "LUKS" {
+		return nil, fmt.Errorf("not a LUKS device: %s", devicePath)
+	}
+
+	version := binary.BigEndian.Uint16(binHeader[6:8])
+	if version != 2 {
+		return nil, fmt.Errorf("only LUKS2 is supported (found version %d)", version)
+	}
+
+	// hdr_len at offset 8 (big-endian uint64)
+	hdrLen := binary.BigEndian.Uint64(binHeader[8:16])
+	if hdrLen < 0x1000 || hdrLen > 16*1024*1024 {
+		return nil, fmt.Errorf("invalid LUKS2 header length: %d", hdrLen)
+	}
+
+	// Read the full header (binary header + JSON area)
+	fullHeader, err := readDeviceRange(devicePath, 0, hdrLen)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read full LUKS2 header: %w", err)
+	}
+
+	// Hash with SHA256
+	hash := sha256.Sum256(fullHeader)
+	buildtags.Debug("luks: LUKS2 header hash (%s, %d bytes): %s\n",
+		devicePath, hdrLen, hex.EncodeToString(hash[:]))
+	return hash[:], nil
 }

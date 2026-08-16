@@ -272,6 +272,47 @@ func (c *Client) ReadPCR(bank HashAlgorithm, pcr int) ([]byte, error) {
 	return val, nil
 }
 
+// ExtendPCR extends a TPM PCR with the given digest in the specified bank.
+// This is used to measure the LUKS2 header into PCR 11 during initrd boot,
+// binding the pcrlock policy to the on-disk LUKS header state.
+//
+// The PCR is extended with PasswordAuth(nil) — vanguard assumes empty PCR
+// auth. If PCR auth is set, the extend will fail gracefully.
+func (c *Client) ExtendPCR(pcrIndex int, bank HashAlgorithm, digest []byte) error {
+	tpm, err := c.openTPM()
+	if err != nil {
+		return err
+	}
+	defer tpm.Close()
+
+	var alg tpm2.TPMAlgID
+	switch bank {
+	case AlgSHA256:
+		alg = tpm2.TPMAlgSHA256
+	default:
+		return fmt.Errorf("unsupported hash algorithm for PCR extend: 0x%x", bank)
+	}
+
+	_, err = tpm2.PCRExtend{
+		PCRHandle: tpm2.AuthHandle{
+			Handle: tpm2.TPMHandle(pcrIndex),
+			Auth:   tpm2.PasswordAuth(nil),
+		},
+		Digests: tpm2.TPMLDigestValues{
+			Digests: []tpm2.TPMTHA{{
+				HashAlg: alg,
+				Digest:  digest,
+			}},
+		},
+	}.Execute(tpm)
+	if err != nil {
+		return fmt.Errorf("PCR %d extend failed: %w", pcrIndex, err)
+	}
+
+	buildtags.Debug("tpm: extended PCR %d with digest %x\n", pcrIndex, digest)
+	return nil
+}
+
 // pcrsToBitmap converts a list of PCR indices to a PCR select bitmap.
 func pcrsToBitmap(pcrs []int) []byte {
 	// PCR select is a bitmap, 3 bytes for PCRs 0-23

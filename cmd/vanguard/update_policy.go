@@ -114,6 +114,28 @@ func (c *UpdatePolicyCmd) Run() error {
 		}
 	}
 
+	luksHeaderEnabled := c.LUKSDevice != "" && !c.NoLUKSHeader
+
+	if luksHeaderEnabled {
+		if err := pcrlock.LockLUKSHeader(c.LUKSDevice); err != nil {
+			if c.Verbose {
+				fmt.Printf("Note: failed to lock LUKS header: %v\n", err)
+			}
+			luksHeaderEnabled = false
+			if err := pcrlock.MaskLUKSHeader(); err != nil {
+				if c.Verbose {
+					fmt.Printf("Note: failed to mask LUKS header policy: %v\n", err)
+				}
+			}
+		}
+	} else {
+		if err := pcrlock.MaskLUKSHeader(); err != nil {
+			if c.Verbose {
+				fmt.Printf("Note: failed to mask LUKS header policy: %v\n", err)
+			}
+		}
+	}
+
 	if err := pcrlock.LockUKIWithPEFallback(c.UKIPath); err != nil {
 		return fmt.Errorf("failed to lock UKI: %w", err)
 	}
@@ -132,6 +154,9 @@ func (c *UpdatePolicyCmd) Run() error {
 		if gptEnabled {
 			addPCR(5, "GPT partition", true)
 		}
+		if luksHeaderEnabled {
+			addPCR(11, "LUKS header", true)
+		}
 		fmt.Println(box("PCRs Locked", lockLines))
 	}
 
@@ -149,11 +174,11 @@ func (c *UpdatePolicyCmd) Run() error {
 
 		pcrs, _ := pcrlock.Predict(c.PolicyOutput)
 		var verifyLines []string
-		for _, p := range []int{2, 3, 4, 5, 7} {
+		for _, p := range []int{2, 3, 4, 5, 7, 11} {
 			name := pcrName(p)
 			if pcrs[p] {
 				verifyLines = append(verifyLines, fmt.Sprintf("%s PCR %d  %s", okStyle.Render("✓"), p, name))
-			} else if (p == 7) || (p == 5 && gptEnabled) {
+			} else if (p == 7) || (p == 5 && gptEnabled) || (p == 11 && luksHeaderEnabled) {
 				verifyLines = append(verifyLines, fmt.Sprintf("%s PCR %d  %s  %s", errStyle.Render("✗"), p, name, errStyle.Render("missing")))
 			} else {
 				verifyLines = append(verifyLines, fmt.Sprintf("%s PCR %d  %s", dimStyle.Render("—"), p, name))
@@ -290,11 +315,12 @@ func box(title string, lines []string) string {
 
 func pcrName(p int) string {
 	names := map[int]string{
-		2: "external-code",
-		3: "external-config",
-		4: "boot-loader-code",
-		5: "GPT-partition",
-		7: "secure-boot-policy",
+		2:  "external-code",
+		3:  "external-config",
+		4:  "boot-loader-code",
+		5:  "GPT-partition",
+		7:  "secure-boot-policy",
+		11: "LUKS-header",
 	}
 	n, ok := names[p]
 	if !ok {
