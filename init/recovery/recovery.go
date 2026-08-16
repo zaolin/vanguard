@@ -63,11 +63,13 @@ func TryTOTP(tpmClient *intpm.Client, devicePath string) bool {
 
 	// 3. Check RTC sanity
 	now := time.Now()
-	skew := uint(totp.DefaultSkew)
-	if abs(now.Unix()-refTimestamp) > RTCDriftThreshold {
-		skew = uint(totp.DriftSkew)
-		console.Print("recovery: WARNING: clock may be wrong (ref=%d, rtc=%d) — using ±5min tolerance\n",
+	refTime := time.Unix(refTimestamp, 0)
+	rtcDrifted := abs(now.Unix()-refTimestamp) > RTCDriftThreshold
+	if rtcDrifted {
+		console.Print("recovery: WARNING: clock may be wrong (ref=%d, rtc=%d)\n",
 			refTimestamp, now.Unix())
+		console.Print("recovery: Enter the current TOTP code from your authenticator app.\n")
+		console.Print("recovery: If your code is rejected, the system clock may need resetting after boot.\n")
 		LogFunc("RECOVERY_RTC_DRIFT", "device", devicePath,
 			"ref", fmt.Sprintf("%d", refTimestamp), "rtc", fmt.Sprintf("%d", now.Unix()))
 	}
@@ -86,7 +88,18 @@ func TryTOTP(tpmClient *intpm.Client, devicePath string) bool {
 		}
 
 		// 5. Validate TOTP
-		if totp.Validate(code, seed, now, skew) {
+		// When RTC is correct, use normal skew (±90s).
+		// When RTC has drifted, also try the reference timestamp with
+		// wide skew (±24h) — the user's authenticator app uses real
+		// current time, which should be within ±24h of the last boot.
+		var valid bool
+		if rtcDrifted {
+			valid = totp.ValidateWithDrift(code, seed, now, uint(totp.DriftSkew), refTime)
+		} else {
+			valid = totp.Validate(code, seed, now, uint(totp.DefaultSkew))
+		}
+
+		if valid {
 			console.Print("recovery: TOTP code accepted — passphrase fallback enabled for this boot\n")
 			LogFunc("RECOVERY_TOTP", "device", devicePath, "status", "ok")
 
@@ -104,6 +117,9 @@ func TryTOTP(tpmClient *intpm.Client, devicePath string) bool {
 	}
 
 	console.Print("recovery: too many failed TOTP attempts\n")
+	console.Print("recovery: if your system clock is wrong, boot a live USB and run:\n")
+	console.Print("recovery:   sudo timedatectl set-ntp true\n")
+	console.Print("recovery:   sudo hwclock --systohc\n")
 	return false
 }
 

@@ -502,10 +502,10 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 					dataSize := int(binary.BigEndian.Uint16(nvData[0:2]))
 					if dataSize == 32 && len(nvData) >= 34 {
 						storedDigest := nvData[2:34]
-						if !bytes.Equal(expectedDigest, storedDigest) {
-							buildtags.Debug("tpm: pcrlock.json pre-check FAILED!\n  expected: %x\n  stored:   %x\n", expectedDigest, storedDigest)
-							return nil, fmt.Errorf("pcrlock.json predictions do not match NV index contents — pcrlock.json may be tampered or stale")
-						}
+					if !bytes.Equal(expectedDigest, storedDigest) {
+						buildtags.Debug("tpm: pcrlock.json pre-check FAILED!\n  expected: %x\n  stored:   %x\n", expectedDigest, storedDigest)
+						return nil, classifyUnsealError(fmt.Errorf("pcrlock.json predictions do not match NV index contents — pcrlock.json may be tampered or stale"), true)
+					}
 						buildtags.Debug("tpm: pcrlock.json pre-check passed (digest matches NV index)\n")
 					}
 				}
@@ -548,7 +548,7 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 		// that PolicyAuthorizeNV requires. Proceeding would guarantee a
 		// PolicyAuthorizeNV failure with a confusing error. Fail fast
 		// with a clear cause instead.
-		return nil, fmt.Errorf("pcrlock token requires PCR predictions from pcrlock.json; pcrlock.json is missing or unparseable")
+		return nil, classifyUnsealError(fmt.Errorf("pcrlock token requires PCR predictions from pcrlock.json; pcrlock.json is missing or unparseable"), true)
 	}
 
 	authVariants := []struct {
@@ -600,7 +600,7 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 		buildtags.Debug("tpm: building super-PCR policy on session...\n")
 		if err := buildSuperPCRPolicySession(tpm, opts.Bank, opts.PCRPredictions, sess); err != nil {
 			cleanup()
-			lastErr = fmt.Errorf("build super-PCR policy: %w", err)
+			lastErr = classifyUnsealError(fmt.Errorf("build super-PCR policy: %w", err), true)
 			continue
 		}
 
@@ -620,7 +620,7 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 		}.Execute(tpm)
 		if err != nil {
 			cleanup()
-			lastErr = fmt.Errorf("PolicyAuthorizeNV failed: %w", err)
+			lastErr = classifyUnsealError(fmt.Errorf("PolicyAuthorizeNV failed: %w", err), true)
 			continue
 		}
 

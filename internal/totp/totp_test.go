@@ -372,6 +372,93 @@ func TestValidate_ConstantTimeComparison(t *testing.T) {
 	}
 }
 
+// --- ValidateWithDrift tests ---
+
+func TestValidateWithDrift_RTCCorrect(t *testing.T) {
+	// When RTC is correct, ValidateWithDrift should behave like Validate
+	secret := []byte("12345678901234567890123456789012")
+	now := time.Unix(1000, 0)
+	refTime := time.Unix(1000, 0) // ref == now, no drift
+
+	code := GenerateCode(secret, now)
+
+	if !ValidateWithDrift(code, secret, now, DefaultSkew, refTime) {
+		t.Error("ValidateWithDrift should accept correct code when RTC matches")
+	}
+}
+
+func TestValidateWithDrift_RTCWrong_CodeMatchesRefTime(t *testing.T) {
+	// Simulates: RTC reset to epoch 0, but reference timestamp is from last boot.
+	// The user's authenticator app generates a code using real current time,
+	// which matches the reference timestamp (last boot was recent).
+	secret := []byte("12345678901234567890123456789012")
+	brokenRTC := time.Unix(0, 0)    // RTC reset to epoch 0
+	refTime := time.Unix(1000, 0)  // Reference timestamp from last boot
+	realTime := time.Unix(1010, 0) // Real current time (within ±24h of ref)
+
+	// Code from authenticator app (uses real time)
+	code := GenerateCode(secret, realTime)
+
+	// RTC validation should fail (code is not for epoch 0)
+	if Validate(code, secret, brokenRTC, DefaultSkew) {
+		t.Error("Validate should reject code when RTC is wrong")
+	}
+
+	// ValidateWithDrift should accept (tries refTime with WideSkew)
+	if !ValidateWithDrift(code, secret, brokenRTC, DriftSkew, refTime) {
+		t.Error("ValidateWithDrift should accept code matching refTime within WideSkew")
+	}
+}
+
+func TestValidateWithDrift_RTCWrong_CodeFarFromRef(t *testing.T) {
+	// Code is generated at a time far outside ±24h of the reference timestamp
+	// (e.g., system was off for 2 days). Should reject.
+	secret := []byte("12345678901234567890123456789012")
+	brokenRTC := time.Unix(0, 0)
+	refTime := time.Unix(1000, 0)
+	realTime := time.Unix(1000 + 2*24*3600, 0) // 2 days after ref
+
+	code := GenerateCode(secret, realTime)
+
+	if ValidateWithDrift(code, secret, brokenRTC, DriftSkew, refTime) {
+		t.Error("ValidateWithDrift should reject code more than ±24h from refTime")
+	}
+}
+
+func TestValidateWithDrift_RTCWrong_CodeWithin24h(t *testing.T) {
+	// Code is generated exactly 23h59m after the reference timestamp
+	secret := []byte("12345678901234567890123456789012")
+	brokenRTC := time.Unix(0, 0)
+	refTime := time.Unix(1000, 0)
+	realTime := time.Unix(1000 + 23*3600 + 59*60, 0) // 23h59m after ref
+
+	code := GenerateCode(secret, realTime)
+
+	if !ValidateWithDrift(code, secret, brokenRTC, DriftSkew, refTime) {
+		t.Error("ValidateWithDrift should accept code within ±24h of refTime")
+	}
+}
+
+func TestValidateWithDrift_WrongCode(t *testing.T) {
+	secret := []byte("12345678901234567890123456789012")
+	now := time.Unix(1000, 0)
+	refTime := time.Unix(1000, 0)
+
+	if ValidateWithDrift("000000", secret, now, DefaultSkew, refTime) {
+		t.Error("ValidateWithDrift should reject wrong code")
+	}
+}
+
+func TestValidateWithDrift_EmptyCode(t *testing.T) {
+	secret := []byte("12345678901234567890123456789012")
+	now := time.Unix(1000, 0)
+	refTime := time.Unix(1000, 0)
+
+	if ValidateWithDrift("", secret, now, DefaultSkew, refTime) {
+		t.Error("ValidateWithDrift should reject empty code")
+	}
+}
+
 // --- HMAC raw verification ---
 
 func TestHMAC_SHA256_RawOutput(t *testing.T) {

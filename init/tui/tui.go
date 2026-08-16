@@ -519,7 +519,7 @@ func Quit() {
 		select {
 		case <-done:
 			// Program exited cleanly
-		case <-time.After(500 * time.Millisecond):
+		case <-time.After(2 * time.Second):
 			// Timeout - force continue to avoid blocking boot
 		}
 

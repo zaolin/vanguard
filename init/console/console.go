@@ -111,16 +111,32 @@ func DebugPrint(format string, args ...interface{}) {
 	LogFunc(msg)
 }
 
-// ReadPassword reads a password from console with echo disabled
+// ReadPassword reads a password from console with echo disabled.
+// It re-opens the console device fresh to avoid conflicts with any
+// lingering TUI goroutine that may still hold the original consoleFd
+// input reader (bubbletea uses /dev/tty for input).
 func ReadPassword(prompt string) (string, error) {
-	if consoleFd == nil {
-		return "", fmt.Errorf("console not initialized")
+	// Re-open the console device fresh. This ensures we get a clean
+	// file descriptor that isn't shared with the TUI's input reader.
+	// If the TUI goroutine is still reading from the old fd, our new
+	// fd will receive input independently.
+	f, err := os.OpenFile("/dev/console", os.O_RDWR, 0)
+	if err != nil {
+		// Fallback to the shared consoleFd
+		if consoleFd == nil {
+			return "", fmt.Errorf("console not initialized")
+		}
+		f = consoleFd
+	} else {
+		defer f.Close()
 	}
 
-	Print("%s", prompt)
+	// Print prompt directly to the fd
+	fmt.Fprint(f, prompt)
 
 	// Get current terminal settings
-	oldState, err := unix.IoctlGetTermios(int(consoleFd.Fd()), unix.TCGETS)
+	fd := int(f.Fd())
+	oldState, err := unix.IoctlGetTermios(fd, unix.TCGETS)
 	if err != nil {
 		return "", fmt.Errorf("failed to get terminal state: %w", err)
 	}
@@ -128,17 +144,17 @@ func ReadPassword(prompt string) (string, error) {
 	// Disable echo and related echo flags to prevent password keystroke leakage
 	newState := *oldState
 	newState.Lflag &^= unix.ECHO | unix.ECHOE | unix.ECHOK | unix.ECHOCTL | unix.ECHOPRT | unix.ECHOKE
-	if err := unix.IoctlSetTermios(int(consoleFd.Fd()), unix.TCSETS, &newState); err != nil {
+	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &newState); err != nil {
 		return "", fmt.Errorf("failed to disable echo: %w", err)
 	}
-	defer unix.IoctlSetTermios(int(consoleFd.Fd()), unix.TCSETS, oldState)
+	defer unix.IoctlSetTermios(fd, unix.TCSETS, oldState)
 
 	// Read password (max 4KB to prevent memory exhaustion)
 	const maxPasswordLen = 4096
 	var password []byte
 	buf := make([]byte, 1)
 	for {
-		n, err := consoleFd.Read(buf)
+		n, err := f.Read(buf)
 		if err != nil || n == 0 {
 			break
 		}
@@ -152,7 +168,7 @@ func ReadPassword(prompt string) (string, error) {
 	}
 	// Zero the read buffer
 	buf[0] = 0
-	Print("\n")
+	fmt.Fprint(f, "\n")
 
 	return string(password), nil
 }

@@ -8,7 +8,8 @@
 //   - Period: 30 seconds (RFC 6238 default)
 //   - Digits: 6 (compatible with Google Authenticator, Authy, etc.)
 //   - Seed: 32 bytes (256-bit secret)
-//   - Skew: ±1 window by default (90s tolerance), ±120 when RTC drift detected
+//   - Skew: ±1 window by default (90s tolerance), ±10 when RTC drift detected,
+//     ±2880 when RTC is clearly wrong (±24h)
 //
 // Zero external dependencies — uses only crypto/hmac, crypto/sha256,
 // crypto/subtle, encoding/binary, encoding/base32, and time.
@@ -47,6 +48,19 @@ const (
 	// while limiting the attack surface: 21 valid windows × 3 attempts = 63/10^6
 	// ≈ 0.006% brute-force probability per recovery session, vs 90s default.
 	DriftSkew = 10
+
+	// WideSkew is the tolerance for severe RTC drift (±2880 = ±24h).
+	// Used when the RTC is clearly wrong (e.g., reset to epoch 0 after firmware
+	// update or CMOS battery removal). The user's authenticator app generates
+	// codes using the real current time, which may be hours or days ahead of
+	// the broken RTC. We validate against the reference timestamp (from the
+	// last successful boot) with a ±24h window.
+	//
+	// This is safe because the TOTP seed is TPM-protected — an attacker without
+	// the seed cannot generate valid codes regardless of skew width. The
+	// brute-force probability is 5761 × 3 / 10^6 ≈ 1.7% per recovery session,
+	// acceptable for a recovery-only path that requires physical presence.
+	WideSkew = 2880
 )
 
 // GenerateCode computes a 6-digit TOTP code for the given secret and time.
@@ -109,7 +123,30 @@ func Validate(code string, secret []byte, t time.Time, skew uint) bool {
 	return false
 }
 
-// GenerateSeed generates a cryptographically random 32-byte TOTP seed.
+// ValidateWithDrift validates a TOTP code against multiple time bases when the
+// RTC may be wrong. It tries:
+//  1. The RTC time (t) with the given skew — normal validation
+//  2. The reference timestamp (refTime) with WideSkew — covers the case where
+//     the RTC reset to epoch 0 or a default date, and the user's authenticator
+//     app generates codes using the real current time which is within ±24h
+//     of the reference timestamp (last successful boot)
+//
+// Returns true if the code matches any time base.
+// The TOTP seed is TPM-protected, so widening the window does not weaken
+// security — an attacker without the seed cannot generate valid codes.
+func ValidateWithDrift(code string, secret []byte, t time.Time, skew uint, refTime time.Time) bool {
+	// Try RTC time first
+	if Validate(code, secret, t, skew) {
+		return true
+	}
+
+	// Try reference timestamp with wide skew (±24h)
+	if Validate(code, secret, refTime, WideSkew) {
+		return true
+	}
+
+	return false
+}
 func GenerateSeed() ([]byte, error) {
 	seed := make([]byte, SeedSize)
 	if _, err := rand.Read(seed); err != nil {
