@@ -411,7 +411,8 @@ func LockGPT(device string) error {
 // in the predicted policy.
 //
 // The component file is placed at:
-//   /etc/pcrlock.d/755-vanguard-luks-header.pcrlock.d/luks-header.pcrlock
+//
+//	/etc/pcrlock.d/755-vanguard-luks-header.pcrlock.d/luks-header.pcrlock
 //
 // The 755- prefix places it between 750-enter-initrd (masked) and
 // 800-leave-initrd (masked), reflecting that the measurement happens
@@ -797,6 +798,20 @@ func LockUKIWithPEFallback(ukiPath string) error {
 		}
 	}
 
+	// Variant 4: Capture current boot's PCR 11 from event log
+	// This is critical for LUKS header binding (PCR 11). The uki.pcrlock variant
+	// measures the on-disk UKI file, which becomes stale when the initrd is
+	// regenerated (the .initrd section measurement changes). This variant uses
+	// the actual boot-time PCR 11 measurements from the event log, so it always
+	// matches the current boot. Without this, any initrd change causes PCR 11
+	// to be dropped from the policy due to "unrecognized measurements."
+	if err := lockCurrentBootPCR11(variantDir); err != nil {
+		// Non-fatal - PCR 11 just won't be predicted from event log
+		if Verbose {
+			fmt.Printf("Note: Could not capture current boot PCR 11: %v\n", err)
+		}
+	}
+
 	return nil
 }
 
@@ -874,6 +889,110 @@ func lockCurrentBootPCR4(variantDir string) error {
 	eventLogPath := filepath.Join(variantDir, "eventlog.pcrlock")
 	if err := os.WriteFile(eventLogPath, data, 0644); err != nil {
 		return fmt.Errorf("failed to write eventlog pcrlock: %w", err)
+	}
+
+	return nil
+}
+
+// lockCurrentBootPCR11 extracts all PCR 11 sd-stub measurements from the event
+// log and creates a variant pcrlock file for them. This ensures PCR 11 is
+// always predictable even when the on-disk UKI file (and thus uki.pcrlock)
+// becomes stale after initrd regeneration.
+//
+// sd-stub measures UKI sections (.linux, .osrel, .sbat, .cmdline, .initrd,
+// .sb, etc.) into PCR 11 as EV_IPL events. These appear in the firmware event
+// log (not the userspace event log) because sd-stub runs before the kernel.
+// We capture all PCR 11 EV_IPL records from the firmware event log and write
+// them as a pcrlock variant.
+//
+// This variant also includes the PCR 4 record from the event log, so it
+// covers both PCR 4 and PCR 11 in a single variant (like uki.pcrlock does).
+func lockCurrentBootPCR11(variantDir string) error {
+	// Read the event log in CEL-JSON format
+	cmd := exec.Command(PCRLockBinPath(), "cel")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to read event log: %w", err)
+	}
+
+	// Parse the CEL-JSON
+	var events []map[string]interface{}
+	if err := json.Unmarshal(output, &events); err != nil {
+		return fmt.Errorf("failed to parse event log: %w", err)
+	}
+
+	// Collect ALL PCR 11 records from the firmware event log.
+	// sd-stub measures UKI sections as EV_IPL events into PCR 11.
+	// We also collect the last EV_EFI_BOOT_SERVICES_APPLICATION on PCR 4
+	// (the kernel measurement) to cover PCR 4 in this variant.
+	var pcr11Records []map[string]interface{}
+	var pcr4Record map[string]interface{}
+
+	for _, event := range events {
+		pcr, ok := event["pcr"].(float64)
+		if !ok {
+			continue
+		}
+
+		content, ok := event["content"].(map[string]interface{})
+		if !ok {
+			continue
+		}
+		eventType, _ := content["event_type"].(string)
+
+		digests, ok := event["digests"].([]interface{})
+		if !ok {
+			continue
+		}
+
+		switch int(pcr) {
+		case 11:
+			// Capture all PCR 11 EV_IPL records (sd-stub section measurements)
+			if eventType == "EV_IPL" {
+				pcr11Records = append(pcr11Records, map[string]interface{}{
+					"pcr":     11,
+					"digests": digests,
+				})
+			}
+		case 4:
+			// Keep the last EV_EFI_BOOT_SERVICES_APPLICATION (kernel measurement)
+			if eventType == "EV_EFI_BOOT_SERVICES_APPLICATION" {
+				pcr4Record = map[string]interface{}{
+					"pcr":     4,
+					"digests": digests,
+				}
+			}
+		}
+	}
+
+	if len(pcr11Records) == 0 {
+		return fmt.Errorf("no PCR 11 EV_IPL records found in event log")
+	}
+
+	// Build the pcrlock file with PCR 4 (if found) + all PCR 11 records
+	var records []map[string]interface{}
+	if pcr4Record != nil {
+		records = append(records, pcr4Record)
+	}
+	records = append(records, pcr11Records...)
+
+	pcrlockFile := map[string]interface{}{
+		"records": records,
+	}
+
+	data, err := json.MarshalIndent(pcrlockFile, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal pcrlock: %w", err)
+	}
+
+	eventLogPath := filepath.Join(variantDir, "eventlog-pcr11.pcrlock")
+	if err := os.WriteFile(eventLogPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write eventlog-pcr11 pcrlock: %w", err)
+	}
+
+	if Verbose {
+		fmt.Printf("[+] Captured %d PCR 11 records from event log (eventlog-pcr11.pcrlock)\n",
+			len(pcr11Records))
 	}
 
 	return nil

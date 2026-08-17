@@ -543,10 +543,10 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 					dataSize := int(binary.BigEndian.Uint16(nvData[0:2]))
 					if dataSize == 32 && len(nvData) >= 34 {
 						storedDigest := nvData[2:34]
-					if !bytes.Equal(expectedDigest, storedDigest) {
-						buildtags.Debug("tpm: pcrlock.json pre-check FAILED!\n  expected: %x\n  stored:   %x\n", expectedDigest, storedDigest)
-						return nil, classifyUnsealError(fmt.Errorf("pcrlock.json predictions do not match NV index contents — pcrlock.json may be tampered or stale"), true)
-					}
+						if !bytes.Equal(expectedDigest, storedDigest) {
+							buildtags.Debug("tpm: pcrlock.json pre-check FAILED!\n  expected: %x\n  stored:   %x\n", expectedDigest, storedDigest)
+							return nil, classifyUnsealError(fmt.Errorf("pcrlock.json predictions do not match NV index contents — pcrlock.json may be tampered or stale"), true)
+						}
 						buildtags.Debug("tpm: pcrlock.json pre-check passed (digest matches NV index)\n")
 					}
 				}

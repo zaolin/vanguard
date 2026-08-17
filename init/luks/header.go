@@ -3,8 +3,8 @@ package luks
 import (
 	"crypto/sha256"
 	"encoding/binary"
-	"encoding/json"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"

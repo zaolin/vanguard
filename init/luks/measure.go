@@ -85,10 +85,10 @@ func measureHeaderWithDeps(
 // for compatibility but are ignored by systemd-pcrlock's component matching
 // (only "pcr" and "digests" are used, per systemd.pcrlock(5)).
 type celRecord struct {
-	PCR       int         `json:"pcr"`
-	Digests   []celDigest `json:"digests"`
-	Content   celContent  `json:"content"`
-	ContentType string     `json:"content_type"`
+	PCR         int         `json:"pcr"`
+	Digests     []celDigest `json:"digests"`
+	Content     celContent  `json:"content"`
+	ContentType string      `json:"content_type"`
 }
 
 type celDigest struct {
@@ -97,7 +97,7 @@ type celDigest struct {
 }
 
 type celContent struct {
-	EventType string `json:"event_type"`
+	EventType string            `json:"event_type"`
 	Data      map[string]string `json:"data"`
 }
 

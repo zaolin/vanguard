@@ -392,7 +392,7 @@ func TestValidateWithDrift_RTCWrong_CodeMatchesRefTime(t *testing.T) {
 	// The user's authenticator app generates a code using real current time,
 	// which matches the reference timestamp (last boot was recent).
 	secret := []byte("12345678901234567890123456789012")
-	brokenRTC := time.Unix(0, 0)    // RTC reset to epoch 0
+	brokenRTC := time.Unix(0, 0)   // RTC reset to epoch 0
 	refTime := time.Unix(1000, 0)  // Reference timestamp from last boot
 	realTime := time.Unix(1010, 0) // Real current time (within ±24h of ref)
 
@@ -416,7 +416,7 @@ func TestValidateWithDrift_RTCWrong_CodeFarFromRef(t *testing.T) {
 	secret := []byte("12345678901234567890123456789012")
 	brokenRTC := time.Unix(0, 0)
 	refTime := time.Unix(1000, 0)
-	realTime := time.Unix(1000 + 2*24*3600, 0) // 2 days after ref
+	realTime := time.Unix(1000+2*24*3600, 0) // 2 days after ref
 
 	code := GenerateCode(secret, realTime)
 
@@ -430,7 +430,7 @@ func TestValidateWithDrift_RTCWrong_CodeWithin24h(t *testing.T) {
 	secret := []byte("12345678901234567890123456789012")
 	brokenRTC := time.Unix(0, 0)
 	refTime := time.Unix(1000, 0)
-	realTime := time.Unix(1000 + 23*3600 + 59*60, 0) // 23h59m after ref
+	realTime := time.Unix(1000+23*3600+59*60, 0) // 23h59m after ref
 
 	code := GenerateCode(secret, realTime)
 
