@@ -565,7 +565,27 @@ func MakePolicy(outputPath string) error {
 	// Remove existing policy file (required by make-policy to overwrite)
 	os.Remove(outputPath)
 
-	args := []string{"make-policy", "--policy=" + outputPath, "--force", "--recovery-pin=query"}
+	// Use --location=756 to limit the prediction window to our
+	// 755-vanguard-luks-header.pcrlock component. This is critical:
+	//
+	// systemd-pcrlock make-policy validates the entire event log against
+	// component files. PCR 11 has measurements from systemd's sysinit/ready
+	// phases (recnum 100-101) that happen AFTER LUKS unlock. Those
+	// components (850-sysinit, 900-ready) are masked, so make-policy sees
+	// "unrecognized measurements" on PCR 11 and refuses to predict it.
+	//
+	// By setting --location=756, we tell make-policy to only predict up to
+	// component 755 (our LUKS header component). Measurements after that
+	// point (sysinit, ready, shutdown) are ignored — they're outside the
+	// prediction window. The predicted PCR 11 value includes only the
+	// sd-stub kernel measurement + our LUKS header hash, which is exactly
+	// the PCR 11 state at LUKS unseal time.
+	//
+	// systemd's own make-policy.service uses --location=770 for the same
+	// reason: it predicts up to the nvpcr-separator, excluding leave-initrd
+	// and later phases that haven't happened at disk-unlock time.
+	args := []string{"make-policy", "--policy=" + outputPath, "--force",
+		"--recovery-pin=query", "--location=756"}
 	// Add --quiet flag when not in verbose mode to suppress diagnostic output
 	if !Verbose {
 		args = append(args, "--quiet")
