@@ -167,6 +167,20 @@ func (c *UpdatePolicyCmd) Run() error {
 		return fmt.Errorf("failed to generate policy: %w", err)
 	}
 
+	// Inject the NEW LUKS header prediction into the policy.
+	// make-policy generates the policy using the event log (which has the
+	// OLD LUKS header hash from the last boot). But the NEXT boot will use
+	// the NEW hash (because vanguard update just re-enrolled the TPM2 token,
+	// changing the LUKS2 JSON metadata). InjectLUKSHeaderPrediction adds
+	// the NEW predicted PCR 11 value so the next boot's unseal succeeds.
+	if luksHeaderEnabled {
+		if err := pcrlock.InjectLUKSHeaderPrediction(c.PolicyOutput, c.LUKSDevice); err != nil {
+			if c.Verbose {
+				fmt.Printf("Note: failed to inject LUKS header prediction: %v\n", err)
+			}
+		}
+	}
+
 	if !c.NoVerify {
 		requiredPCRs := []int{7}
 

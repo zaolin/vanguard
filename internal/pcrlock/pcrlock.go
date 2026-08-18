@@ -4,6 +4,7 @@ import (
 	"bufio"
 	"bytes"
 	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -63,6 +64,14 @@ func cmdOutput() (io.Writer, io.Writer) {
 // the event log. When a component can't match, systemd-pcrlock drops every PCR
 // it touches (0-7, 9, 12-14) with "touched by component we can't find",
 // cascading to drop ALL PCRs including PCR 7.
+//
+// Note: 850-sysinit and 900-ready are NOT masked. They are statically-defined
+// components that match systemd's sysinit/ready phase measurements on PCR 11.
+// make-policy validates the entire event log (not just up to --location), so
+// if these are masked, PCR 11 gets "unrecognized measurements" and is dropped.
+// With --location=756, the prediction is computed before these phases, but
+// validation still needs to match them. Keeping them unmasked allows full
+// PCR 11 validation while the --location parameter controls the prediction point.
 var maskedPolicies = []string{
 	"200-firmware-code.pcrlock",
 	"220-firmware-config.pcrlock",
@@ -74,8 +83,6 @@ var maskedPolicies = []string{
 	"800-leave-initrd.pcrlock",
 	"820-machine-id.pcrlock",
 	"830-root-file-system.pcrlock",
-	"850-sysinit.pcrlock",
-	"900-ready.pcrlock",
 	"940-machine-id.pcrlock",
 	"940-machine-id-null.pcrlock",
 	"950-root-file-system.pcrlock",
@@ -88,6 +95,14 @@ var maskedPolicies = []string{
 var unmaskedPolicies = []string{
 	"400-external-code.pcrlock",
 	"400-external-config.pcrlock",
+}
+
+// previouslyMaskedPolicies lists entries that were previously in maskedPolicies
+// but have been removed. ConfigureMasks() unmasks these to remove stale
+// /dev/null symlinks from previous vanguard update runs.
+var previouslyMaskedPolicies = []string{
+	"850-sysinit.pcrlock",
+	"900-ready.pcrlock",
 }
 
 // Stale locks to remove before regenerating
@@ -151,6 +166,19 @@ func ConfigureMasks() error {
 
 	// Remove stale locks
 	RemoveStaleLocks()
+
+	// Remove stale masks — entries that were previously in maskedPolicies
+	// but have been removed. Without this, old symlinks to /dev/null persist
+	// and cause make-policy to see those components as masked even though
+	// the code no longer masks them.
+	for _, name := range previouslyMaskedPolicies {
+		if err := UnmaskPolicy(name); err != nil {
+			// Non-fatal — just log
+			if Verbose {
+				fmt.Printf("Note: failed to unmask stale %s: %v\n", name, err)
+			}
+		}
+	}
 
 	// Mask noisy policies
 	for _, name := range maskedPolicies {
@@ -404,22 +432,29 @@ func LockGPT(device string) error {
 	return nil
 }
 
-// LockLUKSHeader creates a pcrlock component file that predicts the PCR 11
+// LockLUKSHeader creates pcrlock component files that predict the PCR 11
 // extension from the LUKS2 header measurement. During boot, vanguard's init
-// hashes the LUKS2 header and extends PCR 11 with the hash. This component
-// tells systemd-pcrlock make-policy what to expect, so PCR 11 is included
-// in the predicted policy.
+// hashes the LUKS2 header and extends PCR 11 with the hash.
 //
-// The component file is placed at:
+// Two variants are created:
 //
-//	/etc/pcrlock.d/755-vanguard-luks-header.pcrlock.d/luks-header.pcrlock
+//  1. luks-header.pcrlock — uses the current on-disk LUKS header hash.
+//     This matches the NEXT boot (after the policy is applied).
+//
+//  2. luks-header-eventlog.pcrlock — uses the LUKS header hash from the
+//     current boot's event log. This matches the CURRENT boot so make-policy
+//     can validate the event log. Without this, make-policy sees the component
+//     as "not found in event log" because the on-disk hash differs from the
+//     event log hash (the header changes when vanguard update re-enrolls the
+//     TPM2 token).
+//
+// The component directory is placed at:
+//
+//	/etc/pcrlock.d/755-vanguard-luks-header.pcrlock.d/
 //
 // The 755- prefix places it between 750-enter-initrd (masked) and
 // 800-leave-initrd (masked), reflecting that the measurement happens
 // during initrd phase.
-//
-// If the LUKS header changes (e.g., keyslot added/removed), the hash changes
-// and the user must re-run `vanguard update` to regenerate this component.
 func LockLUKSHeader(devicePath string) error {
 	digest, err := computeLUKSHeaderDigest(devicePath)
 	if err != nil {
@@ -432,9 +467,14 @@ func LockLUKSHeader(devicePath string) error {
 		return fmt.Errorf("failed to create LUKS header variant directory: %w", err)
 	}
 
-	// Create the .pcrlock file with the expected PCR 11 extension record.
-	// Format matches the CEL-JSON subset used by systemd-pcrlock:
-	// { "records": [{ "pcr": 11, "digests": [{ "hashAlg": "sha256", "digest": "<hex>" }] }] }
+	// Clean variant directory before creating new locks
+	if entries, err := os.ReadDir(variantDir); err == nil {
+		for _, entry := range entries {
+			os.Remove(filepath.Join(variantDir, entry.Name()))
+		}
+	}
+
+	// Variant 1: On-disk LUKS header hash (matches next boot)
 	pcrlockFile := map[string]interface{}{
 		"records": []map[string]interface{}{
 			{
@@ -463,6 +503,19 @@ func LockLUKSHeader(devicePath string) error {
 		fmt.Printf("[+] Locked LUKS header for %s (PCR 11, digest: %x)\n", devicePath, digest)
 	}
 
+	// Variant 2: Event log LUKS header hash (matches current boot)
+	// This is critical: vanguard update re-enrolls the TPM2 token, which
+	// changes the LUKS2 JSON metadata, which changes the header hash. The
+	// event log has the OLD hash (from the last boot), but the on-disk
+	// variant has the NEW hash. Without an eventlog variant, make-policy
+	// can't match the component against the event log and drops PCR 11.
+	if err := lockLUKSHeaderEventlog(variantDir); err != nil {
+		// Non-fatal — just means current boot won't match but next boot will
+		if Verbose {
+			fmt.Printf("Note: Could not capture LUKS header from event log: %v\n", err)
+		}
+	}
+
 	return nil
 }
 
@@ -471,6 +524,324 @@ func LockLUKSHeader(devicePath string) error {
 // or when the device is not LUKS-encrypted.
 func MaskLUKSHeader() error {
 	return MaskPolicy("755-vanguard-luks-header.pcrlock")
+}
+
+// lockLUKSHeaderEventlog extracts the vanguard-luks-header PCR 11 record from
+// the current boot's event log and creates a variant pcrlock file for it.
+// This ensures make-policy can match the component against the event log even
+// when the on-disk LUKS header hash differs (e.g., after vanguard update
+// re-enrolls the TPM2 token, changing the LUKS2 JSON metadata).
+//
+// The record is identified by exclusion: sd-stub measurements have
+// content_type "pcclient_std" and systemd phase measurements have
+// content_type "systemd". Our vanguard-luks-header record has neither
+// (systemd-pcrlock cel strips unrecognized content), so we pick the
+// PCR 11 record that doesn't match either known content_type.
+func lockLUKSHeaderEventlog(variantDir string) error {
+	digest, err := findLUKSHeaderDigestFromEventLog()
+	if err != nil {
+		return err
+	}
+
+	pcrlockFile := map[string]interface{}{
+		"records": []map[string]interface{}{
+			{
+				"pcr": 11,
+				"digests": []map[string]interface{}{
+					{
+						"hashAlg": "sha256",
+						"digest":  fmt.Sprintf("%x", digest),
+					},
+				},
+			},
+		},
+	}
+
+	data, err := json.MarshalIndent(pcrlockFile, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal eventlog LUKS header pcrlock: %w", err)
+	}
+
+	eventlogPath := filepath.Join(variantDir, "luks-header-eventlog.pcrlock")
+	if err := os.WriteFile(eventlogPath, data, 0644); err != nil {
+		return fmt.Errorf("failed to write eventlog LUKS header pcrlock: %w", err)
+	}
+
+	if Verbose {
+		fmt.Printf("[+] Captured LUKS header from event log (luks-header-eventlog.pcrlock)\n")
+	}
+
+	return nil
+}
+
+// findLUKSHeaderDigestFromEventLog reads the combined event log via
+// `systemd-pcrlock cel` and finds the vanguard-luks-header PCR 11 record.
+// The record is identified by exclusion: it's the PCR 11 record that
+// doesn't have content_type "pcclient_std" (sd-stub) or "systemd" (phases).
+func findLUKSHeaderDigestFromEventLog() ([]byte, error) {
+	cmd := exec.Command(PCRLockBinPath(), "cel")
+	output, err := cmd.Output()
+	if err != nil {
+		return nil, fmt.Errorf("failed to read event log: %w", err)
+	}
+
+	var events []map[string]interface{}
+	if err := json.Unmarshal(output, &events); err != nil {
+		return nil, fmt.Errorf("failed to parse event log: %w", err)
+	}
+
+	for _, event := range events {
+		pcr, ok := event["pcr"].(float64)
+		if !ok || int(pcr) != 11 {
+			continue
+		}
+
+		// Skip sd-stub measurements (content_type: "pcclient_std")
+		contentType, _ := event["content_type"].(string)
+		if contentType == "pcclient_std" {
+			continue
+		}
+		// Skip systemd phase measurements (content_type: "systemd")
+		if contentType == "systemd" {
+			continue
+		}
+
+		// This is our vanguard-luks-header record (no recognized content_type)
+		digests, ok := event["digests"].([]interface{})
+		if !ok {
+			continue
+		}
+
+		for _, d := range digests {
+			dMap, ok := d.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			hashAlg, _ := dMap["hashAlg"].(string)
+			digestHex, _ := dMap["digest"].(string)
+			if hashAlg == "sha256" && digestHex != "" {
+				return hex.DecodeString(digestHex)
+			}
+		}
+	}
+
+	return nil, fmt.Errorf("no vanguard-luks-header record found in event log")
+}
+
+// InjectLUKSHeaderPrediction post-processes a pcrlock.json policy file to
+// add the predicted PCR 11 value using the current on-disk LUKS header hash.
+//
+// This is needed because make-policy generates the policy using the event log
+// (which has the OLD LUKS header hash from the last boot), but the NEXT boot
+// will use the NEW hash (after vanguard update re-enrolled the TPM2 token).
+//
+// The function:
+//  1. Reads the existing pcrlock.json
+//  2. Replays all PCR 11 records from the event log (sd-stub + old LUKS hash)
+//     to compute the PCR 11 value that make-policy predicted
+//  3. Replaces the old LUKS hash with the new on-disk hash and recomputes
+//     the predicted PCR 11 value
+//  4. Adds the new predicted value as an additional value for PCR 11 in the
+//     policy's pcrValues array (PolicyOR — accepts either old or new)
+//
+// On the next boot, init measures the NEW hash → PCR 11 matches the injected
+// prediction → unseal succeeds. After that boot, make-policy regenerates the
+// policy cleanly (event log now has the new hash).
+func InjectLUKSHeaderPrediction(policyPath, devicePath string) error {
+	// Read the on-disk LUKS header hash
+	newDigest, err := computeLUKSHeaderDigest(devicePath)
+	if err != nil {
+		return fmt.Errorf("failed to hash LUKS header: %w", err)
+	}
+
+	// Read the event log to get the old LUKS header hash and all PCR 11
+	// records that come before it (sd-stub measurements)
+	cmd := exec.Command(PCRLockBinPath(), "cel")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to read event log: %w", err)
+	}
+
+	var events []map[string]interface{}
+	if err := json.Unmarshal(output, &events); err != nil {
+		return fmt.Errorf("failed to parse event log: %w", err)
+	}
+
+	// Collect all PCR 11 extension digests in order (sd-stub + LUKS header).
+	// We need to replay them to compute the predicted PCR 11 value.
+	// The LUKS header record is identified by exclusion: it's the PCR 11
+	// record that doesn't have content_type "pcclient_std" (sd-stub) or
+	// "systemd" (phases). systemd-pcrlock cel strips the content field
+	// from unrecognized records, so we can't search by content string.
+	var pcr11Extensions [][]byte
+	var oldLUKSDigest []byte
+	foundLUKS := false
+
+	for _, event := range events {
+		pcr, ok := event["pcr"].(float64)
+		if !ok || int(pcr) != 11 {
+			continue
+		}
+
+		digests, ok := event["digests"].([]interface{})
+		if !ok {
+			continue
+		}
+
+		// Extract sha256 digest
+		for _, d := range digests {
+			dMap, ok := d.(map[string]interface{})
+			if !ok {
+				continue
+			}
+			hashAlg, _ := dMap["hashAlg"].(string)
+			digestHex, _ := dMap["digest"].(string)
+			if hashAlg != "sha256" {
+				continue
+			}
+
+			digest, err := hex.DecodeString(digestHex)
+			if err != nil {
+				continue
+			}
+
+			// Identify the vanguard-luks-header record by exclusion.
+			// sd-stub records have content_type "pcclient_std".
+			// systemd phase records have content_type "systemd".
+			// Our record has neither (stripped by cel).
+			contentType, _ := event["content_type"].(string)
+			if contentType != "pcclient_std" && contentType != "systemd" {
+				oldLUKSDigest = digest
+				foundLUKS = true
+				// Don't add to pcr11Extensions — we'll replace with new digest
+			} else {
+				pcr11Extensions = append(pcr11Extensions, digest)
+			}
+		}
+	}
+
+	if !foundLUKS {
+		// No LUKS header record in event log — nothing to inject
+		if Verbose {
+			fmt.Printf("Note: No vanguard-luks-header record in event log, skipping injection\n")
+		}
+		return nil
+	}
+
+	// Compute predicted PCR 11 with OLD hash (what make-policy predicted)
+	// Replay: PCR11 = SHA256(SHA256(...SHA256(0 || ext1) || ext2...) || oldLUKS)
+	pcr11Old := make([]byte, 32) // start with all-zeros
+	for _, ext := range pcr11Extensions {
+		h := sha256.New()
+		h.Write(pcr11Old)
+		h.Write(ext)
+		pcr11Old = h.Sum(nil)
+	}
+	if oldLUKSDigest != nil {
+		h := sha256.New()
+		h.Write(pcr11Old)
+		h.Write(oldLUKSDigest)
+		pcr11Old = h.Sum(nil)
+	}
+
+	// Compute predicted PCR 11 with NEW hash (what the next boot will produce)
+	pcr11New := make([]byte, 32)
+	for _, ext := range pcr11Extensions {
+		h := sha256.New()
+		h.Write(pcr11New)
+		h.Write(ext)
+		pcr11New = h.Sum(nil)
+	}
+	h := sha256.New()
+	h.Write(pcr11New)
+	h.Write(newDigest)
+	pcr11New = h.Sum(nil)
+
+	// Read the existing policy
+	policyData, err := os.ReadFile(policyPath)
+	if err != nil {
+		return fmt.Errorf("failed to read policy: %w", err)
+	}
+
+	var policy map[string]interface{}
+	if err := json.Unmarshal(policyData, &policy); err != nil {
+		return fmt.Errorf("failed to parse policy: %w", err)
+	}
+
+	// Find or create PCR 11 entry in pcrValues
+	pcrValues, ok := policy["pcrValues"].([]interface{})
+	if !ok {
+		pcrValues = []interface{}{}
+	}
+
+	newPCR11Value := hex.EncodeToString(pcr11New)
+	oldPCR11Value := hex.EncodeToString(pcr11Old)
+
+	// Check if PCR 11 is already in the policy
+	foundPCR11 := false
+	for i, pv := range pcrValues {
+		pvMap, ok := pv.(map[string]interface{})
+		if !ok {
+			continue
+		}
+		pcr, ok := pvMap["pcr"].(float64)
+		if ok && int(pcr) == 11 {
+			foundPCR11 = true
+			// Add the new predicted value if not already present
+			values, ok := pvMap["values"].([]interface{})
+			if !ok {
+				values = []interface{}{}
+			}
+
+			// Check if new value is already present
+			alreadyPresent := false
+			for _, v := range values {
+				if vStr, ok := v.(string); ok && vStr == newPCR11Value {
+					alreadyPresent = true
+					break
+				}
+			}
+
+			if !alreadyPresent {
+				values = append(values, newPCR11Value)
+				pvMap["values"] = values
+				pcrValues[i] = pvMap
+				if Verbose {
+					fmt.Printf("[+] Injected PCR 11 prediction for new LUKS header hash: %s\n",
+						newPCR11Value[:20])
+				}
+			}
+
+			break
+		}
+	}
+
+	// If PCR 11 is not in the policy at all, add it with both old and new values
+	if !foundPCR11 {
+		pcr11Entry := map[string]interface{}{
+			"pcr":    11,
+			"values": []interface{}{oldPCR11Value, newPCR11Value},
+		}
+		pcrValues = append(pcrValues, pcr11Entry)
+		if Verbose {
+			fmt.Printf("[+] Added PCR 11 to policy with old (%s...) and new (%s...) predictions\n",
+				oldPCR11Value[:20], newPCR11Value[:20])
+		}
+	}
+
+	policy["pcrValues"] = pcrValues
+
+	// Write the modified policy
+	updatedData, err := json.MarshalIndent(policy, "", "  ")
+	if err != nil {
+		return fmt.Errorf("failed to marshal updated policy: %w", err)
+	}
+
+	if err := os.WriteFile(policyPath, updatedData, 0644); err != nil {
+		return fmt.Errorf("failed to write updated policy: %w", err)
+	}
+
+	return nil
 }
 
 // computeLUKSHeaderDigest reads the LUKS2 header from the device and returns

@@ -845,6 +845,42 @@ func buildBootChainTamperingVector(data *statusData) threatVector {
 		}
 	}
 
+	// PCR 11 (LUKS header binding)
+	// Detects offline LUKS header tampering: adding a backdoor keyslot,
+	// weakening KDF, or changing the cipher. Any header modification
+	// changes the PCR 11 hash and breaks the pcrlock policy.
+	pcr11Bound := false
+	pcr11Match := false
+	for _, r := range data.PCRLock.PCRResults {
+		if r.PCR == 11 {
+			pcr11Bound = r.IsEnforced
+			pcr11Match = r.Match
+			break
+		}
+	}
+	if pcr11Bound {
+		if pcr11Match {
+			v.Mitigations = append(v.Mitigations, mitigation{
+				Name:   "PCRLock PCR 11 (LUKS header)",
+				Status: "ok",
+				Detail: "bound — LUKS header tampering detected",
+			})
+		} else {
+			v.Mitigations = append(v.Mitigations, mitigation{
+				Name:   "PCRLock PCR 11 (LUKS header)",
+				Status: "critical",
+				Detail: "MISMATCH — LUKS header changed since enrollment",
+				Fix:    "Run: vanguard update -u <uki> -l <luks-dev>",
+			})
+		}
+	} else {
+		v.Mitigations = append(v.Mitigations, mitigation{
+			Name:   "PCRLock PCR 11 (LUKS header)",
+			Status: "info",
+			Detail: "not bound — LUKS header tampering not detected (use -l <luks-dev> with vanguard update)",
+		})
+	}
+
 	// TPM PCRs valid (fwupd)
 	if data.Fwupd != nil && data.Fwupd.present(fwupdTpmEmptyPcr) {
 		if data.Fwupd.success(fwupdTpmEmptyPcr) {

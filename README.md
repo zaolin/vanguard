@@ -15,7 +15,8 @@ Vanguard binds disk encryption keys to the measured boot state of the platform. 
 | Attack | What Vanguard does |
 |--------|-------------------|
 | Evil Maid (initrd/UKI replacement) | Secure Boot enforcement, PCRLock PCR 7 binding, sbctl signature verification, hardware validated boot (PSB) |
-| Boot chain tampering | PCRLock multi-PCR binding (PCR 0-7), TPM NV index policy, PCR0 reconstruction |
+| Boot chain tampering | PCRLock multi-PCR binding (PCR 0-7, 11), TPM NV index policy, PCR0 reconstruction, LUKS header measurement (PCR 11) |
+| LUKS header tampering (offline) | PCR 11 LUKS header hash binding — detects added keyslots, KDF weakening, cipher changes |
 | TPM key extraction (bus sniffing) | fTPM detection (no external bus), TPM bus encryption (CONFIG_TCG_TPM2_HMAC), dictionary attack lockout |
 | DMA attack (Thunderbolt/PCIe) | IOMMU enforcement, pre-boot DMA protection |
 | Kernel runtime attack (module/rootkit) | Kernel lockdown, module signature enforcement, CET shadow stack, SMAP |
