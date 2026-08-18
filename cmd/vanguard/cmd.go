@@ -29,7 +29,7 @@ type GenerateCmd struct {
 
 // UpdatePolicyCmd updates TPM2 pcrlock policy
 type UpdatePolicyCmd struct {
-	UKIPath      string `short:"u" required:"" help:"Path to UKI file (e.g., /boot/EFI/Gentoo/kernel.efi)"`
+	UKIPath      string `short:"u" help:"Path to UKI file (e.g., /boot/EFI/Gentoo/kernel.efi)"`
 	PolicyOutput string `short:"p" help:"Output path for policy JSON (default: <uki-path>.pcrlock.json)"`
 	LUKSDevice   string `short:"l" help:"LUKS device to measure (e.g., /dev/nvme0n1p2)"`
 	NoGPT        bool   `help:"Disable GPT partition table binding (PCR 5). GPT binding is auto-enabled when --luks-device is specified."`
@@ -39,6 +39,7 @@ type UpdatePolicyCmd struct {
 	Cleanup      bool   `short:"c" help:"Remove old unused pcrlock NV indices from TPM"`
 	DryRun       bool   `help:"Show what would be done without modifying TPM or writing policy"`
 	JSON         bool   `help:"Output results as JSON (implies --dry-run for non-mutating commands)"`
+	Config       string `type:"path" help:"Path to TOML config file (e.g., /etc/vanguard.toml). Reads uki_path and luks_device from config if not set via flags."`
 }
 
 // VerifyPCRLockCmd verifies TPM2 pcrlock setup

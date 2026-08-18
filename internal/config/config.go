@@ -13,7 +13,9 @@ type Config struct {
 	Firmware    []string `toml:"firmware"`
 	Modules     []string `toml:"modules"`
 	Debug       bool     `toml:"debug"`
-	InitBinary  string   `toml:"-"` // Not from TOML - set from CLI flag
+	UKIPath     string   `toml:"uki_path"`
+	LUKSDevice  string   `toml:"luks_device"`
+	InitBinary  string   `toml:"-"`
 }
 
 // DefaultConfig returns a config with sensible defaults

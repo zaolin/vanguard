@@ -238,6 +238,10 @@ Vanguard can be configured using a TOML file. By default, it looks for `/etc/van
 ### File Format
 
 ```toml
+# /etc/vanguard.toml
+
+# --- Initramfs generation (vanguard generate) ---
+
 # Output path for generated initramfs
 output = "/boot/initramfs-linux.img"
 
@@ -261,6 +265,14 @@ modules = [
     "i915",
     "amdgpu",
 ]
+
+# --- TPM policy (vanguard update, vanguard-pcrlock-relock.service) ---
+
+# Path to the UKI file (required for vanguard update)
+uki_path = "/boot/EFI/Gentoo/kernel.efi"
+
+# LUKS device for GPT + LUKS header binding (optional, enables PCR 5 + PCR 11)
+luks_device = "/dev/nvme0n1p2"
 ```
 
 ### Options Reference
@@ -295,6 +307,16 @@ modules = [
 - **Type:** array of strings
 - **Default:** `[]`
 - **Description:** List of kernel modules to include. Modules are loaded during early boot.
+
+#### uki_path
+- **Type:** string
+- **Default:** (none)
+- **Description:** Path to the UKI file. Used by `vanguard update --config` and `vanguard-pcrlock-relock.service` to locate the UKI for pcrlock policy generation. Can be overridden with `-u` flag.
+
+#### luks_device
+- **Type:** string
+- **Default:** (none)
+- **Description:** Path to the LUKS device (e.g., `/dev/nvme0n1p2`). Enables GPT partition binding (PCR 5) and LUKS header measurement (PCR 11). Used by `vanguard update --config` and `vanguard-pcrlock-relock.service`. Can be overridden with `-l` flag.
 
 ## Included Binaries
 

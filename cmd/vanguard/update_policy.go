@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	"github.com/zaolin/vanguard/internal/config"
 	"github.com/zaolin/vanguard/internal/pcrlock"
 )
 
@@ -14,6 +15,24 @@ func (c *UpdatePolicyCmd) Run() error {
 
 	if os.Geteuid() != 0 {
 		return fmt.Errorf("this command must be run as root")
+	}
+
+	// Load config file if specified — CLI flags override TOML values
+	if c.Config != "" {
+		cfg, err := config.Load(c.Config)
+		if err != nil {
+			return fmt.Errorf("failed to load config %s: %w", c.Config, err)
+		}
+		if c.UKIPath == "" {
+			c.UKIPath = cfg.UKIPath
+		}
+		if c.LUKSDevice == "" {
+			c.LUKSDevice = cfg.LUKSDevice
+		}
+	}
+
+	if c.UKIPath == "" {
+		return fmt.Errorf("UKI path required: use -u <path> or set uki_path in config file")
 	}
 
 	if _, err := os.Stat(c.UKIPath); err != nil {

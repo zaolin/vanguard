@@ -46,5 +46,3 @@ install: embed
 install-systemd: install
 	install -d $(DESTDIR)/usr/lib/systemd/system
 	install -m644 cmd/vanguard/embed/vanguard-pcrlock-relock.service $(DESTDIR)/usr/lib/systemd/system/
-	install -d $(DESTDIR)/etc/vanguard
-	install -m600 cmd/vanguard/embed/vanguard.env.example $(DESTDIR)/etc/vanguard/vanguard.env.example

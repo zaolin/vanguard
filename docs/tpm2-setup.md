@@ -128,6 +128,9 @@ sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi
 # With GPT + LUKS header binding (adds PCR 5 + PCR 11)
 sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2
 
+# Using a config file (reads uki_path and luks_device from /etc/vanguard.toml)
+sudo vanguard update --config /etc/vanguard.toml
+
 # With GPT binding but without LUKS header binding
 sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 --no-luks-header
 
@@ -455,20 +458,24 @@ The `make-policy` step always uses the CLI path because:
 
 Vanguard ships a systemd unit that automatically re-locks the pcrlock policy **and** re-provisions the TOTP recovery seed after a firmware update that changes Secure Boot keys (PCR 7).
 
+**Prerequisite:** Add `uki_path` and `luks_device` to your `/etc/vanguard.toml`:
+
+```toml
+# /etc/vanguard.toml
+uki_path = "/boot/EFI/Gentoo/kernel.efi"
+luks_device = "/dev/nvme0n1p2"
+```
+
 **Installation:**
 
 ```bash
-# Copy the example environment file and adjust paths
-sudo cp /etc/vanguard/vanguard.env.example /etc/vanguard/vanguard.env
-# Edit /etc/vanguard/vanguard.env with your UKI and LUKS paths
-
 # Enable the service
 sudo systemctl enable vanguard-pcrlock-relock.service
 ```
 
 **What it does after reboot:**
 
-1. `vanguard update -u <uki> -l <luks-dev> --no-verify` - regenerates the pcrlock policy against the new firmware measurements
+1. `vanguard update --config /etc/vanguard.toml --no-verify` - regenerates the pcrlock policy against the new firmware measurements (reads `uki_path` and `luks_device` from the TOML config)
 2. `vanguard recovery --auto-reseed` - detects if the recovery seed is unreadable (PCR 7 changed), generates a new seed, and writes it to TPM NVRAM. The new seed's `otpauth://` URI is saved to `/var/lib/vanguard/recovery-pending.uri`.
 
 **After the service runs:**
