@@ -4,11 +4,16 @@ on:
     branches: [main]
   workflow_dispatch:
 
+permissions:
+  contents: write
+
 jobs:
   coverage:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}
       - uses: actions/setup-go@v5
         with:
           go-version: '1.25'
@@ -182,6 +187,38 @@ jobs:
             exit 1
           fi
           echo "Coverage check passed"
+
+      - name: Write coverage badge data
+        run: |
+          COMBINED_COV=$(go tool cover -func=test/combined.out | tail -1 | awk '{print $3}' | tr -d '%')
+          GOTEST_COV=$(go tool cover -func=test/gotest.out | tail -1 | awk '{print $3}' | tr -d '%')
+          QEMU_COV=0
+          if [ -f test/qemu-cover.out ]; then
+            QEMU_COV=$(go tool cover -func=test/qemu-cover.out | tail -1 | awk '{print $3}' | tr -d '%')
+          fi
+          COLOR="green"
+          if [ $(echo "${COMBINED_COV} < 34" | bc) -eq 1 ]; then
+            COLOR="red"
+          elif [ $(echo "${COMBINED_COV} < 50" | bc) -eq 1 ]; then
+            COLOR="yellow"
+          fi
+          cat > .github/coverage.json << EOF
+          {
+            "schemaVersion": 1,
+            "label": "coverage",
+            "message": "${COMBINED_COV}%",
+            "color": "${COLOR}"
+          }
+          EOF
+          echo "Coverage badge data written: ${COMBINED_COV}% (${COLOR})"
+
+      - name: Commit coverage data
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add .github/coverage.json
+          git diff --staged --quiet || git commit -m "chore: update coverage badge data [skip ci]"
+          git push || true
 
       - uses: actions/upload-artifact@v4
         with:

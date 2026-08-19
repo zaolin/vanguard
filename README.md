@@ -4,6 +4,11 @@
 
 # Vanguard
 
+[![Lint](https://github.com/zaolin/vanguard/actions/workflows/lint.yml/badge.svg)](https://github.com/zaolin/vanguard/actions/workflows/lint.yml)
+[![Unit Tests](https://github.com/zaolin/vanguard/actions/workflows/unit-tests.yml/badge.svg)](https://github.com/zaolin/vanguard/actions/workflows/unit-tests.yml)
+[![Coverage](https://img.shields.io/endpoint?url=https://raw.githubusercontent.com/zaolin/vanguard/main/.github/coverage.json)](https://github.com/zaolin/vanguard/actions/workflows/coverage.yml)
+[![Secure Boot](https://github.com/zaolin/vanguard/actions/workflows/secure-boot-test.yml/badge.svg)](https://github.com/zaolin/vanguard/actions/workflows/secure-boot-test.yml)
+
 A minimal, security-focused initramfs generator for Linux systems with full disk encryption. Written in Go, Vanguard creates lightweight boot images optimized for LUKS + LVM + TPM2 setups with PCRLock boot integrity enforcement.
 
 ## Security Guarantees
@@ -124,6 +129,8 @@ A systemd unit (`vanguard-pcrlock-relock.service`) is shipped for automatic poli
 | [Kernel Parameters](docs/kernel-parameters.md) | Supported kernel command line options |
 
 ## Testing
+
+CI runs four workflows on every push: lint (golangci-lint), unit tests (with swtpm), coverage (go test + QEMU boot), and secure boot tests (OVMF). Combined coverage from go tests and QEMU boot is tracked via a badge above - threshold is 34%.
 
 ```bash
 # QEMU test with software TPM (direct kernel boot, no UEFI)
