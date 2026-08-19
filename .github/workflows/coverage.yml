@@ -107,10 +107,32 @@ jobs:
         continue-on-error: true
         id: qemu_run
         run: |
-          # Run QEMU WITHOUT TPM device - the TPM causes QEMU to hang on CI.
-          # In test mode, the init binary will fail at PCR 7 check (no TPM)
-          # but still flush coverage data via halt() -> os.Exit(0).
-          # The C wrapper handles cover disk mount + power off.
+          # Restart swtpm in ctrl-only mode for QEMU.
+          # The enrollment step used two-socket mode (--server + --ctrl) because
+          # systemd-cryptenroll/systemd-pcrlock use the swtpm: TCTI which talks
+          # directly to the data socket. But QEMU's TPM emulator backend requires
+          # the CONTROL socket for the CMD_SET_DATAFD handshake — connecting QEMU
+          # to the data socket causes an indefinite hang (0 bytes of output).
+          # We restart swtpm in ctrl-only mode, preserving the TPM state dir
+          # (which contains the enrolled NV index), and point QEMU at the ctrl socket.
+          sudo pkill swtpm 2>/dev/null; sleep 1
+          rm -f test/tpm/swtpm-qemu.sock
+          swtpm socket --tpmstate dir=test/tpm \
+            --ctrl type=unixio,path=test/tpm/swtpm-qemu.sock \
+            --tpm2 --flags startup-none,not-need-init \
+            --log level=5,file=test/tpm/swtpm-qemu.log &
+          sleep 2
+          if [ ! -S test/tpm/swtpm-qemu.sock ]; then
+            echo "ERROR: swtpm ctrl socket not created"
+            cat test/tpm/swtpm-qemu.log 2>/dev/null || echo "no swtpm log"
+            exit 1
+          fi
+
+          # Run QEMU with TPM device (tpm-tis, not tpm-crb — tpm-tis is the
+          # documented and more broadly tested QEMU TPM frontend).
+          # The init binary will find /dev/tpmrm0, proceed through the full
+          # boot flow (TPM module loading, PCR 7 check, LUKS token discovery,
+          # TPM unseal attempt), exercising significantly more code paths.
           timeout 120 qemu-system-x86_64 \
             -m 512M -cpu qemu64 -enable-kvm \
             -kernel testdata/kernel/bzImage \
@@ -121,11 +143,22 @@ jobs:
             -drive file=test/test-disk.raw,format=raw,id=hd0,if=none \
             -drive id=cover,format=raw,if=none,file=test/cover.img \
             -device virtio-blk-pci,drive=cover \
-            -nographic -no-reboot 2>&1 | tee /tmp/cover-boot.log | head -200 || true
+            -chardev socket,id=chrtpm,path=test/tpm/swtpm-qemu.sock \
+            -tpmdev emulator,id=tpm0,chardev=chrtpm \
+            -device tpm-tis,tpmdev=tpm0 \
+            -nographic -no-reboot 2>&1 | tee /tmp/cover-boot.log | head -500 || true
 
           echo "Boot log size: $(wc -c < /tmp/cover-boot.log) bytes"
           tail -30 /tmp/cover-boot.log
           cp /tmp/cover-boot.log test/cover-boot.log
+
+          # If boot log is empty, dump swtpm log for debugging
+          if [ $(wc -c < /tmp/cover-boot.log) -eq 0 ]; then
+            echo "=== WARNING: Boot log is empty — QEMU may have hung on TPM handshake ==="
+            echo "=== swtpm log ==="
+            cat test/tpm/swtpm-qemu.log 2>/dev/null || echo "no swtpm log"
+          fi
+
           echo "=== End of boot log ==="
 
       - name: Extract QEMU coverage

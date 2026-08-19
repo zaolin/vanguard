@@ -280,7 +280,7 @@ provision_ovmf() {
         -append "console=ttyS0" \
         -chardev socket,id=chrtpm,path="$TPM_SOCKET" \
         -tpmdev emulator,id=tpm0,chardev=chrtpm \
-        -device tpm-crb,tpmdev=tpm0 \
+        -device tpm-tis,tpmdev=tpm0 \
         -serial mon:stdio 2>&1 | tail -30
 
     kill "$swtpm_pid" 2>/dev/null || true

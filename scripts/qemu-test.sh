@@ -575,7 +575,7 @@ run_qemu_tpm() {
         -drive file="${DISK_IMG}",format=qcow2,id=hd0,if=none \
         -chardev socket,id=chrtpm,path="${TPM_SOCKET}" \
         -tpmdev emulator,id=tpm0,chardev=chrtpm \
-        -device tpm-crb,tpmdev=tpm0 \
+        -device tpm-tis,tpmdev=tpm0 \
         -nographic -no-reboot
 
     if [ -n "${old_stty}" ]; then
@@ -768,7 +768,7 @@ provision_ovmf() {
         -append "console=ttyS0" \
         -chardev socket,id=chrtpm,path="$TPM_SOCKET" \
         -tpmdev emulator,id=tpm0,chardev=chrtpm \
-        -device tpm-crb,tpmdev=tpm0 \
+        -device tpm-tis,tpmdev=tpm0 \
         -serial mon:stdio 2>&1 | tail -20
 
     kill "$swtpm_pid" 2>/dev/null || true
@@ -840,7 +840,7 @@ run_qemu_uefi() {
         -device ide-hd,drive=esp,bus=ahci.0 \
         -chardev socket,id=chrtpm,path="$TPM_SOCKET" \
         -tpmdev emulator,id=tpm0,chardev=chrtpm \
-        -device tpm-crb,tpmdev=tpm0 \
+        -device tpm-tis,tpmdev=tpm0 \
         -serial mon:stdio
 }
 
@@ -864,7 +864,7 @@ run_qemu_secure() {
         -device ide-hd,drive=esp,bus=ahci.0 \
         -chardev socket,id=chrtpm,path="$TPM_SOCKET" \
         -tpmdev emulator,id=tpm0,chardev=chrtpm \
-        -device tpm-crb,tpmdev=tpm0 \
+        -device tpm-tis,tpmdev=tpm0 \
         -serial mon:stdio
 }
 
@@ -985,7 +985,7 @@ case "${1:-}" in
             -device virtio-blk-pci,drive=cover \
             -chardev socket,id=chrtpm,path="${TPM_SOCKET}" \
             -tpmdev emulator,id=tpm0,chardev=chrtpm \
-            -device tpm-crb,tpmdev=tpm0 \
+            -device tpm-tis,tpmdev=tpm0 \
             -nographic -no-reboot 2>&1 | tee "${TEST_DIR}/cover-boot.log"
 
         # Extract coverage data from cover disk

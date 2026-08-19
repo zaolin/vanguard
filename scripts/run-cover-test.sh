@@ -88,17 +88,18 @@ echo "[INFO] Creating cover disk..."
 dd if=/dev/zero of=test/cover.img bs=1M count=10 2>/dev/null
 mkfs.ext4 -q test/cover.img
 
-# Step 6: Restart swtpm with preserved state (startup-none)
-echo "[INFO] Restarting swtpm (preserving NV indexes)..."
+# Step 6: Restart swtpm in ctrl-only mode (QEMU needs the ctrl socket, not --server)
+echo "[INFO] Restarting swtpm (ctrl-only, preserving NV indexes)..."
 swtpm socket --tpmstate dir="${TPM_DIR}" \
-    --server type=unixio,path="${TPM_SOCKET}" \
-    --ctrl type=unixio,path="${TPM_SOCKET}.ctrl" \
-    --tpm2 --flags startup-none,not-need-init &
+    --ctrl type=unixio,path="${TPM_DIR}/swtpm-qemu.sock" \
+    --tpm2 --flags startup-none,not-need-init \
+    --log level=5,file="${TPM_DIR}/swtpm-qemu.log" &
 SWTPM_PID=$!
 cleanup() { kill ${SWTPM_PID} 2>/dev/null || true; wait ${SWTPM_PID} 2>/dev/null || true; }
 trap cleanup EXIT
 sleep 1
-[ -S "${TPM_SOCKET}" ] || { echo "ERROR: swtpm restart failed"; exit 1; }
+QEMU_TPM_SOCKET="${TPM_DIR}/swtpm-qemu.sock"
+[ -S "${QEMU_TPM_SOCKET}" ] || { echo "ERROR: swtpm restart failed"; cat "${TPM_DIR}/swtpm-qemu.log" 2>/dev/null; exit 1; }
 
 # Step 7: Run QEMU with coverage collection
 echo "[INFO] Starting QEMU for coverage collection..."
@@ -112,9 +113,9 @@ timeout 120 qemu-system-x86_64 \
     -drive file=test/test-disk.raw,format=raw,id=hd0,if=none \
     -drive id=cover,format=raw,if=none,file=test/cover.img \
     -device virtio-blk-pci,drive=cover \
-    -chardev socket,id=chrtpm,path="${TPM_SOCKET}" \
+    -chardev socket,id=chrtpm,path="${QEMU_TPM_SOCKET}" \
     -tpmdev emulator,id=tpm0,chardev=chrtpm \
-    -device tpm-crb,tpmdev=tpm0 \
+    -device tpm-tis,tpmdev=tpm0 \
     -nographic -no-reboot 2>&1 | tee test/cover-boot.log
 
 # Step 8: Extract QEMU coverage
