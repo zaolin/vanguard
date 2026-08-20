@@ -1,7 +1,6 @@
 package pcrlock
 
 import (
-	"bufio"
 	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
@@ -11,8 +10,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"strconv"
 	"strings"
+
+	"github.com/zaolin/vanguard/internal/tpm"
 )
 
 // PCRLockDir is the directory for pcrlock policy files.
@@ -927,10 +927,13 @@ func MakePolicy(outputPath string) error {
 			// We MUST undefine the existing index because systemd-pcrlock make-policy
 			// tries to define it anew and fails if it exists.
 			// This effectively "reuses" the slot by freeing it up first.
-			// We use tpm2_nvundefine for this.
-			undefCmd := exec.Command("tpm2_nvundefine", fmt.Sprintf("0x%x", info.NVIndex))
-			// Ignore output/error - if it fails (e.g. doesn't exist), make-policy will handle it
-			_ = undefCmd.Run()
+			// Use native go-tpm2 instead of shelling out to tpm2_nvundefine.
+			tpmClient := tpm.New()
+			if err := tpmClient.NVUndefineSpace(uint32(info.NVIndex)); err != nil {
+				if Verbose {
+					fmt.Printf("Note: failed to undefine NV index 0x%x: %v (make-policy will handle it)\n", info.NVIndex, err)
+				}
+			}
 		}
 	}
 
@@ -1414,69 +1417,63 @@ func CleanupOldNVIndices(keepIndices []int) (int, error) {
 	return removed, nil
 }
 
-// listNVIndices returns all NV indices defined in the TPM
+// listNVIndices returns all NV indices defined in the TPM using native go-tpm2.
 func listNVIndices() ([]int, error) {
-	cmd := exec.Command("tpm2_getcap", "handles-nv-index")
-	output, err := cmd.Output()
+	tpmClient := tpm.New()
+	indexes, err := tpmClient.ListNVIndexes()
 	if err != nil {
-		return nil, fmt.Errorf("tpm2_getcap handles-nv-index failed: %w", err)
+		return nil, fmt.Errorf("failed to list NV indices: %w", err)
 	}
 
 	var indices []int
-	scanner := bufio.NewScanner(bytes.NewReader(output))
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		// Lines look like "- 0x180D9B3"
-		if strings.HasPrefix(line, "- 0x") || strings.HasPrefix(line, "-0x") {
-			hexStr := strings.TrimPrefix(strings.TrimPrefix(line, "- "), "-")
-			if idx, err := strconv.ParseInt(strings.TrimPrefix(hexStr, "0x"), 16, 64); err == nil {
-				indices = append(indices, int(idx))
-			}
-		}
+	for idx := range indexes {
+		indices = append(indices, int(idx))
 	}
-
-	return indices, scanner.Err()
+	return indices, nil
 }
 
 // isPCRLockNVIndex checks if an NV index looks like a pcrlock index
-// by checking its attributes and size
+// by checking its attributes and size using native go-tpm2.
 func isPCRLockNVIndex(idx int) bool {
 	// pcrlock indices are in the owner hierarchy range (0x01800000 - 0x01BFFFFF)
 	if idx < nvIndexMin || idx > nvIndexMax {
 		return false
 	}
 
-	// Check the index attributes using tpm2_nvreadpublic
-	cmd := exec.Command("tpm2_nvreadpublic", fmt.Sprintf("0x%x", idx))
-	output, err := cmd.Output()
+	tpmClient := tpm.New()
+	detailed, err := tpmClient.ListNVIndexesDetailed()
 	if err != nil {
 		return false
 	}
 
-	outputStr := string(output)
+	for _, info := range detailed {
+		if info.Index != uint32(idx) {
+			continue
+		}
+		// pcrlock indices have these characteristics:
+		// - size: 34 (SHA256 hash + 2 byte header)
+		// - attributes include: policywrite, ownerread
+		// - do NOT have: platformcreate (those are firmware indices)
+		if info.Attributes.PlatformCreate {
+			return false
+		}
+		if !info.Attributes.PolicyWrite {
+			return false
+		}
+		if !info.Attributes.OwnerRead {
+			return false
+		}
+		if info.DataSize != 34 {
+			return false
+		}
+		return true
+	}
 
-	// pcrlock indices have these characteristics:
-	// - size: 34 (SHA256 hash + 2 byte header)
-	// - attributes include: policywrite, ownerread
-	// - do NOT have: platformcreate (those are firmware indices)
-	if strings.Contains(outputStr, "platformcreate") {
-		return false
-	}
-	if !strings.Contains(outputStr, "policywrite") {
-		return false
-	}
-	if !strings.Contains(outputStr, "ownerread") {
-		return false
-	}
-	if !strings.Contains(outputStr, "size: 34") {
-		return false
-	}
-
-	return true
+	return false
 }
 
-// removeNVIndex removes an NV index from the TPM
+// removeNVIndex removes an NV index from the TPM using native go-tpm2.
 func removeNVIndex(idx int) error {
-	cmd := exec.Command("tpm2_nvundefine", fmt.Sprintf("0x%x", idx))
-	return cmd.Run()
+	tpmClient := tpm.New()
+	return tpmClient.NVUndefineSpace(uint32(idx))
 }

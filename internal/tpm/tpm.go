@@ -1080,6 +1080,85 @@ func (c *Client) FindPCRLockNVIndex() (uint32, error) {
 	return 0, fmt.Errorf("no PCRLock NV index found")
 }
 
+// NVUndefineSpace removes an NV index from the TPM using owner auth.
+// This is the native go-tpm2 replacement for `tpm2_nvundefine`.
+func (c *Client) NVUndefineSpace(index uint32) error {
+	tpm, err := c.openTPM()
+	if err != nil {
+		return err
+	}
+	defer tpm.Close()
+
+	// Read the NV name first — with CONFIG_TCG_TPM2_HMAC, the kernel
+	// TPM driver requires the Name for HMAC session computation.
+	pubRsp, err := tpm2.NVReadPublic{
+		NVIndex: tpm2.TPMHandle(index),
+	}.Execute(tpm)
+	if err != nil {
+		// Index may not exist — that's fine
+		return nil
+	}
+
+	_, err = tpm2.NVUndefineSpace{
+		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
+		NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(index), Name: pubRsp.NVName},
+	}.Execute(tpm)
+	if err != nil {
+		return fmt.Errorf("NVUndefineSpace for 0x%x: %w", index, err)
+	}
+
+	buildtags.Debug("tpm: undefined NV index 0x%x\n", index)
+	return nil
+}
+
+// NVIndexInfo contains parsed NV index public area information.
+type NVIndexInfo struct {
+	Index      uint32
+	DataSize   uint16
+	AuthPolicy []byte
+	Attributes tpm2.TPMANV
+	Name       []byte
+}
+
+// ListNVIndexesDetailed returns detailed information about all NV indexes.
+func (c *Client) ListNVIndexesDetailed() ([]NVIndexInfo, error) {
+	indexes, err := c.ListNVIndexes()
+	if err != nil {
+		return nil, err
+	}
+
+	tpm, err := c.openTPM()
+	if err != nil {
+		return nil, err
+	}
+	defer tpm.Close()
+
+	var result []NVIndexInfo
+	for index := range indexes {
+		pubRsp, err := tpm2.NVReadPublic{
+			NVIndex: tpm2.TPMHandle(index),
+		}.Execute(tpm)
+		if err != nil {
+			continue
+		}
+
+		nvPub, err := pubRsp.NVPublic.Contents()
+		if err != nil {
+			continue
+		}
+
+		result = append(result, NVIndexInfo{
+			Index:      index,
+			DataSize:   nvPub.DataSize,
+			AuthPolicy: nvPub.AuthPolicy.Buffer,
+			Attributes: nvPub.Attributes,
+			Name:       pubRsp.NVName.Buffer,
+		})
+	}
+
+	return result, nil
+}
+
 // ParsePCRBank converts a bank name string to TPM algorithm.
 func ParsePCRBank(bank string) HashAlgorithm {
 	switch bank {

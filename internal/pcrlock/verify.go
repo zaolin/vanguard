@@ -2,12 +2,14 @@ package pcrlock
 
 import (
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"os"
-	"os/exec"
 	"strings"
+
+	"github.com/google/go-tpm/tpm2"
+	"github.com/zaolin/vanguard/internal/tpm"
 )
 
 // Policy represents the structure of the pcrlock.json policy file
@@ -80,46 +82,62 @@ func VerifyNVIndex(policy *Policy) (*NVIndexDetails, bool, error) {
 	return details, matches, nil
 }
 
-// ReadNVIndexDetails reads NV Index details using tpm2_nvreadpublic
+// ReadNVIndexDetails reads NV Index details using native go-tpm2.
 func ReadNVIndexDetails(index int) (*NVIndexDetails, error) {
-	cmd := exec.Command("tpm2_nvreadpublic", fmt.Sprintf("0x%x", index))
-	output, err := cmd.Output()
+	tpmClient := tpm.New()
+
+	detailed, err := tpmClient.ListNVIndexesDetailed()
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return nil, fmt.Errorf("%v: %s", err, string(exitErr.Stderr))
-		}
-		return nil, err // likely index not found or TPM error
+		return nil, fmt.Errorf("failed to list NV indexes: %w", err)
 	}
 
-	details := &NVIndexDetails{}
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if strings.HasPrefix(line, "name:") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				details.Name = strings.TrimSpace(parts[1])
-			}
-		} else if strings.HasPrefix(line, "authorization policy:") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				details.AuthPolicy = strings.TrimSpace(parts[1])
-			}
-		} else if strings.HasPrefix(line, "size:") {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				fmt.Sscanf(strings.TrimSpace(parts[1]), "%d", &details.Size)
-			}
-		} else if strings.HasPrefix(line, "friendly:") && details.Attributes == "" {
-			parts := strings.SplitN(line, ":", 2)
-			if len(parts) == 2 {
-				details.Attributes = strings.TrimSpace(parts[1])
-			}
+	for _, info := range detailed {
+		if int(info.Index) != index {
+			continue
 		}
+		details := &NVIndexDetails{
+			Name:       hex.EncodeToString(info.Name),
+			AuthPolicy: hex.EncodeToString(info.AuthPolicy),
+			Size:       int(info.DataSize),
+			Attributes: nvAttributesToString(info.Attributes),
+		}
+		return details, nil
 	}
 
-	return details, nil
+	return nil, fmt.Errorf("NV index 0x%x not found", index)
+}
+
+// nvAttributesToString converts TPMA_NV attributes to a human-readable string.
+func nvAttributesToString(attrs tpm2.TPMANV) string {
+	var parts []string
+	if attrs.PPWrite {
+		parts = append(parts, "ppwrite")
+	}
+	if attrs.OwnerWrite {
+		parts = append(parts, "ownerwrite")
+	}
+	if attrs.AuthWrite {
+		parts = append(parts, "authwrite")
+	}
+	if attrs.PolicyWrite {
+		parts = append(parts, "policywrite")
+	}
+	if attrs.OwnerRead {
+		parts = append(parts, "ownerread")
+	}
+	if attrs.AuthRead {
+		parts = append(parts, "authread")
+	}
+	if attrs.PolicyRead {
+		parts = append(parts, "policyread")
+	}
+	if attrs.PlatformCreate {
+		parts = append(parts, "platformcreate")
+	}
+	if attrs.OwnerRead {
+		parts = append(parts, "ownerread")
+	}
+	return strings.Join(parts, ",")
 }
 
 // extractNVPublicDetails extracts authPolicy and dataSize from base64-encoded
@@ -214,39 +232,15 @@ func readCurrentPCRs(pcrsToRead []int) (map[int]string, error) {
 		return make(map[int]string), nil
 	}
 
-	pcrList := make([]string, len(pcrsToRead))
-	for i, pcr := range pcrsToRead {
-		pcrList[i] = fmt.Sprintf("%d", pcr)
-	}
-	pcrArg := "sha256:" + strings.Join(pcrList, ",")
-
-	cmd := exec.Command("tpm2_pcrread", pcrArg)
-	output, err := cmd.Output()
+	tpmClient := tpm.New()
+	pcrValues, err := tpmClient.ReadPCRs(tpm.AlgSHA256, pcrsToRead)
 	if err != nil {
-		return nil, fmt.Errorf("tpm2_pcrread failed: %w", err)
+		return nil, fmt.Errorf("failed to read PCRs: %w", err)
 	}
 
 	pcrs := make(map[int]string)
-	lines := strings.Split(string(output), "\n")
-	for _, line := range lines {
-		line = strings.TrimSpace(line)
-		if !strings.Contains(line, ":") {
-			continue
-		}
-		parts := strings.SplitN(line, ":", 2)
-		if len(parts) != 2 {
-			continue
-		}
-
-		var pcr int
-		if _, err := fmt.Sscanf(strings.TrimSpace(parts[0]), "%d", &pcr); err != nil {
-			continue
-		}
-
-		value := strings.TrimSpace(parts[1])
-		value = strings.TrimPrefix(value, "0x")
-		value = strings.TrimPrefix(value, "0X")
-		pcrs[pcr] = strings.ToLower(value)
+	for pcr, value := range pcrValues {
+		pcrs[pcr] = hex.EncodeToString(value)
 	}
 
 	return pcrs, nil

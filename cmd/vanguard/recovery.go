@@ -10,6 +10,7 @@ type RecoveryCmd struct {
 	Enable     bool   `help:"Enable TOTP recovery (generate seed, write to TPM NVRAM, display QR code)"`
 	Disable    bool   `help:"Disable TOTP recovery (remove seed from TPM NVRAM)"`
 	Show       bool   `help:"Show current TOTP seed and QR code (for re-enrollment)"`
+	Check      bool   `help:"Verify that TOTP recovery is properly configured and the seed is readable"`
 	Clean      bool   `help:"Forcefully remove old/legacy recovery NV indexes (for migration from older vanguard versions)"`
 	AutoReseed bool   `help:"Automatically re-provision recovery seed if unreadable (for firmware update convergence — non-interactive)"`
 	NVIndex    uint32 `help:"TPM NV index for recovery data (default: 0x01C30001)"`
