@@ -43,16 +43,31 @@ func TryTOTP(tpmClient *intpm.Client, devicePath string) bool {
 	// value to match the anti-evil-maid policy (Secure Boot state). If the
 	// system was booted from a live USB or the initrd was tampered with,
 	// the PCR 7 value won't match and the read will fail.
-	//
-	// The enrollment-time branch digest is also read (from the timestamp
-	// NV index) for API compatibility, though with the single-branch
-	// PolicyPCR design it is not used at runtime — the session digest
-	// after PolicyPCR directly matches the authPolicy.
+	var seed []byte
+	var refTimestamp int64
 	seed, refTimestamp, _, err := tpmClient.ReadRecoveryData(intpm.DefaultRecoverySeedNVIndex)
 	if err != nil {
-		console.Print("recovery: failed to read TOTP seed from TPM: %v\n", err)
-		LogFunc("RECOVERY_READ_FAIL", "device", devicePath, "error", err.Error())
-		return false
+		// ReadRecoveryData failed. Check if it's because the timestamp NV
+		// index is missing (e.g., from a previous failed auto-reseed).
+		// If so, try reading the seed without the timestamp.
+		if !tpmClient.TimestampNVExists() {
+			buildtags.Debug("recovery: timestamp NV index missing, trying seed-only read\n")
+			seed, err = tpmClient.ReadSeedOnly(intpm.DefaultRecoverySeedNVIndex)
+			if err != nil {
+				console.Print("recovery: failed to read TOTP seed from TPM: %v\n", err)
+				LogFunc("RECOVERY_READ_FAIL", "device", devicePath, "error", err.Error())
+				return false
+			}
+			// No reference timestamp available — use current time as reference
+			// with wide skew. This is safe because the TOTP seed is TPM-protected.
+			refTimestamp = time.Now().Unix()
+			console.Print("recovery: WARNING: timestamp NV index missing, using current time as reference\n")
+			LogFunc("RECOVERY_TIMESTAMP_MISSING", "device", devicePath)
+		} else {
+			console.Print("recovery: failed to read TOTP seed from TPM: %v\n", err)
+			LogFunc("RECOVERY_READ_FAIL", "device", devicePath, "error", err.Error())
+			return false
+		}
 	}
 	// Zero the seed after use to reduce cold-boot extraction window
 	defer func() {

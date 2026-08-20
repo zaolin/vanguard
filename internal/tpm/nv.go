@@ -2,6 +2,7 @@ package tpm
 
 import (
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"time"
 
@@ -9,6 +10,11 @@ import (
 	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/zaolin/vanguard/init/buildtags"
 )
+
+// ErrTimestampMissing indicates that the timestamp NV index (0x01C30002)
+// does not exist on the TPM. This can happen if a previous auto-reseed
+// deleted it but failed to recreate it. The seed index may still be valid.
+var ErrTimestampMissing = errors.New("timestamp NV index missing")
 
 // NV index constants for TOTP recovery.
 const (
@@ -327,6 +333,114 @@ func (c *Client) ReadRecoveryData(seedIndex uint32) (seed []byte, refTimestamp i
 
 	buildtags.Debug("tpm: read recovery data (seed=%d bytes, timestamp=%d)\n", len(seed), refTimestamp)
 	return seed, refTimestamp, branchDigests, nil
+}
+
+// ReadSeedOnly reads the TOTP seed from the seed NV index WITHOUT requiring
+// the timestamp NV index. This is used when the timestamp index is missing
+// (e.g., after a failed auto-reseed) but the seed may still be readable.
+//
+// The seed is read via a policy session requiring the current PCR 7 value
+// to match the enrollment-time authPolicy. If PCR 7 has changed, this will
+// fail just like ReadRecoveryData.
+//
+// Returns only the seed (no timestamp or branch digests).
+func (c *Client) ReadSeedOnly(seedIndex uint32) ([]byte, error) {
+	tpm, err := c.openTPM()
+	if err != nil {
+		return nil, err
+	}
+	defer tpm.Close()
+
+	// readSeedWithPolicy ignores enrollmentBranchDigests with single-branch
+	// policy (line 490: _ = enrollmentBranchDigests). It reads current PCR 7
+	// values directly and uses PolicyPCR. So we can pass nil.
+	seed, err := c.readSeedWithPolicy(tpm, seedIndex, nil)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read seed: %w", err)
+	}
+
+	buildtags.Debug("tpm: read seed only (%d bytes, timestamp skipped)\n", len(seed))
+	return seed, nil
+}
+
+// RecreateTimestampOnly recreates the timestamp NV index (0x01C30002) if it
+// is missing, without touching the seed index. This is used by auto-reseed
+// when the seed is still readable (PCR 7 matches) but the timestamp index
+// was lost (e.g., from a previous failed reseed).
+//
+// The timestamp is set to the current time, and the branch digests are
+// recomputed from the current PCR 7 values.
+func (c *Client) RecreateTimestampOnly(pcrValues map[int][]byte) error {
+	tpm, err := c.openTPM()
+	if err != nil {
+		return err
+	}
+	defer tpm.Close()
+
+	tsIndex := uint32(DefaultRecoveryTimestampNVIndex)
+
+	// Check if timestamp index already exists
+	if c.nvIndexExists(tpm, tsIndex) {
+		buildtags.Debug("tpm: timestamp NV index 0x%x already exists, skipping recreation\n", tsIndex)
+		return nil
+	}
+
+	// Define the timestamp NV index with OwnerRead/OwnerWrite
+	tsDef := tpm2.NVDefineSpace{
+		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
+		Auth:       tpm2.TPM2BAuth{},
+		PublicInfo: tpm2.New2B(tpm2.TPMSNVPublic{
+			NVIndex:    tpm2.TPMHandle(tsIndex),
+			NameAlg:    tpm2.TPMAlgSHA256,
+			Attributes: tpm2.TPMANV{OwnerWrite: true, OwnerRead: true, NT: tpm2.TPMNTOrdinary, NoDA: true},
+			DataSize:   uint16(TimestampNVDataSize),
+		}),
+	}
+	if _, err := tsDef.Execute(tpm); err != nil {
+		return fmt.Errorf("failed to define timestamp NV index 0x%x: %w", tsIndex, err)
+	}
+
+	// Write the timestamp data: current timestamp + branch digests
+	tsData := make([]byte, TimestampNVDataSize)
+	binary.BigEndian.PutUint64(tsData, uint64(time.Now().Unix()))
+
+	branchDigests, err := computeAllBranchDigests(pcrValues)
+	if err != nil {
+		return fmt.Errorf("failed to compute branch digests: %w", err)
+	}
+	for i, bd := range branchDigests {
+		copy(tsData[TimestampSize+i*BranchDigestSize:], bd)
+	}
+
+	tsPubRsp, err := tpm2.NVReadPublic{
+		NVIndex: tpm2.TPMHandle(tsIndex),
+	}.Execute(tpm)
+	if err != nil {
+		return fmt.Errorf("NVReadPublic for new timestamp 0x%x: %w", tsIndex, err)
+	}
+
+	_, err = tpm2.NVWrite{
+		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
+		NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(tsIndex), Name: tsPubRsp.NVName},
+		Data:       tpm2.TPM2BMaxNVBuffer{Buffer: tsData},
+		Offset:     0,
+	}.Execute(tpm)
+	if err != nil {
+		return fmt.Errorf("NVWrite for timestamp 0x%x: %w", tsIndex, err)
+	}
+
+	buildtags.Debug("tpm: recreated timestamp NV index 0x%x\n", tsIndex)
+	return nil
+}
+
+// TimestampNVExists checks if the timestamp NV index is defined.
+func (c *Client) TimestampNVExists() bool {
+	tpm, err := c.openTPM()
+	if err != nil {
+		return false
+	}
+	defer tpm.Close()
+	return c.nvIndexExists(tpm, uint32(DefaultRecoveryTimestampNVIndex))
 }
 
 // RecoveryNVExists checks if the seed NV index is defined.

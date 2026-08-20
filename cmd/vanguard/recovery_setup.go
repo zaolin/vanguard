@@ -514,6 +514,19 @@ func (c *RecoveryCmd) runCheck(nvIndex uint32) error {
 
 	fmt.Printf("  %s Recovery NV index 0x%x exists\n", okStyle.Render("✓"), nvIndex)
 
+	// Check if timestamp index exists
+	if !client.TimestampNVExists() {
+		fmt.Printf("  %s Timestamp NV index 0x%x is missing\n", errStyle.Render("✗"), tpm.DefaultRecoveryTimestampNVIndex)
+		fmt.Println()
+		fmt.Println("  The timestamp NV index was lost (possibly from a previous failed auto-reseed).")
+		fmt.Println("  The seed may still be valid — auto-reseed can repair this without changing the seed.")
+		fmt.Println()
+		fmt.Println("  To fix:")
+		fmt.Println("    sudo vanguard recovery --auto-reseed  # repair timestamp (seed preserved)")
+		fmt.Println()
+		return fmt.Errorf("timestamp NV index missing")
+	}
+
 	// Try to read the seed (requires PCR 7 to match)
 	seed, refTimestamp, _, err := client.ReadRecoveryData(nvIndex)
 	if err != nil {
@@ -595,16 +608,55 @@ func (c *RecoveryCmd) runAutoReseed(nvIndex uint32) error {
 		return nil
 	}
 
-	// 3. Seed is unreadable — PCR 7 changed (firmware update reset Secure Boot keys)
-	//    Re-provision atomically: define new indexes FIRST, then delete old ones.
-	//    This prevents bricking recovery if the new creation fails.
+	// 3. ReadRecoveryData failed. Diagnose the cause:
+	//    - Timestamp index missing: seed may still be readable, just need to
+	//      recreate the timestamp. This is a targeted repair that preserves
+	//      the existing seed (user's TOTP code stays valid).
+	//    - PCR 7 mismatch: seed is unreadable, need full reseed with new seed.
+	//    - Other error: fall back to full reseed.
+
+	timestampMissing := !client.TimestampNVExists()
+
+	if timestampMissing {
+		// Try to read the seed without the timestamp
+		seed, seedErr := client.ReadSeedOnly(nvIndex)
+		if seedErr == nil {
+			// Seed is readable! PCR 7 matches. Just recreate the timestamp.
+			// Zero the seed — we don't need it, just needed to verify readability.
+			for i := range seed {
+				seed[i] = 0
+			}
+
+			// Read current PCR 7 for branch digest computation
+			pcrValues := make(map[int][]byte)
+			val, pcrErr := client.ReadPCR(tpm.AlgSHA256, 7)
+			if pcrErr != nil {
+				return fmt.Errorf("failed to read PCR 7 for timestamp recreation: %w", pcrErr)
+			}
+			pcrValues[7] = val
+
+			// Recreate only the timestamp index
+			if err := client.RecreateTimestampOnly(pcrValues); err != nil {
+				return fmt.Errorf("failed to recreate timestamp NV index: %w", err)
+			}
+
+			fmt.Println("recovery: timestamp NV index was missing, recreated (seed preserved)")
+			fmt.Println("recovery: TOTP recovery is now fully operational — no re-enrollment needed")
+			return nil
+		}
+
+		// Seed is also unreadable — PCR 7 changed. Fall through to full reseed.
+		// The old seed is gone (can't be read with new PCR 7). Both indexes
+		// need to be re-provisioned.
+	}
+
+	// 4. Full atomic reseed: seed is unreadable (PCR 7 changed) or
+	//    diagnosis failed. Generate new seed, create at temp index,
+	//    then swap.
 	//
 	//    We use a temporary NV index (nvIndex + 0x100) for the new seed.
 	//    If the new index is successfully created and written, we delete the
 	//    old indexes. If any step fails, the old indexes remain intact.
-	//
-	//    The temporary index is in the same platform hierarchy range but
-	//    offset by 0x100 to avoid collision with the old index.
 
 	// Generate new seed
 	seed, err := totp.GenerateSeed()
@@ -644,9 +696,6 @@ func (c *RecoveryCmd) runAutoReseed(nvIndex uint32) error {
 
 	// Redefine at the original index with the new seed
 	if err := client.DefineRecoveryNVSpace(nvIndex, pcrValues); err != nil {
-		// Failed to create at original index — the temp index still has
-		// the new seed. Update the init code to look at temp index too.
-		// For now, the temp index is the active recovery seed.
 		fmt.Fprintf(os.Stderr, "warning: failed to redefine at original index 0x%x, new seed at temp index 0x%x\n", nvIndex, tempNVIndex)
 	} else if err := client.WriteRecoveryData(nvIndex, seed, time.Now().Unix(), pcrValues); err != nil {
 		fmt.Fprintf(os.Stderr, "warning: failed to write at original index 0x%x, new seed at temp index 0x%x\n", nvIndex, tempNVIndex)
