@@ -70,7 +70,7 @@ jobs:
             /usr/lib/systemd/systemd-pcrlock make-policy \
             --policy=test/pcrlock.json --pcr=23 --force || true
 
-          sudo pkill swtpm; sleep 1
+          sudo pkill swtpm 2>/dev/null || true; sleep 1
           sudo losetup -d $LOOP
 
       - name: Generate initramfs
@@ -115,7 +115,7 @@ jobs:
           # to the data socket causes an indefinite hang (0 bytes of output).
           # We restart swtpm in ctrl-only mode, preserving the TPM state dir
           # (which contains the enrolled NV index), and point QEMU at the ctrl socket.
-          sudo pkill swtpm 2>/dev/null; sleep 1
+          sudo pkill swtpm 2>/dev/null || true; sleep 1
           rm -f test/tpm/swtpm-qemu.sock
           swtpm socket --tpmstate dir=test/tpm \
             --ctrl type=unixio,path=test/tpm/swtpm-qemu.sock \
