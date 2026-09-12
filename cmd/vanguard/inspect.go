@@ -46,7 +46,7 @@ func (c *InspectCmd) Run() error {
 	// is uncompressed, followed by a compressed main CPIO. We try the
 	// uncompressed CPIO first; when it ends (TRAILER!!!), we check if there's
 	// a compressed segment following.
-	earlyCount, earlySize, hasEarly, err := parseUncompressedCPIO(f, c.Verbose)
+	earlyCount, earlySize, hasEarly, _ := parseUncompressedCPIO(f, c.Verbose)
 	if hasEarly {
 		fileCount += earlyCount
 		totalSize += earlySize

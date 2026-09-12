@@ -95,7 +95,7 @@ When `--luks-device` (`-l`) is specified, Vanguard automatically enables GPT par
 When `--luks-device` (`-l`) is specified, Vanguard automatically enables LUKS header binding in addition to GPT binding:
 
 **How it works:**
-1. During `vanguard update`, the LUKS2 header (binary header + JSON metadata area) is hashed with SHA256 and a `.pcrlock` component file (`755-vanguard-luks-header.pcrlock`) is created with the expected PCR 11 extension digest.
+1. During `vanguard update`, the LUKS2 header (binary header + JSON metadata area) is hashed with SHA256 and a `.pcrlock` component directory (`755-vanguard-luks-header.pcrlock.d/`) is created with two variant files: `luks-header.pcrlock` (current on-disk header hash, matches the next boot) and `luks-header-eventlog.pcrlock` (previous boot's hash, lets make-policy validate the current event log).
 2. During boot, vanguard's init hashes the LUKS2 header **before** attempting unlock and extends PCR 11 with the hash. A CEL-JSON record is written to `/run/log/systemd/tpm2-measure.log` so `systemd-pcrlock make-policy` can match the measurement.
 3. The pcrlock policy predicts the PCR 11 value after the extension. If the header matches, unseal succeeds. If the header was tampered, PCR 11 won't match and unseal fails.
 
@@ -103,6 +103,8 @@ When `--luks-device` (`-l`) is specified, Vanguard automatically enables LUKS he
 - Detects LUKS header tampering (e.g., attacker adds a keyslot, modifies cipher parameters)
 - Prevents offline attacks that modify the header to weaken encryption
 - Binds the disk encryption state to the TPM policy
+
+**Status semantics (important):** the policy's PCR 11 value is an *at-unseal-time* prediction (sd-stub kernel measurement + LUKS header hash). After the disk is unlocked, systemd extends PCR 11 further (sysinit/ready phases), so the **live PCR 11 value in a booted system legitimately diverges from the policy** and always reports as a live mismatch. This is expected, not tampering. `vanguard status` therefore verifies the actual security property — the on-disk header digest against the enrollment-time component digests in `/etc/pcrlock.d/755-vanguard-luks-header.pcrlock.d/` — and reports CRITICAL only when the header itself changed. The PCR DETAILS table shows both the header digest comparison and the live PCR 11 value (annotated with post-unlock extensions).
 
 **Caveats:**
 - LUKS header changes (adding/removing keyslots, re-encrypting) break unlock - re-run `vanguard update -l <device>` after.
@@ -181,9 +183,10 @@ Expected output:
     sbctl: booted UKI signed:    ✓ kernel.efi
 
   ✓ Boot Chain Tampering (firmware/UKI change)
-    PCRLock PCR binding:         ✓ 6 PCRs bound, all match
+    PCRLock PCR binding:         ✓ 4 PCRs bound, all match
     PCRLock NV index:            ✓ 0x1a97310 present on TPM
     PCR0 Reconstruction:         ✓ valid
+    PCRLock PCR 11 (LUKS header): ✓ bound — LUKS header unchanged since enrollment
 
   ✓ TPM Key Extraction (bus sniffing)
     TPM 2.0:                     ✓ /dev/tpmrm0
@@ -197,8 +200,12 @@ Expected output:
   ✓ Brute-Force / Key Theft (LUKS)
     TPM2 token:                  ✓ systemd-tpm2 enrolled
     PIN:                         ✓ additional auth factor
-    TOTP fallback:               ✓ recovery code enrolled
+    HOTP fallback:               ✓ recovery code enrolled
 ```
+
+Note: PCR 11 (LUKS header) is reported from the on-disk header digest
+comparison, not the live PCR value — the live PCR 11 legitimately diverges
+from the policy after unlock (see the LUKS header binding section above).
 
 ## Native Go TPM Stack
 
@@ -378,7 +385,7 @@ for line in sys.stdin.read().split('\x1e'):
 "
 
 # If no PCR 11 record, the initrd may not have measured the header
-# Check vanguard debug output (vanguard.debug=1) for "luks: measured LUKS2 header"
+# Check vanguard debug output (generate the initramfs with -d) for "luks: measured LUKS2 header"
 ```
 
 ### TPM Device Not Found
@@ -456,7 +463,7 @@ The `make-policy` step always uses the CLI path because:
 
 ### Automatic re-lock after firmware update
 
-Vanguard ships a systemd unit that automatically re-locks the pcrlock policy **and** re-provisions the TOTP recovery seed after a firmware update that changes Secure Boot keys (PCR 7).
+Vanguard ships a systemd unit that automatically re-locks the pcrlock policy **and** re-provisions the HOTP recovery seed after a firmware update that changes Secure Boot keys (PCR 7).
 
 **Prerequisite:** Add `uki_path` and `luks_device` to your `/etc/vanguard.toml`:
 
@@ -469,6 +476,12 @@ luks_device = "/dev/nvme0n1p2"
 **Installation:**
 
 ```bash
+# Install the binary to /usr/bin/vanguard and the unit to the systemd
+# directory (the unit's ExecStart requires /usr/bin/vanguard — a binary
+# installed elsewhere, e.g. /usr/local/bin, makes the service fail with
+# 203/EXEC):
+sudo make install-systemd
+
 # Enable the service
 sudo systemctl enable vanguard-pcrlock-relock.service
 ```
@@ -480,13 +493,13 @@ sudo systemctl enable vanguard-pcrlock-relock.service
 
 **After the service runs:**
 
-Retrieve the new TOTP seed and re-enroll your authenticator app:
+Retrieve the new HOTP seed and re-enroll your authenticator app:
 
 ```bash
 sudo vanguard recovery --show
 ```
 
-This reads the pending file, displays the QR code, and on successful TOTP verification deletes the pending file.
+This reads the pending file, displays the QR code, and on successful HOTP verification deletes the pending file.
 
 **Failure handling:** If `--auto-reseed` fails (e.g., TPM error), the service logs a warning but does not block boot. The recovery seed is a fallback - if it's unavailable, the user can manually run `vanguard recovery --clean --enable`.
 
@@ -498,13 +511,13 @@ Vanguard and systemd-pcrlock use TPM2 NVRAM indexes in the owner hierarchy range
 |---|---|---|---|---|
 | `0x01800000`–`0x01BFFFFF` | systemd-pcrlock policy indexes | systemd-pcrlock | 34 bytes (SHA256 digest + 2B header) | Auto-discovered by `FindPCRLockNVIndex` |
 | `0x01C20000` | Default pcrlock NV index (fallback) | systemd-pcrlock | 34 bytes | Used when token doesn't pin a specific index |
-| **`0x01C30001`** | **Vanguard TOTP recovery seed** | **vanguard** | **32 bytes** | PCR-bound (PolicyRead/PolicyWrite); only accessible with correct PCR 7 state |
-| **`0x01C30002`** | **Vanguard TOTP reference timestamp** | **vanguard** | **40 bytes** | Owner-auth (not secret); stores 8-byte timestamp + 32-byte enrollment branch digest |
-| `0x01C30003`–`0x01C3FFFF` | Reserved for future vanguard indexes | vanguard | - | Not yet used |
+| **`0x01C30001`** | **Vanguard HOTP recovery seed** | **vanguard** | **32 bytes** | PCR-bound (PolicyRead/PolicyWrite); only accessible with correct PCR 7 state |
+| **`0x01C30003`** | **Vanguard HOTP recovery state** | **vanguard** | **12 bytes** | Owner-auth (not secret); 8-byte counter + 4-byte fail count. Persists the one-time-code position across boots |
+| `0x01C30004`–`0x01C3FFFF` | Reserved for future vanguard indexes | vanguard | - | Not yet used |
 
 ### Recovery NV Index Details
 
-The TOTP recovery uses two separate NV indexes:
+The HOTP recovery uses two separate NV indexes:
 
 **Seed index (`0x01C30001`):**
 - Attributes: `PolicyRead`, `PolicyWrite`, `NoDA`, `WriteAll`, `NT=Ordinary`
@@ -513,16 +526,20 @@ The TOTP recovery uses two separate NV indexes:
 - `authPolicy` = `PolicyPCR(PCR 7)` - single branch: Secure Boot state. The seed is only released when PCR 7 matches the enrollment-time value. No `PolicyOR` is used (the TPM requires at least 2 branches for `PolicyOR`).
 - Reading/writing requires a policy session with `PolicyPCR` matching the `authPolicy`
 - Deletion uses `NVUndefineSpace` with owner auth (no policy session needed)
-- **Anti-evil-maid protection**: An attacker booting from a live USB has different PCR values → cannot read the seed → cannot generate valid TOTP codes
+- **Anti-evil-maid protection**: An attacker booting from a live USB has different PCR values → cannot read the seed → cannot generate valid HOTP codes
 
-**Timestamp index (`0x01C30002`):**
-- Attributes: `OwnerRead`, `OwnerWrite`, `NoDA`, `WriteAll`, `NT=Ordinary`
-- No policy - the timestamp is not secret and needs to be writable at boot
-- Layout: 40 bytes total - 8-byte big-endian Unix timestamp of last successful boot (for RTC drift detection) + 32-byte enrollment branch digest (for policy session reconstruction at boot)
+**State index (`0x01C30003`):**
+- Attributes: `PolicyRead`, `PolicyWrite`, `NoDA`, `WriteAll`, `NT=Ordinary`
+- Bound to PCR 7 by the same `PolicyPCR` authPolicy as the seed — the counter is not a secret, but its integrity is: binding it to the boot state prevents counter/fail-count rollback from an untrusted boot
+- Layout: 12 bytes total - 8-byte big-endian HOTP counter + 4-byte big-endian failed-attempt count
+- The counter advances past the matched position after every successful code (consuming it), so codes cannot be replayed
+- The fail count bounds cross-boot online guessing: at `10` failures recovery refuses further codes until a successful disk unlock resets it
+- The state index is bound to PCR 7 by the same `PolicyPCR` as the seed: a live-USB boot can neither read nor reset the counter/fail count — the cap and the counter position cannot be rolled back off the trusted boot chain
+- The legacy TOTP reference-timestamp index (`0x01C30002`) is no longer used
 
 ### Anti-Evil-Maid Protection
 
-The TOTP seed is **PCR-bound** - it can only be read when the current PCR state matches the `authPolicy` stored in the NV index. This prevents an attacker with physical access from reading the seed via a live USB:
+The HOTP seed is **PCR-bound** - it can only be read when the current PCR state matches the `authPolicy` stored in the NV index. This prevents an attacker with physical access from reading the seed via a live USB:
 
 | Scenario | PCR state | Seed accessible? |
 |----------|-----------|-----------------|
@@ -547,46 +564,56 @@ sudo vanguard recovery --enable
 
 If the `vanguard-pcrlock-relock.service` is enabled, `--auto-reseed` will handle this automatically on the next reboot (the old 3-branch seed will be unreadable, triggering re-provisioning).
 
-## Recovery
+### Migration from TOTP to HOTP
 
-### TOTP Recovery (Recommended)
-
-TOTP recovery allows passphrase fallback in strict mode without weakening the security model. When the TPM2 unseal fails, the user enters a 6-digit TOTP code from their authenticator app. If correct, passphrase fallback is enabled for this boot only.
-
-**Parameters:** HMAC-SHA256, 30-second period, 6 digits, ±1 window tolerance (90s), ±10 window tolerance when RTC drift detected (±5 minutes).
-
-#### Enable TOTP Recovery
+Recovery switched from TOTP (time-based) to HOTP (counter-based) because the initramfs has no trustworthy clock. A seed enrolled by an older vanguard has no state index, so the new code treats it as not HOTP-enrolled and refuses recovery until you re-enroll:
 
 ```bash
 sudo vanguard recovery --enable
 ```
 
-This generates a 32-byte random TOTP seed, stores it in TPM NVRAM at index `0x01C30001` (PCR-bound with anti-evil-maid protection), and displays:
-- A QR code for scanning with your authenticator app (Google Authenticator, Authy, 1Password, etc.)
+Then re-scan the new `otpauth://hotp` QR code with an HOTP-capable app (Aegis, FreeOTP, KeePassXC, Bitwarden, ...). Re-enroll promptly: until you do, a failed TPM unseal cannot use recovery.
+
+## Recovery
+
+### HOTP Recovery (Recommended)
+
+HOTP recovery allows passphrase fallback in strict mode without weakening the security model. When the TPM2 unseal fails, the user enters an 8-digit HOTP code from their authenticator app. If correct, passphrase fallback is enabled for this boot only.
+
+**Parameters:** HMAC-SHA256, counter-based (RFC 4226), 8 digits, lookahead window of 4 counters. No clock is consulted — recovery works with a dead RTC or wrong system time.
+
+#### Enable HOTP Recovery
+
+```bash
+sudo vanguard recovery --enable
+```
+
+This generates a 32-byte random HOTP seed, stores it in TPM NVRAM at index `0x01C30001` (PCR-bound with anti-evil-maid protection), and displays:
+- A QR code for scanning with an HOTP-capable authenticator app (Aegis, FreeOTP, KeePassXC, Bitwarden, ...)
 - The base32-encoded seed for manual entry
 - The `otpauth://` URI for enrollment
 
 Register the QR code in your authenticator app. The seed persists in TPM NVRAM and survives reboots.
 
-#### How TOTP Recovery Works at Boot
+#### How HOTP Recovery Works at Boot
 
 1. TPM2 unseal fails (e.g. after firmware update without re-running `vanguard update`)
-2. Vanguard checks if TOTP recovery is configured (NV index `0x01C30001` exists)
-3. If configured, prompts: "Enter recovery TOTP code (attempt N/3):"
-4. User enters the 6-digit code from their authenticator app
-5. Vanguard validates the code using constant-time comparison
-6. If correct → passphrase fallback enabled for this boot
-7. If 3 failed attempts → halt
+2. Vanguard checks if HOTP recovery is configured (NV index `0x01C30001` exists)
+3. If configured, prompts: "Enter recovery HOTP code (attempt N/3):"
+4. User enters the 8-digit code from their authenticator app
+5. Vanguard validates it (constant-time) against the stored counter and the next few counters (lookahead)
+6. If correct → the counter advances past the matched position (the code is consumed) → passphrase fallback enabled for this boot
+7. If the persisted failure count has reached the cap (15), recovery is locked until a successful disk unlock resets it
 
-**RTC drift handling:** If the hardware clock is wrong (e.g. dead CMOS battery), Vanguard automatically widens the TOTP tolerance to ±5 minutes. The reference timestamp in NVRAM is updated after each successful boot to keep it fresh.
+**No clock dependency:** HOTP is purely counter-based. A dead RTC, a firmware-reset clock, a wrong timezone, or a machine that was powered off for months all make no difference — there is no time base to get wrong.
 
-#### Manage TOTP Recovery
+#### Manage HOTP Recovery
 
 ```bash
 # Show current seed and QR code (for re-enrollment)
 sudo vanguard recovery --show
 
-# Disable TOTP recovery (removes seed from TPM NVRAM)
+# Disable HOTP recovery (removes seed from TPM NVRAM)
 sudo vanguard recovery --disable
 
 # Print recovery instructions
@@ -598,8 +625,8 @@ vanguard recovery
 | Property | How |
 |----------|-----|
 | Can't be triggered via kernel cmdline | `vanguard.strict=0` cmdline override has been removed entirely |
-| Can't replay old codes | TOTP is time-based, codes expire after 30 seconds |
-| Can't brute-force | 3 attempts per 30s window = 3/1M = 0.0003% per window |
+| Can't replay old codes | Each successful code advances the TPM-stored counter past it, so it can never be reused. Only codes within the small lookahead window (4) are accepted |
+| Can't brute-force | 3 attempts per boot; the persisted fail count locks recovery after 10 total failures until a successful unlock. An 8-digit code with a lookahead of 4 gives ≈1.5×10⁻⁷ per boot, and the policy-bound persistent cap bounds the lifetime |
 | Seed stored in TPM NVRAM | Not on disk; PCR-bound (anti-evil-maid); only readable with correct PCR 7 state |
 | Anti-evil-maid | Attacker booting from live USB cannot read the seed (wrong PCR values) |
 | Anti-EvilAbigail | Attacker replacing initrd changes PCR 4 → seed still readable if Secure Boot (PCR 7) unchanged, but initrd validation prevents unseal |
@@ -613,7 +640,7 @@ The recovery PIN is separate from the LUKS passphrase. It is stored in the TPM N
 
 ### Passphrase Fallback
 
-In strict mode (default), passphrase fallback requires TOTP recovery. Without TOTP recovery configured, a failed TPM unlock will halt the system.
+In strict mode (default), passphrase fallback requires HOTP recovery. Without HOTP recovery configured, a failed TPM unlock will halt the system.
 
 Always maintain a passphrase slot for emergency recovery:
 

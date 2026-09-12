@@ -36,7 +36,7 @@ boot=/dev/nvme0n1p1
 **Formats supported:**
 - Device path only: `/dev/sda1`, `/dev/nvme0n1p1`
 
-**Note:** UUID and PARTUUID formats are not currently supported for the `boot=` parameter. If not specified, Vanguard scans partitions to find one containing `pcrlock.json` by trying to mount each partition as FAT32.
+**Note:** UUID and PARTUUID formats are not currently supported for the `boot=` parameter. If not specified, Vanguard scans partitions to find one containing `pcrlock.json` by trying to mount each partition as FAT32. The scan only runs when the expected pcrlock path can be derived from the `LoaderImageIdentifier` EFI variable (i.e. a systemd-stub UKI boot); without it, `/boot` is not mounted early and boot logging starts only if a later step mounts it.
 
 
 ## Resume (Hibernation) Parameters
@@ -176,6 +176,67 @@ These affect kernel message verbosity but Vanguard's own debug output is control
 
 The first one that exists and executes successfully is used.
 
+## Test-Only Parameters
+
+These parameters are only meaningful in test builds/scenarios and are
+parsed unconditionally, but they have no effect on production boots:
+
+### vanguard.testmode=
+
+```
+vanguard.testmode=1
+```
+
+Enables test mode in the init binary: mounts the coverage disk (FAT-formatted
+virtio-blk at `/dev/vdb`) for `GOCOVERDIR` output, skips the LUKS header
+header measurement and the recovery fail-count reset (no TPM is attached in coverage
+runs), and auto-enters the test PIN if `vanguard.testpin=` is set. Used by
+`scripts/qemu-test.sh` and the CI coverage workflow.
+
+### vanguard.testpin=
+
+```
+vanguard.testpin=1234
+```
+
+Auto-enters this PIN for TPM2 prompts instead of waiting for console input.
+Only meaningful together with `vanguard.testmode=1`.
+
+### vanguard.testhotp=
+
+```
+vanguard.testhotp=1
+```
+
+Forces the TPM2 token-unseal path to fail so the HOTP recovery flow is
+exercised end-to-end in QEMU tests. Only honored together with
+`vanguard.testmode=1`; without a HOTP recovery seed enrolled, recovery
+bails with "no HOTP recovery configured".
+
+## Test-Only Environment Variables (host CLI)
+
+### VANGUARD_TPM_SOCKET
+
+Redirects host-side CLI TPM access (`vanguard update`, `vanguard recovery`,
+...) to a swtpm unix socket instead of `/dev/tpmrm0`. Used by the QEMU test
+scenarios so enrollment runs against the same simulator the VM boots with.
+Never set at boot — the initramfs binary is unaffected.
+
+### VANGUARD_TEST_SKIP_VERIFY=1
+
+With `vanguard recovery --enable`: skips the interactive-terminal requirement
+and the verification prompt, keeping the enrollment (the seed is printed to
+stdout for scripted capture). Test scenarios only.
+
+### GOCOVERDIR=
+
+```
+GOCOVERDIR=/cover
+```
+
+Standard Go coverage parameter, consumed by the init binary's `init()` before
+`main()` (read from `/proc/cmdline`) so coverage data is emitted to the
+directory mounted by test mode. Used by the CI coverage workflow.
 
 ## Example Boot Configurations
 

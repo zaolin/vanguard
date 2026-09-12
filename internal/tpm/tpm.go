@@ -17,6 +17,7 @@ import (
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/google/go-tpm/tpm2/transport/linuxtpm"
+	"github.com/google/go-tpm/tpm2/transport/linuxudstpm"
 	"github.com/zaolin/vanguard/init/buildtags"
 	"golang.org/x/crypto/pbkdf2"
 )
@@ -100,7 +101,14 @@ const FallbackDevice = "/dev/tpm0"
 const DefaultPCRLockNV = 0x01c20000
 
 // New creates a new TPM client.
+// The VANGUARD_TPM_SOCKET environment variable redirects all host-side CLI
+// TPM access to a swtpm socket (path or unixio path) — used by QEMU test
+// scenarios to enroll against the same simulator the VM boots with. In the
+// initramfs the variable is never set, so boot behavior is unchanged.
 func New() *Client {
+	if sock := os.Getenv("VANGUARD_TPM_SOCKET"); sock != "" {
+		return &Client{device: sock}
+	}
 	return &Client{device: DefaultDevice}
 }
 
@@ -144,6 +152,16 @@ func (c *Client) openTPM() (transport.TPMCloser, error) {
 	// If an injectable transport is set, use it directly
 	if c.transport != nil {
 		return c.transport, nil
+	}
+
+	// swtpm socket (VANGUARD_TPM_SOCKET) — connect via the unix-domain-
+	// socket TPM transport instead of the device-file one.
+	if fi, err := os.Stat(c.device); err == nil && fi.Mode()&os.ModeSocket != 0 {
+		tpm, err := linuxudstpm.Open(c.device)
+		if err != nil {
+			return nil, fmt.Errorf("%w: %v", ErrTPMUnavailable, err)
+		}
+		return tpm, nil
 	}
 
 	tpm, err := linuxtpm.Open(c.device)

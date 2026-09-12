@@ -78,14 +78,11 @@ func TestGetLUKS2Info(t *testing.T) {
 	if info.Version != 2 {
 		t.Errorf("Version: got %d, want 2", info.Version)
 	}
-	if info.StorageOffset != 0x1000 {
-		t.Errorf("StorageOffset: got %d, want 0x1000", info.StorageOffset)
+	if info.BackingDevice != path {
+		t.Errorf("BackingDevice: got %s, want %s", info.BackingDevice, path)
 	}
-	if info.StorageEncryption == "" {
-		t.Error("StorageEncryption should not be empty")
-	}
-	if info.HeaderSize == 0 {
-		t.Error("HeaderSize should not be 0")
+	if info.HeaderSize < 0x1000 {
+		t.Errorf("HeaderSize: got %d, want >= 0x1000", info.HeaderSize)
 	}
 	if info.JSONSize == 0 {
 		t.Error("JSONSize should not be 0")
@@ -141,24 +138,6 @@ func TestReadDeviceRange(t *testing.T) {
 	}
 	if string(result2) != "4567" {
 		t.Errorf("readDeviceRange(4,4): got %q, want 4567", string(result2))
-	}
-}
-
-func TestGetBlockDeviceSize(t *testing.T) {
-	f, err := os.CreateTemp("", "blocksize-*.bin")
-	if err != nil {
-		t.Fatalf("CreateTemp: %v", err)
-	}
-	f.Write(make([]byte, 1024))
-	f.Close()
-	defer os.Remove(f.Name())
-
-	size, err := getBlockDeviceSize(f.Name())
-	if err != nil {
-		t.Fatalf("getBlockDeviceSize: %v", err)
-	}
-	if size != 1024 {
-		t.Errorf("getBlockDeviceSize: got %d, want 1024", size)
 	}
 }
 

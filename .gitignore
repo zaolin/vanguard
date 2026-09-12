@@ -6,12 +6,13 @@
 cmd/vanguard/embed/init*
 
 
-# Test directory (artifacts, not test data)
-test/
+# Test directory (artifacts, not test data — anchored so scripts/test/ and
+# any internal/*/test/ fixture dirs are NOT ignored)
+/test/
 
-# Test data (kernel is committed, but not test artifacts)
-testdata/kernel/*.cov
-testdata/kernel/*.log
+# Editor/LSP caches
+.ccls-cache/
+.go/
 
 # Temporary files
 tmp/

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -22,6 +21,7 @@ type statusData struct {
 	TPM              tpmStatus             `json:"tpm"`
 	LUKSDevices      []luksDeviceInfo      `json:"luks"`
 	PCRLock          *pcrlockInfo          `json:"pcrlock,omitempty"`
+	HeaderBinding    *headerBindingInfo    `json:"headerBinding,omitempty"`
 	SecureBoot       *secureBootInfo       `json:"secureBoot,omitempty"`
 	HardwareSecurity *hardwareSecurityInfo `json:"hardwareSecurity,omitempty"`
 	Sbctl            *sbctlInfo            `json:"sbctl,omitempty"`
@@ -30,6 +30,25 @@ type statusData struct {
 	HSTI             *hstiInfo             `json:"hsti,omitempty"`
 	ThreatModel      []threatVector        `json:"threatModel,omitempty"`
 }
+
+// headerBindingInfo carries the LUKS header PCR 11 binding check result.
+// See internal/pcrlock.VerifyLUKSHeaderBinding for semantics: the on-disk
+// LUKS2 header digest is compared against the enrollment-time component
+// digests, not against the live PCR 11 (which legitimately includes
+// post-unlock systemd extensions).
+type headerBindingInfo struct {
+	Bound           bool     `json:"bound"`
+	Match           bool     `json:"match"`
+	Detail          string   `json:"detail"`
+	OnDiskDigest    string   `json:"onDiskDigest,omitempty"`
+	EnrolledDigests []string `json:"enrolledDigests,omitempty"`
+	Device          string   `json:"device,omitempty"`
+	Error           string   `json:"error,omitempty"`
+}
+
+// PCR11ForStatus is the PCR index whose live value diverges from the policy
+// prediction by design after unlock (kernel-boot PCR with systemd phases).
+const PCR11ForStatus = 11
 
 type tpmStatus struct {
 	Present        bool   `json:"present"`
@@ -58,7 +77,10 @@ type tokenDetail struct {
 }
 
 type recoveryInfo struct {
-	Enabled bool `json:"enabled"`
+	Enabled   bool   `json:"enabled"`
+	Counter   uint64 `json:"counter,omitempty"`
+	FailCount uint32 `json:"failCount,omitempty"`
+	Locked    bool   `json:"locked,omitempty"`
 }
 
 // threatVector represents one attack vector and its mitigations.
@@ -151,10 +173,10 @@ func (c *StatusCmd) Run() error {
 	data.Recovery = collectRecoveryStatus()
 	data.Fwupd = collectFwupdStatus()
 	data.HSTI = collectHSTIStatus()
-	computeTier(&data)
 
-	// Build threat model from collected data
+	// Build the threat model once — computeTier derives the tier from it.
 	data.ThreatModel = buildThreatModel(&data)
+	computeTier(&data)
 
 	if c.JSON {
 		enc := json.NewEncoder(os.Stdout)
@@ -171,9 +193,16 @@ func collectRecoveryStatus() *recoveryInfo {
 	if !client.WaitForDevice(2 * time.Second) {
 		return &recoveryInfo{}
 	}
-	return &recoveryInfo{
+	info := &recoveryInfo{
 		Enabled: client.RecoveryNVExists(tpm.DefaultRecoverySeedNVIndex),
 	}
+	// Surface the HOTP counter/fail state (owner-auth read; non-fatal).
+	if counter, failCount, err := client.ReadRecoveryState(); err == nil {
+		info.Counter = counter
+		info.FailCount = failCount
+		info.Locked = failCount >= recoveryMaxFailCount
+	}
+	return info
 }
 
 func collectTPMStatus(data *statusData) {
@@ -220,8 +249,12 @@ func collectLUKSStatus(data *statusData) {
 		info.Version = dev.Version()
 		info.Slots = len(dev.Slots())
 
-		tokens, _ := dev.Tokens()
+		tokens, tokenErr := dev.Tokens()
 		dev.Close()
+		if tokenErr != nil {
+			// Unreadable token data — device will show as passphrase-only.
+			fmt.Fprintf(os.Stderr, "vanguard: warning: failed to read tokens from %s: %v\n", info.Path, tokenErr)
+		}
 
 		for _, token := range tokens {
 			if token.Type != "systemd-tpm2" {
@@ -250,23 +283,10 @@ func parseTokenDetail(payload []byte) tokenDetail {
 	if raw.PCRLockNV != 0 {
 		td.NVIndex = raw.PCRLockNV
 	} else if raw.PCRLockNVAlt != "" {
-		nvBytes, err := base64.StdEncoding.DecodeString(raw.PCRLockNVAlt)
-		if err == nil && len(nvBytes) >= 6 {
-			// TPM2B_NV_PUBLIC: NV index is at offset 2 (after TPM2B size).
-			// Use the same parseNVIndexFromPublic logic as detect.go.
-			// Try offset 2 first (spec-compliant), then offset 0.
-			nvIdx := uint32(nvBytes[2])<<24 | uint32(nvBytes[3])<<16 |
-				uint32(nvBytes[4])<<8 | uint32(nvBytes[5])
-			if nvIdx&0xFF000000 == 0x01000000 {
-				td.NVIndex = nvIdx
-			} else if len(nvBytes) >= 4 {
-				// Fallback: offset 0 (no TPM2B wrapping)
-				nvIdx = uint32(nvBytes[0])<<24 | uint32(nvBytes[1])<<16 |
-					uint32(nvBytes[2])<<8 | uint32(nvBytes[3])
-				if nvIdx&0xFF000000 == 0x01000000 {
-					td.NVIndex = nvIdx
-				}
-			}
+		// Shared validated parser (offset 2 spec-compliant, offset 0 legacy,
+		// pcrlock range check) — same logic as the boot path in init/luks.
+		if idx, err := pcrlock.ParseNVIndexFromBlob(raw.PCRLockNVAlt); err == nil {
+			td.NVIndex = idx
 		}
 	}
 	td.HasSalt = raw.Salt != "" || raw.SaltAlt != ""
@@ -327,6 +347,12 @@ func collectPCRLockStatus(data *statusData) {
 
 	currentPCRs := readPCRsFromTPM()
 
+	// LUKS header binding check: compare the on-disk header digest against
+	// the enrollment-time component digests. Checked per device with a TPM2
+	// token; the first device that yields a binding result wins (typically
+	// a single LUKS device).
+	data.HeaderBinding = collectHeaderBinding(data.LUKSDevices)
+
 	if info.NVIndex != 0 {
 		info.NVOnTPM = tpmNVExists(info.NVIndex)
 	}
@@ -344,8 +370,10 @@ func collectPCRLockStatus(data *statusData) {
 		}
 
 		var allowed [][]byte
+		var rawValues []string
 		for _, pv := range policy.PCRValues {
 			if pv.PCR == pcr {
+				rawValues = pv.Values
 				for _, v := range pv.Values {
 					b, err := hexDecode(v)
 					if err == nil {
@@ -356,25 +384,13 @@ func collectPCRLockStatus(data *statusData) {
 			}
 		}
 
-		isEnforced := true
-		allZero := true
-		for _, a := range allowed {
-			for _, b := range a {
-				if b != 0 {
-					allZero = false
-					break
-				}
-			}
-			if !allZero {
-				break
-			}
-		}
-
-		if allZero {
-			isEnforced = false
-			info.UnboundPCRs = append(info.UnboundPCRs, pcr)
-		} else {
+		// Shared enforcement semantics with vanguard verify: enforced when
+		// at least one allowed value is not the all-zero digest.
+		isEnforced := pcrlock.IsEnforcedValues(rawValues)
+		if isEnforced {
 			info.EnforcedPCRs = append(info.EnforcedPCRs, pcr)
+		} else {
+			info.UnboundPCRs = append(info.UnboundPCRs, pcr)
 		}
 
 		match := !isEnforced
@@ -450,7 +466,7 @@ func readSecureBootState() string {
 
 func readPCRsFromTPM() map[int][]byte {
 	client := tpm.New()
-	if !client.WaitForDevice(2000000000) {
+	if !client.WaitForDevice(2 * time.Second) {
 		return nil
 	}
 
@@ -478,14 +494,65 @@ func hexDecode(s string) ([]byte, error) {
 	return hex.DecodeString(s)
 }
 
+// collectHeaderBinding runs the LUKS header digest check for each LUKS
+// device and returns the first binding result that indicates an enrolled
+// (bound) header component. Devices without a TPM2 token are skipped.
+// Per-device errors are remembered and only surfaced when NO device yielded
+// a real binding — an error on one device must never mask a tampered header
+// on another. Returns nil when there is nothing to report.
+func collectHeaderBinding(devices []luksDeviceInfo) *headerBindingInfo {
+	var firstErr *headerBindingInfo
+	for _, d := range devices {
+		if d.Token == nil {
+			continue
+		}
+		res, err := pcrlock.VerifyLUKSHeaderBinding(d.Path)
+		if err != nil {
+			// Remember the error and keep scanning other devices.
+			if firstErr == nil {
+				firstErr = &headerBindingInfo{
+					Device: d.Path,
+					Error:  err.Error(),
+				}
+			}
+			continue
+		}
+		if !res.Bound {
+			continue
+		}
+		return &headerBindingInfo{
+			Bound:           res.Bound,
+			Match:           res.Match,
+			Detail:          res.Detail,
+			OnDiskDigest:    res.OnDiskDigest,
+			EnrolledDigests: res.EnrolledDigests,
+			Device:          d.Path,
+		}
+	}
+	return firstErr
+}
+
+// pcr11Result returns the PCR 11 entry from the policy PCR results.
+func pcr11Result(results []pcrStatus) (pcrStatus, bool) {
+	for _, r := range results {
+		if r.PCR == PCR11ForStatus {
+			return r, true
+		}
+	}
+	return pcrStatus{}, false
+}
+
+// pcr11Enforced reports whether PCR 11 appears as enforced in the policy.
+func pcr11Enforced(results []pcrStatus) bool {
+	r, ok := pcr11Result(results)
+	return ok && r.IsEnforced
+}
+
 func hexEncode(b []byte) string {
 	return hex.EncodeToString(b)
 }
 
 func computeTier(data *statusData) {
-	// Build threat model first
-	data.ThreatModel = buildThreatModel(data)
-
 	// No TPM token → LOW
 	hasToken := false
 	for _, d := range data.LUKSDevices {
@@ -777,13 +844,37 @@ func buildBootChainTamperingVector(data *statusData) threatVector {
 	enforcedCount := 0
 	matchCount := 0
 	mismatchPCRs := []string{}
+	// PCR 11's live value legitimately diverges from the policy in a booted
+	// system: the policy predicts the at-unseal-time value (sd-stub + LUKS
+	// header), and systemd extends PCR 11 further after unlock. The header
+	// binding itself is checked separately via the on-disk header digest —
+	// exclude PCR 11 from the live-match critical trigger.
 	for _, r := range data.PCRLock.PCRResults {
-		if r.IsEnforced {
-			enforcedCount++
-			if r.Match {
-				matchCount++
-			} else {
-				mismatchPCRs = append(mismatchPCRs, fmt.Sprintf("PCR %d (%s)", r.PCR, r.Name))
+		if !r.IsEnforced {
+			continue
+		}
+		if r.PCR == PCR11ForStatus && data.HeaderBinding != nil {
+			// Handled by the dedicated LUKS header binding check below.
+			continue
+		}
+		enforcedCount++
+		if r.Match {
+			matchCount++
+		} else {
+			mismatchPCRs = append(mismatchPCRs, fmt.Sprintf("PCR %d (%s)", r.PCR, r.Name))
+		}
+	}
+	// Fall back to including PCR 11 when no digest check data is available
+	// (older policy on disk, non-LUKS device, or check errored).
+	if data.HeaderBinding == nil {
+		for _, r := range data.PCRLock.PCRResults {
+			if r.IsEnforced && r.PCR == PCR11ForStatus {
+				enforcedCount++
+				if r.Match {
+					matchCount++
+				} else {
+					mismatchPCRs = append(mismatchPCRs, fmt.Sprintf("PCR %d (%s)", r.PCR, r.Name))
+				}
 			}
 		}
 	}
@@ -847,30 +938,45 @@ func buildBootChainTamperingVector(data *statusData) threatVector {
 
 	// PCR 11 (LUKS header binding)
 	// Detects offline LUKS header tampering: adding a backdoor keyslot,
-	// weakening KDF, or changing the cipher. Any header modification
-	// changes the PCR 11 hash and breaks the pcrlock policy.
-	pcr11Bound := false
-	pcr11Match := false
-	for _, r := range data.PCRLock.PCRResults {
-		if r.PCR == 11 {
-			pcr11Bound = r.IsEnforced
-			pcr11Match = r.Match
-			break
-		}
-	}
-	if pcr11Bound {
-		if pcr11Match {
+	// weakening KDF, or changing the cipher. The security property is
+	// "the on-disk header is unchanged since enrollment", checked by
+	// comparing the on-disk header digest against the enrollment-time
+	// component digests (755-vanguard-luks-header.pcrlock.d).
+	//
+	// The live PCR 11 value is NOT compared against the policy here: the
+	// policy predicts the at-unseal-time value, and systemd extends PCR 11
+	// further after unlock (850-sysinit, 900-ready), so a live comparison
+	// always mismatches in a booted system and is not a security signal.
+	if data.HeaderBinding != nil && data.HeaderBinding.Bound {
+		if data.HeaderBinding.Match {
 			v.Mitigations = append(v.Mitigations, mitigation{
 				Name:   "PCRLock PCR 11 (LUKS header)",
 				Status: "ok",
-				Detail: "bound — LUKS header tampering detected",
+				Detail: "bound — LUKS header unchanged since enrollment",
 			})
 		} else {
 			v.Mitigations = append(v.Mitigations, mitigation{
 				Name:   "PCRLock PCR 11 (LUKS header)",
 				Status: "critical",
 				Detail: "MISMATCH — LUKS header changed since enrollment",
-				Fix:    "Run: vanguard update -u <uki> -l <luks-dev>",
+				Fix:    "Verify the change was intentional (cryptsetup reenroll/keyslot change); then run: vanguard update -u <uki> -l <luks-dev>",
+			})
+		}
+	} else if data.HeaderBinding != nil && !data.HeaderBinding.Bound && pcr11Enforced(data.PCRLock.PCRResults) {
+		// PCR 11 is in the policy but the header binding check couldn't
+		// verify the digest (e.g. non-LUKS device passed). Surface the live
+		// comparison result as informational instead of critical.
+		if r, ok := pcr11Result(data.PCRLock.PCRResults); ok && r.Match {
+			v.Mitigations = append(v.Mitigations, mitigation{
+				Name:   "PCRLock PCR 11 (LUKS header)",
+				Status: "ok",
+				Detail: "bound — live PCR 11 matches policy",
+			})
+		} else {
+			v.Mitigations = append(v.Mitigations, mitigation{
+				Name:   "PCRLock PCR 11 (LUKS header)",
+				Status: "warning",
+				Detail: "pcrlock-enforced — live PCR 11 does not match policy (expected after boot; header digest unverifiable)",
 			})
 		}
 	} else {
@@ -1278,13 +1384,13 @@ func buildBruteForceVector(data *statusData) threatVector {
 
 	if data.Recovery != nil && data.Recovery.Enabled {
 		v.Mitigations = append(v.Mitigations, mitigation{
-			Name:   "TOTP fallback",
+			Name:   "HOTP fallback",
 			Status: "ok",
 			Detail: "recovery code enrolled",
 		})
 	} else {
 		v.Mitigations = append(v.Mitigations, mitigation{
-			Name:   "TOTP fallback",
+			Name:   "HOTP fallback",
 			Status: "warning",
 			Detail: "not enrolled — no recovery if TPM unlock fails",
 			Fix:    "Run: sudo vanguard recovery --enable",
@@ -1529,8 +1635,7 @@ func renderStatus(data *statusData) {
 
 func renderVector(v *threatVector) string {
 	status := vectorStatus(v)
-	// Always expand — show all mitigations
-	_ = v.Collapsed // collapsed only used in JSON
+	// Always expand — show all mitigations (Collapsed is used only in JSON)
 
 	var prefix, label string
 	switch status {
@@ -1581,135 +1686,6 @@ func renderMitigation(m *mitigation) string {
 	return line + "\n"
 }
 
-func collapseDetail(v *threatVector) string {
-	switch v.Name {
-	case "Evil Maid (initrd/UKI replacement)":
-		var parts []string
-		for _, m := range v.Mitigations {
-			if m.Status == "ok" {
-				switch m.Name {
-				case "Secure Boot":
-					parts = append(parts, "Secure Boot")
-				case "PCRLock PCR 7":
-					parts = append(parts, "PCR 7")
-				case "Hardware Validated Boot (PSB)":
-					parts = append(parts, "PSB")
-				}
-			}
-		}
-		return strings.Join(parts, " + ")
-	case "Boot Chain Tampering (firmware/UKI change)":
-		for _, m := range v.Mitigations {
-			if m.Name == "PCRLock PCR binding" && m.Status == "ok" {
-				return m.Detail
-			}
-		}
-		return ""
-	case "TPM Key Extraction (bus sniffing)":
-		var parts []string
-		for _, m := range v.Mitigations {
-			if m.Status == "ok" {
-				switch m.Name {
-				case "TPM type":
-					if strings.Contains(m.Detail, "fTPM") {
-						parts = append(parts, "fTPM")
-					}
-				case "TPM bus encryption":
-					parts = append(parts, "bus encryption")
-				case "Dictionary attack lockout":
-					parts = append(parts, "DA lockout ok")
-				}
-			}
-		}
-		return strings.Join(parts, " + ")
-	case "DMA Attack (Thunderbolt/PCIe)":
-		var parts []string
-		for _, m := range v.Mitigations {
-			if m.Status == "ok" {
-				switch m.Name {
-				case "IOMMU/DMA":
-					parts = append(parts, "IOMMU")
-				case "Pre-boot DMA protection":
-					parts = append(parts, "pre-boot DMA")
-				}
-			}
-		}
-		return strings.Join(parts, " + ")
-	case "Kernel Runtime Attack (module/rootkit)":
-		var parts []string
-		for _, m := range v.Mitigations {
-			if m.Status == "ok" {
-				switch m.Name {
-				case "Kernel lockdown":
-					parts = append(parts, "lockdown "+m.Detail)
-				case "Module signatures":
-					parts = append(parts, "module sigs")
-				case "CET Shadow Stack":
-					parts = append(parts, "CET")
-				case "SMAP":
-					parts = append(parts, "SMAP")
-				}
-			}
-		}
-		return strings.Join(parts, " + ")
-	case "Cold Boot Attack (RAM dump)":
-		return ""
-	case "Brute-Force / Key Theft (LUKS)":
-		var parts []string
-		for _, m := range v.Mitigations {
-			if m.Status == "ok" {
-				switch m.Name {
-				case "TPM2 token":
-					parts = append(parts, "TPM2 token")
-				case "PIN":
-					parts = append(parts, "PIN")
-				case "PCRLock binding":
-					parts = append(parts, "PCRLock")
-				case "TOTP fallback":
-					parts = append(parts, "TOTP")
-				}
-			}
-		}
-		return strings.Join(parts, " + ")
-	case "Physical Debug Attack (JTAG/DCI)":
-		var parts []string
-		for _, m := range v.Mitigations {
-			if m.Status == "ok" {
-				switch m.Name {
-				case "Debug interface locked":
-					parts = append(parts, "debug locked")
-				case "Fused part":
-					parts = append(parts, "fused")
-				}
-			}
-		}
-		return strings.Join(parts, " + ")
-	case "Firmware Tampering (SPI flash/replay/downgrade)":
-		var parts []string
-		for _, m := range v.Mitigations {
-			if m.Status == "ok" {
-				switch m.Name {
-				case "SPI Write Protection":
-					parts = append(parts, "SPI write")
-				case "SPI Replay Protection":
-					parts = append(parts, "SPI replay")
-				case "Anti-Rollback Protection":
-					parts = append(parts, "rollback")
-				}
-			}
-		}
-		return strings.Join(parts, " + ")
-	case "SMM Attack (ring -2 rootkit)":
-		for _, m := range v.Mitigations {
-			if m.Name == "SMM Locked" && m.Status == "ok" {
-				return "locked"
-			}
-		}
-		return ""
-	}
-	return ""
-}
-
 func renderVerboseLUKS(data *statusData) string {
 	var out strings.Builder
 	hasLUKS := false
@@ -1750,12 +1726,58 @@ func renderVerbosePCRs(data *statusData) string {
 		} else {
 			matchStr = errStyle.Render("MISMATCH")
 		}
+
+		// PCR 11 special case: the policy predicts the at-unseal-time value,
+		// systemd extends PCR 11 after unlock, so the live value diverges by
+		// design. Show the on-disk header digest binding instead — that is
+		// the actual security property.
+		if r.PCR == PCR11ForStatus && r.IsEnforced && data.HeaderBinding != nil {
+			out.WriteString(fmt.Sprintf("    PCR %-2d %-20s %s  %s\n", r.PCR, r.Name,
+				renderHeaderBindingMatch(data.HeaderBinding), dimStyle.Render(label)))
+			if data.HeaderBinding.OnDiskDigest != "" {
+				out.WriteString(fmt.Sprintf("      header:   %s\n", data.HeaderBinding.OnDiskDigest))
+			}
+			for _, ed := range data.HeaderBinding.EnrolledDigests {
+				out.WriteString(fmt.Sprintf("      enrolled: %s\n", ed))
+			}
+			out.WriteString(fmt.Sprintf("      %s\n", dimStyle.Render(headerBindingDetail(data.HeaderBinding))))
+			if r.Current != "" {
+				out.WriteString(fmt.Sprintf("      live:     %s %s\n", r.Current, dimStyle.Render("(includes post-unlock systemd measurements)")))
+			}
+			continue
+		}
+
 		out.WriteString(fmt.Sprintf("    PCR %-2d %-20s %s  %s\n", r.PCR, r.Name, matchStr, dimStyle.Render(label)))
 		if r.Current != "" {
 			out.WriteString(fmt.Sprintf("      current: %s\n", r.Current))
 		}
 	}
 	return out.String()
+}
+
+// renderHeaderBindingMatch renders the header binding result for the PCR
+// DETAILS table.
+func renderHeaderBindingMatch(info *headerBindingInfo) string {
+	if info.Error != "" {
+		return dimStyle.Render("unverifiable")
+	}
+	if info.Match {
+		return okStyle.Render("match")
+	}
+	return errStyle.Render("MISMATCH")
+}
+
+// headerBindingDetail returns the explanation line for the PCR DETAILS
+// table: the check's Detail, or the error text when the check itself
+// failed (so the failure is diagnosable instead of a blank line).
+func headerBindingDetail(info *headerBindingInfo) string {
+	if info.Detail != "" {
+		return info.Detail
+	}
+	if info.Error != "" {
+		return "header digest check failed: " + info.Error
+	}
+	return ""
 }
 
 func renderTier(tier string) string {

@@ -7,8 +7,8 @@ import (
 	"github.com/zaolin/vanguard/internal/tpm/swtpmtest"
 )
 
-// TestSwtpmRecoveryEnrollAndRead tests the full recovery seed lifecycle
-// using swtpm instead of the real TPM hardware.
+// TestSwtpmRecoveryEnrollAndRead tests the full recovery seed + state
+// lifecycle using swtpm instead of the real TPM hardware.
 func TestSwtpmRecoveryEnrollAndRead(t *testing.T) {
 	tpmTransport, cleanup := swtpmtest.Setup(t)
 	defer cleanup()
@@ -19,11 +19,8 @@ func TestSwtpmRecoveryEnrollAndRead(t *testing.T) {
 	}
 
 	nvIndex := uint32(0x01C30020)
-
-	// Clean up any existing index
 	_ = client.UndefineRecoveryNVSpace(nvIndex, nil)
 
-	// Read current PCR 7
 	pcrValues := make(map[int][]byte)
 	val, err := client.ReadPCR(AlgSHA256, 7)
 	if err != nil {
@@ -31,76 +28,64 @@ func TestSwtpmRecoveryEnrollAndRead(t *testing.T) {
 	}
 	pcrValues[7] = val
 
-	// Define NV space
 	if err := client.DefineRecoveryNVSpace(nvIndex, pcrValues); err != nil {
 		t.Fatalf("DefineRecoveryNVSpace: %v", err)
 	}
-
-	// Check it exists
 	if !client.RecoveryNVExists(nvIndex) {
 		t.Fatal("RecoveryNVExists should return true after DefineRecoveryNVSpace")
 	}
+	if !client.StateNVExists() {
+		t.Fatal("StateNVExists should return true after DefineRecoveryNVSpace")
+	}
 
-	// Write recovery data
 	testSeed := make([]byte, SeedSize)
 	for i := range testSeed {
 		testSeed[i] = byte(i)
 	}
-	testTimestamp := int64(1234567890)
-	if err := client.WriteRecoveryData(nvIndex, testSeed, testTimestamp, pcrValues); err != nil {
+	if err := client.WriteRecoveryData(nvIndex, testSeed, pcrValues); err != nil {
 		t.Fatalf("WriteRecoveryData: %v", err)
 	}
 
-	// Read recovery data back
-	seed, refTimestamp, _, err := client.ReadRecoveryData(nvIndex)
+	seed, counter, failCount, err := client.ReadRecoveryData(nvIndex)
 	if err != nil {
 		t.Fatalf("ReadRecoveryData: %v", err)
 	}
-
-	// Verify seed
 	for i, b := range seed {
 		if b != byte(i) {
 			t.Fatalf("seed[%d]: got %d, want %d", i, b, byte(i))
 		}
 	}
-	if refTimestamp != testTimestamp {
-		t.Errorf("timestamp: got %d, want %d", refTimestamp, testTimestamp)
+	if counter != 0 || failCount != 0 {
+		t.Errorf("initial state: counter=%d failCount=%d, want 0,0", counter, failCount)
 	}
 
-	// Update timestamp
-	newTimestamp := int64(9876543210)
-	if err := client.UpdateRecoveryTimestamp(newTimestamp); err != nil {
-		t.Fatalf("UpdateRecoveryTimestamp: %v", err)
+	if err := client.WriteRecoveryState(5, 2); err != nil {
+		t.Fatalf("WriteRecoveryState: %v", err)
 	}
-
-	// Read again - timestamp should be updated, seed preserved
-	seed2, refTimestamp2, _, err := client.ReadRecoveryData(nvIndex)
+	seed2, counter2, failCount2, err := client.ReadRecoveryData(nvIndex)
 	if err != nil {
-		t.Fatalf("ReadRecoveryData after timestamp update: %v", err)
+		t.Fatalf("ReadRecoveryData after state write: %v", err)
 	}
-	if refTimestamp2 != newTimestamp {
-		t.Errorf("timestamp after update: got %d, want %d", refTimestamp2, newTimestamp)
+	if counter2 != 5 || failCount2 != 2 {
+		t.Errorf("state after write: counter=%d failCount=%d, want 5,2", counter2, failCount2)
 	}
-	// Seed should be unchanged
 	for i, b := range seed2 {
 		if b != byte(i) {
-			t.Fatalf("seed2[%d] changed after timestamp update", i)
+			t.Fatalf("seed2[%d] changed after state write", i)
 		}
 	}
 
-	// Undefine
 	if err := client.UndefineRecoveryNVSpace(nvIndex, nil); err != nil {
 		t.Fatalf("UndefineRecoveryNVSpace: %v", err)
 	}
-
-	// Verify it's gone
 	if client.RecoveryNVExists(nvIndex) {
 		t.Error("RecoveryNVExists should return false after undefine")
 	}
+	if client.StateNVExists() {
+		t.Error("StateNVExists should return false after undefine")
+	}
 }
 
-// TestSwtpmRecoverySeedNotReadable tests that the seed is not readable
-// when PCR 7 doesn't match the enrollment value.
 func TestSwtpmRecoverySeedNotReadableWrongPCR(t *testing.T) {
 	tpmTransport, cleanup := swtpmtest.Setup(t)
 	defer cleanup()
@@ -108,53 +93,54 @@ func TestSwtpmRecoverySeedNotReadableWrongPCR(t *testing.T) {
 	client := NewWithTransport(tpmTransport)
 
 	nvIndex := uint32(0x01C30021)
-
-	// Clean up
 	_ = client.UndefineRecoveryNVSpace(nvIndex, nil)
 
-	// Read current PCR 7 and define with a fake value
-	pcrValues := make(map[int][]byte)
+	// Read current PCR 7
 	val, err := client.ReadPCR(AlgSHA256, 7)
 	if err != nil {
 		t.Fatalf("ReadPCR 7: %v", err)
 	}
-	// Use a fake PCR 7 value (different from current)
+	pcrValuesCorrect := map[int][]byte{7: val}
+
+	// Fake PCR 7 (different from current)
 	fakePCR7 := make([]byte, 32)
 	for i := range fakePCR7 {
 		fakePCR7[i] = 0xFF
 	}
-	pcrValues[7] = fakePCR7
+	pcrValuesFake := map[int][]byte{7: fakePCR7}
 
-	if err := client.DefineRecoveryNVSpace(nvIndex, pcrValues); err != nil {
-		t.Fatalf("DefineRecoveryNVSpace: %v", err)
-	}
-
-	// Write with fake PCR values (should work - writeSeedWithPolicy uses current TPM PCR values)
-	// Actually this will fail because the policy session uses current PCR values which don't match
-	// The authPolicy was computed from fakePCR7, but the TPM's current PCR 7 is different
-	// So writeSeedWithPolicy's PolicyPCR will produce a different session digest
-	// This is actually the correct behavior - you can only write when PCRs match
-
-	// Instead, let's just verify that ReadRecoveryData fails when PCR doesn't match
-	// First, write with the correct PCR values
-	pcrValuesCorrect := make(map[int][]byte)
-	pcrValuesCorrect[7] = val
+	// Enroll with the correct PCR 7 (defines seed + state, writes both).
 	if err := client.DefineRecoveryNVSpace(nvIndex, pcrValuesCorrect); err != nil {
 		t.Fatalf("DefineRecoveryNVSpace (correct): %v", err)
 	}
 	testSeed := make([]byte, SeedSize)
-	if err := client.WriteRecoveryData(nvIndex, testSeed, 1000, pcrValuesCorrect); err != nil {
+	if err := client.WriteRecoveryData(nvIndex, testSeed, pcrValuesCorrect); err != nil {
 		t.Fatalf("WriteRecoveryData: %v", err)
 	}
 
-	// Now redefine with fake PCR 7 - the old seed becomes unreadable
-	if err := client.DefineRecoveryNVSpace(nvIndex, pcrValues); err != nil {
-		t.Fatalf("DefineRecoveryNVSpace (fake): %v", err)
+	// Readable with the matching PCR state.
+	if _, _, _, err := client.ReadRecoveryData(nvIndex); err != nil {
+		t.Fatalf("ReadRecoveryData with matching PCR 7 should succeed: %v", err)
 	}
 
-	// Read should fail because PCR 7 doesn't match the authPolicy
-	_, _, _, err = client.ReadRecoveryData(nvIndex)
-	if err == nil {
+	// Replace ONLY the seed index with a fake-PCR-7 policy: the seed
+	// becomes unreadable under the current boot state.
+	if err := client.DefineSeedNVIndex(nvIndex, pcrValuesFake); err != nil {
+		t.Fatalf("DefineSeedNVIndex (fake): %v", err)
+	}
+
+	// Seed read must fail (PCR 7 mismatch).
+	if _, err := client.ReadSeedOnly(nvIndex); err == nil {
+		t.Error("ReadSeedOnly with different PCR 7 should fail")
+	}
+
+	// The state index (bound to the real PCR 7) must remain readable.
+	if _, _, err := client.ReadRecoveryState(); err != nil {
+		t.Errorf("ReadRecoveryState with matching PCR 7 should still succeed: %v", err)
+	}
+
+	// Full ReadRecoveryData fails because of the seed.
+	if _, _, _, err := client.ReadRecoveryData(nvIndex); err == nil {
 		t.Error("ReadRecoveryData should fail when PCR 7 doesn't match authPolicy")
 	}
 

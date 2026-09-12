@@ -73,17 +73,28 @@ func (c *VerifyPCRLockCmd) runJSON(policy *pcrlock.Policy) error {
 			name = "unknown"
 		}
 
-		isEnforced := true
-		for _, v := range pv.Values {
-			if v != "0000000000000000000000000000000000000000000000000000000000000000" {
-				isEnforced = false
-				break
-			}
-		}
-		isEnforced = !isEnforced
+		// Shared enforcement semantics with vanguard status.
+		isEnforced := pcrlock.IsEnforcedValues(pv.Values)
 
 		matched := pcrMatches[pv.PCR]
 		current := currentValues[pv.PCR]
+
+		// PCR 11: the live comparison always mismatches post-boot (systemd
+		// extends PCR 11 after unlock). With a LUKS device, use the header
+		// digest binding as the authoritative match. Without a device, the
+		// live mismatch is not evaluable — keep Match=false but do not fail
+		// AllMatch on it (matches the human output's "—" rendering).
+		pcr11NotEvaluated := false
+		if pv.PCR == 11 && isEnforced && !matched {
+			if c.LUKSDevice != "" {
+				hb, hbErr := pcrlock.VerifyLUKSHeaderBinding(c.LUKSDevice)
+				if hbErr == nil && hb.Bound {
+					matched = hb.Match
+				}
+			} else {
+				pcr11NotEvaluated = true
+			}
+		}
 
 		result.PCRs = append(result.PCRs, verifyPCR{
 			PCR:      pv.PCR,
@@ -93,7 +104,7 @@ func (c *VerifyPCRLockCmd) runJSON(policy *pcrlock.Policy) error {
 			Current:  current,
 		})
 
-		if !matched && isEnforced {
+		if !matched && isEnforced && !pcr11NotEvaluated {
 			result.AllMatch = false
 		}
 	}
@@ -176,19 +187,48 @@ func (c *VerifyPCRLockCmd) runHuman(policy *pcrlock.Policy) error {
 			name = "unknown"
 		}
 
-		isEnforced := true
+		var pvValues []string
 		for _, pv := range policy.PCRValues {
 			if pv.PCR == pcr {
-				allZero := true
-				for _, v := range pv.Values {
-					if v != "0000000000000000000000000000000000000000000000000000000000000000" {
-						allZero = false
-						break
-					}
-				}
-				isEnforced = !allZero
+				pvValues = pv.Values
 				break
 			}
+		}
+
+		// Shared enforcement semantics with vanguard status.
+		isEnforced := pcrlock.IsEnforcedValues(pvValues)
+
+		// PCR 11 special case: the policy predicts the at-unseal-time value
+		// and systemd extends PCR 11 after unlock, so the live comparison
+		// always mismatches in a booted system. When a LUKS device is given,
+		// use the on-disk header digest binding instead; otherwise report
+		// the live mismatch as informational.
+		if pcr == 11 && isEnforced && !pcrMatches[pcr] {
+			if c.LUKSDevice != "" {
+				hb, hbErr := pcrlock.VerifyLUKSHeaderBinding(c.LUKSDevice)
+				if hbErr == nil && hb.Bound {
+					if hb.Match {
+						pcrLines = append(pcrLines, fmt.Sprintf("%s PCR %-2d %s  %s", okStyle.Render("✓"), pcr, name,
+							dimStyle.Render("(header digest match — live PCR extended post-unlock)")))
+					} else {
+						pcrLines = append(pcrLines, fmt.Sprintf("%s PCR %-2d %s — MISMATCH", errStyle.Render("✗"), pcr, name))
+						pcrLines = append(pcrLines, dimStyle.Render("   LUKS header changed since enrollment"))
+						pcrAllMatch = false
+					}
+				} else {
+					// Binding unverifiable — fall back to live comparison.
+					pcrLines = append(pcrLines, fmt.Sprintf("%s PCR %-2d %s — MISMATCH", errStyle.Render("✗"), pcr, name))
+					pcrAllMatch = false
+				}
+				if current := currentValues[pcr]; current != "" {
+					pcrLines = append(pcrLines, dimStyle.Render(fmt.Sprintf("   live: %s (includes post-unlock systemd measurements)", truncateHash(current))))
+				}
+				continue
+			}
+			// No LUKS device: live PCR 11 mismatch is expected post-boot.
+			pcrLines = append(pcrLines, fmt.Sprintf("%s PCR %-2d %s  %s", dimStyle.Render("—"), pcr, name,
+				dimStyle.Render("(live mismatch expected post-boot; pass -l <luks-dev> to verify header digest)")))
+			continue
 		}
 
 		matched := pcrMatches[pcr]

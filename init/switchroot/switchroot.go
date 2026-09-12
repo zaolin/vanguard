@@ -68,7 +68,7 @@ func SwitchRoot(newroot, init string) error {
 	}
 
 	// Delete the old initramfs root contents to free RAM and eliminate
-	// any secrets (passwords, keys, TOTP seeds) that may remain in the
+	// any secrets (passwords, keys, HOTP seeds) that may remain in the
 	// initramfs tmpfs. After chroot, the old root is no longer accessible
 	// via the filesystem, so we delete the contents of the current root
 	// (which is the new root) — wait, that's wrong. We need to delete the

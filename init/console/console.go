@@ -23,6 +23,14 @@ var LogFunc func(message string) = func(message string) {}
 
 // Setup initializes the console for early output
 func Setup() error {
+	// Ensure /dev/console exists as char device (5,1). The generated
+	// initramfs carries device nodes, but if the archive was produced by an
+	// older vanguard (broken rdev serialization → node (0,0)) or the kernel
+	// did not mount devtmpfs before /init, the open below would fail and
+	// boot would halt with no output at all. Mknod is a cheap no-op when
+	// the node already exists with the right type.
+	mknodConsole()
+
 	// Try various console devices
 	for _, path := range []string{"/dev/console", "/dev/tty1", "/dev/ttyS0"} {
 		fd, err := os.OpenFile(path, os.O_RDWR, 0)
@@ -39,6 +47,16 @@ func Setup() error {
 		}
 	}
 	return fmt.Errorf("no console device available")
+}
+
+// mknodConsole creates /dev/console (char 5:1) and /dev/null (char 1:3) as
+// a last-resort fallback. Errors are ignored: on a correctly-built
+// initramfs (or devtmpfs) the nodes already exist, and there is nothing
+// further to do if creation fails.
+func mknodConsole() {
+	// glibc/linux makedev for small numbers: (major << 8 | minor).
+	_ = unix.Mknod("/dev/console", unix.S_IFCHR|0600, int(uint32(5)<<8|uint32(1)))
+	_ = unix.Mknod("/dev/null", unix.S_IFCHR|0666, int(uint32(1)<<8|uint32(3)))
 }
 
 // SuppressKernelMessages sets the kernel console log level to suppress

@@ -106,8 +106,29 @@ func ParseGPT(device string) ([]Partition, error) {
 
 	Debug("gpt: found GPT with %d partition entries\n", header.NumPartitions)
 
+	// Validate the entry-array geometry from the untrusted header before
+	// allocating: PartitionEntrySize feeds make() directly (a crafted value
+	// up to 4 GiB would attempt a huge allocation from a small initramfs),
+	// and NumPartitions x entrySize bounds the scan length.
+	// GPT spec: entry size >= 128, <= 16384; typical entry counts <= 128,
+	// spec allows up to 2^32-4 entries but real disks use 128.
+	if header.PartitionEntrySize != 0 {
+		if header.PartitionEntrySize < 128 || header.PartitionEntrySize > 16384 || header.PartitionEntrySize%8 != 0 {
+			Debug("gpt: invalid partition entry size %d, skipping disk\n", header.PartitionEntrySize)
+			return nil, nil
+		}
+	}
+	if header.NumPartitions > 1024 {
+		Debug("gpt: implausible partition count %d, skipping disk\n", header.NumPartitions)
+		return nil, nil
+	}
+
 	// Read partition entries
 	entryOffset := int64(header.PartitionEntryLBA) * sectorSize
+	if entryOffset < 0 {
+		Debug("gpt: partition entry LBA %d out of range, skipping disk\n", header.PartitionEntryLBA)
+		return nil, nil
+	}
 	entrySize := int64(header.PartitionEntrySize)
 	if entrySize == 0 {
 		entrySize = 128 // Default GPT entry size

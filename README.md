@@ -20,7 +20,7 @@ Vanguard binds disk encryption keys to the measured boot state of the platform. 
 | Attack | What Vanguard does |
 |--------|-------------------|
 | Evil Maid (initrd/UKI replacement) | Secure Boot enforcement, PCRLock PCR 7 binding, sbctl signature verification, hardware validated boot (PSB) |
-| Boot chain tampering | PCRLock multi-PCR binding (PCR 0-7, 11), TPM NV index policy, PCR0 reconstruction, LUKS header measurement (PCR 11) |
+| Boot chain tampering | PCRLock multi-PCR binding (PCR 2-5, 7, 11), TPM NV index policy, PCR0 reconstruction, LUKS header measurement (PCR 11) |
 | LUKS header tampering (offline) | PCR 11 LUKS header hash binding — detects added keyslots, KDF weakening, cipher changes |
 | TPM key extraction (bus sniffing) | fTPM detection (no external bus), TPM bus encryption (CONFIG_TCG_TPM2_HMAC), dictionary attack lockout |
 | DMA attack (Thunderbolt/PCIe) | IOMMU enforcement, pre-boot DMA protection |
@@ -29,7 +29,7 @@ Vanguard binds disk encryption keys to the measured boot state of the platform. 
 | Firmware tampering (SPI flash/replay) | SPI write protection, replay protection, anti-rollback (via fwupd HSI / AMD HSTI) |
 | SMM attack (ring -2 rootkit) | SMM lock enforcement (via fwupd) |
 | Cold boot attack (RAM dump) | Memory encryption (AMD SME/TSME, Intel TME) - informational, does not affect tier |
-| Brute-force / key theft | TPM2 token with PIN, PCRLock binding, TOTP recovery fallback |
+| Brute-force / key theft | TPM2 token with PIN, PCRLock binding, HOTP recovery fallback |
 
 ### Protection Tiers
 
@@ -45,19 +45,31 @@ Vanguard binds disk encryption keys to the measured boot state of the platform. 
 
 ### PCR Coverage
 
+The enforced set is the "safe/stable" PCR subset: firmware PCRs (0/1) change
+on every firmware update and are therefore masked from the policy (they are
+still verified independently via fwupd's PCR0 reconstruction check).
+
 | PCR | Name | Enforcement |
 |-----|------|:-----------:|
-| 0 | platform-code | Enforced |
-| 1 | platform-config | Enforced |
 | 2 | external-code | Enforced |
 | 3 | external-config | Enforced |
 | 4 | boot-loader-code | Enforced (multi-branch) |
 | 5 | GPT partition table | Optional (`-l` flag) |
 | 7 | secure-boot-policy | Enforced |
+| 11 | kernel-boot | Enforced (LUKS header hash, with `-l` flag) |
+| 0, 1 | platform-code/config | Masked (verified via fwupd PCR0 reconstruction instead) |
 | 13 | sysexts | Unbound |
 | 14 | shim-policy | Unbound |
 
-The TOTP recovery seed is sealed to PCR 7 (Secure Boot state) in TPM NVRAM. If Secure Boot keys change (firmware update), the seed becomes inaccessible and is automatically re-provisioned via `vanguard recovery --auto-reseed`.
+**PCR 11 status semantics:** the policy's PCR 11 value is an at-unseal-time
+prediction (kernel measurement + LUKS header hash). After unlock, systemd
+extends PCR 11 further, so the live value in a booted system legitimately
+diverges from the policy. `vanguard status` therefore verifies the actual
+security property — the on-disk LUKS header digest against the
+enrollment-time component digests — and only reports a mismatch when the
+header itself changed.
+
+The HOTP recovery seed is sealed to PCR 7 (Secure Boot state) in TPM NVRAM. If Secure Boot keys change (firmware update), the seed becomes inaccessible and is automatically re-provisioned via `vanguard recovery --auto-reseed`.
 
 ## Quick Start
 
@@ -76,7 +88,7 @@ sudo ./vanguard generate -o /boot/initramfs-linux.img
 # Set up TPM2 PCRLock policy + enroll token
 sudo vanguard enroll -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 --with-pin
 
-# Enable TOTP recovery (scan QR code with authenticator app)
+# Enable HOTP recovery (scan QR code with authenticator app)
 sudo vanguard recovery --enable
 ```
 
@@ -91,7 +103,7 @@ For the full setup guide including partition layout, kernel command line, and fi
 | `vanguard enroll` | Enroll TPM2 token on a LUKS device (runs update + systemd-cryptenroll) |
 | `vanguard verify` | Verify TPM2 pcrlock setup (PCRs, NV index, LUKS token) |
 | `vanguard status` | Show system protection status as a threat-model view |
-| `vanguard recovery` | Manage TOTP-based boot recovery (`--enable`, `--show`, `--disable`, `--clean`, `--auto-reseed`) |
+| `vanguard recovery` | Manage HOTP-based boot recovery (`--enable`, `--show`, `--disable`, `--clean`, `--auto-reseed`) |
 | `vanguard inspect` | Inspect contents of a generated initramfs |
 
 See [Configuration](docs/configuration.md) for all CLI options and config file format.
@@ -104,7 +116,7 @@ Vanguard has a dual-binary design:
 - **`init/`** - Init binary running inside the initramfs at boot (19-step sequence)
 - **`internal/`** - Shared libraries: native Go TPM2 client, native Go LUKS, CPIO writer, compression, pcrlock integration
 
-The init binary is statically linked (`CGO_ENABLED=0`) with zero runtime dependencies. LUKS unlock and TPM2 operations use native Go implementations - no `cryptsetup` or `tpm2-tools` needed at boot. The only external binaries in the initramfs are `lvm`, `systemd-udevd`/`udevadm`, and `dmsetup`.
+The init binary is statically linked (`CGO_ENABLED=0`) with zero runtime dependencies. LUKS unlock and TPM2 operations use native Go implementations - no `cryptsetup` or `tpm2-tools` needed at boot. The external binaries in the initramfs are `lvm`, `systemd-udevd`/`udevadm`, and `dmsetup`, plus optional `loadkeys`/`setfont` (console) and `fsck` binaries (root filesystem check) — see [Configuration](docs/configuration.md) for the full list.
 
 ## Requirements
 

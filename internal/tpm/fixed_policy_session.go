@@ -151,7 +151,7 @@ func computeFixedHMACKey(sessionKey []byte, auth []byte) []byte {
 // using reflect. Returns sessionKey, nonceCaller, attrs.
 func getSessionInternals(sess tpm2.Session) (sessionKey []byte, nonceCaller []byte, attrs tpm2.TPMASession, err error) {
 	v := reflect.ValueOf(sess)
-	if v.Kind() == reflect.Ptr {
+	if v.Kind() == reflect.Pointer {
 		v = v.Elem()
 	}
 

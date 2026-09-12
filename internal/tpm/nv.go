@@ -4,59 +4,65 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/google/go-tpm/tpm2"
 	"github.com/google/go-tpm/tpm2/transport"
 	"github.com/zaolin/vanguard/init/buildtags"
 )
 
-// ErrTimestampMissing indicates that the timestamp NV index (0x01C30002)
-// does not exist on the TPM. This can happen if a previous auto-reseed
-// deleted it but failed to recreate it. The seed index may still be valid.
-var ErrTimestampMissing = errors.New("timestamp NV index missing")
+// ErrSeedPCRMismatch indicates the seed NV read failed because the current
+// PCR state does not satisfy the index authPolicy (Secure Boot state
+// changed or untrusted boot). This is the ONLY condition under which
+// recovery --auto-reseed may replace the seed.
+var ErrSeedPCRMismatch = errors.New("TPM seed policy mismatch")
 
-// NV index constants for TOTP recovery.
+// ErrSeedReadTransient indicates the seed NV read failed for a
+// non-policy reason (transport error, session creation failure, or any
+// TPM response code that is not a policy/auth failure). Callers must
+// treat this as retryable/diagnostic — NEVER as a reason to reseed.
+var ErrSeedReadTransient = errors.New("TPM seed read failed (transient)")
+
+// NV index constants for HOTP recovery.
 const (
-	// DefaultRecoverySeedNVIndex stores the TOTP seed (32 bytes).
-	// Protected by PolicyRead/PolicyWrite/PolicyDelete — only accessible
-	// when the correct PCR state is present (anti-evil-maid protection).
+	// DefaultRecoverySeedNVIndex stores the HOTP seed (32 bytes).
+	// Protected by PolicyRead/PolicyWrite — only accessible when the
+	// correct PCR 7 state is present (anti-evil-maid protection). No
+	// PolicyDelete: the index is undefined and redefined by recovery
+	// --enable / --auto-reseed via owner auth.
 	DefaultRecoverySeedNVIndex = 0x01C30001
 
-	// DefaultRecoveryTimestampNVIndex stores the reference timestamp (8 bytes).
-	// Protected by OwnerRead/OwnerWrite — not secret, just needs to be
-	// writable for updates at boot.
-	DefaultRecoveryTimestampNVIndex = 0x01C30002
+	// DefaultRecoveryStateNVIndex stores the HOTP counter (8 bytes) and the
+	// failed-attempt count (4 bytes): 12 bytes total. OwnerRead/OwnerWrite —
+	// not secret, but must survive reboots so the counter advances and
+	// brute-force attempts accumulate across boots.
+	//
+	// 0x01C30002 is the legacy (removed) TOTP reference-timestamp index;
+	// the state index deliberately uses a new handle so an upgrade does not
+	// collide with a leftover timestamp index.
+	DefaultRecoveryStateNVIndex = 0x01C30003
 
-	// SeedSize is the TOTP seed size in bytes (256-bit HMAC-SHA256 key).
+	// SeedSize is the HOTP seed size in bytes (256-bit HMAC-SHA256 key).
 	SeedSize = 32
 
-	// TimestampSize is the reference timestamp size in bytes (int64 big-endian).
-	TimestampSize = 8
+	// CounterSize is the HOTP counter size in bytes (uint64 big-endian).
+	CounterSize = 8
+
+	// FailCountSize is the failed-attempt counter size in bytes (uint32 big-endian).
+	FailCountSize = 4
+
+	// StateNVDataSize is the total size of the recovery state NV index:
+	// counter (8) + fail count (4) = 12 bytes.
+	StateNVDataSize = CounterSize + FailCountSize
 
 	// NumBranches is the number of PolicyOR branches in the seed read policy.
 	// Single branch: PCR 7 only (Secure Boot state).
 	// Note: PolicyOR requires at least 2 branches per TPM 2.0 spec, so with
 	// a single branch we use PolicyPCR directly (no PolicyOR).
 	NumBranches = 1
-
-	// BranchDigestSize is the size of each branch digest (SHA256 = 32 bytes).
-	BranchDigestSize = 32
-
-	// TimestampNVDataSize is the total size of the timestamp NV index data.
-	// It stores the reference timestamp (8 bytes) followed by the enrollment-time
-	// branch digest (NumBranches * BranchDigestSize = 32 bytes), totaling 40 bytes.
-	//
-	// The branch digest is stored so that PolicyOR at boot time can use the
-	// enrollment-time branch digest (not a current-PCR-derived one), ensuring
-	// the PolicyOR result matches the authPolicy even when PCRs have changed
-	// (e.g., PCR 4 after a kernel update — the single PCR 7 branch still
-	// matches because Secure Boot state is stable).
-	TimestampNVDataSize = TimestampSize + NumBranches*BranchDigestSize
 )
 
-// DefineRecoveryNVSpace creates the two NV indexes for TOTP recovery:
-//   - Seed index (0x01C30001): PolicyRead/PolicyWrite/PolicyDelete, authPolicy = PolicyOR
+// DefineRecoveryNVSpace creates the two NV indexes for HOTP recovery:
+//   - Seed index (0x01C30001): PolicyRead/PolicyWrite, authPolicy from PCR 7
 //   - Timestamp index (0x01C30002): OwnerRead/OwnerWrite, no policy
 //
 // The seed index's authPolicy is computed from the current PCR 7 value
@@ -65,7 +71,26 @@ const (
 // has different PCR values and cannot access the seed.
 //
 // If the indexes already exist, they are undefined first.
+//
+// This is the FULL provisioning path (recovery --enable) — it tears down and
+// recreates BOTH indexes. Atomic-reseed staging must NOT use this function:
+// use DefineSeedNVIndex/WriteSeedOnly (seed-only) so the shared timestamp
+// index is never touched while a replacement seed is being staged.
 func (c *Client) DefineRecoveryNVSpace(seedIndex uint32, pcrValues map[int][]byte) error {
+	if err := c.UndefineRecoveryNVSpace(seedIndex, nil); err != nil {
+		return err
+	}
+	if err := c.DefineSeedNVIndex(seedIndex, pcrValues); err != nil {
+		return err
+	}
+	return c.DefineStateNVIndex(pcrValues)
+}
+
+// DefineSeedNVIndex defines ONLY the seed NV index at seedIndex with the
+// PCR-7-bound read/write policy, replacing any existing index at that
+// handle. It never touches the shared state index (0x01C30003) —
+// safe for atomic-reseed temp staging (nvIndex+0x100).
+func (c *Client) DefineSeedNVIndex(seedIndex uint32, pcrValues map[int][]byte) error {
 	tpm, err := c.openTPM()
 	if err != nil {
 		return err
@@ -78,63 +103,12 @@ func (c *Client) DefineRecoveryNVSpace(seedIndex uint32, pcrValues map[int][]byt
 		return fmt.Errorf("failed to compute seed read policy: %w", err)
 	}
 
-	// Compute the enrollment-time branch digests so they can be stored
-	// alongside the timestamp for use by PolicyOR at boot time.
-	branchDigests, err := computeAllBranchDigests(pcrValues)
-	if err != nil {
-		return fmt.Errorf("failed to compute enrollment branch digests: %w", err)
-	}
-	if len(branchDigests) != NumBranches {
-		return fmt.Errorf("expected %d branch digests, got %d", NumBranches, len(branchDigests))
+	// Undefine existing seed index at this handle if present
+	if err := c.undefineSeedNVIndex(tpm, seedIndex); err != nil {
+		return err
 	}
 
-	// Undefine existing indexes if present
-	if c.nvIndexExists(tpm, seedIndex) {
-		buildtags.Debug("tpm: undefining existing seed NV index 0x%x\n", seedIndex)
-		// Read the NV name first — with CONFIG_TCG_TPM2_HMAC, the kernel
-		// TPM driver requires the Name for HMAC session computation.
-		oldPubRsp, oldPubErr := tpm2.NVReadPublic{
-			NVIndex: tpm2.TPMHandle(seedIndex),
-		}.Execute(tpm)
-		if oldPubErr != nil {
-			return fmt.Errorf("failed to read old seed NV public for 0x%x: %w", seedIndex, oldPubErr)
-		}
-
-		// Try owner undefine first (works if PolicyDelete is not set)
-		if _, err := (tpm2.NVUndefineSpace{
-			AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
-			NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(seedIndex), Name: oldPubRsp.NVName},
-		}.Execute(tpm)); err != nil {
-			// If owner undefine fails, try platform undefine special
-			// (needed if PolicyDelete is set on an existing index)
-			_, err2 := (tpm2.NVUndefineSpaceSpecial{
-				NVIndex:  tpm2.AuthHandle{Handle: tpm2.TPMHandle(seedIndex), Name: oldPubRsp.NVName, Auth: tpm2.PasswordAuth(nil)},
-				Platform: tpm2.AuthHandle{Handle: tpm2.TPMRHPlatform, Auth: tpm2.PasswordAuth(nil)},
-			}.Execute(tpm))
-			if err2 != nil {
-				return fmt.Errorf("failed to undefine existing seed NV index 0x%x: owner=%v platform=%v", seedIndex, err, err2)
-			}
-		}
-	}
-
-	tsIndex := uint32(DefaultRecoveryTimestampNVIndex)
-	if c.nvIndexExists(tpm, tsIndex) {
-		buildtags.Debug("tpm: undefining existing timestamp NV index 0x%x\n", tsIndex)
-		tsPubRsp, tsPubErr := tpm2.NVReadPublic{
-			NVIndex: tpm2.TPMHandle(tsIndex),
-		}.Execute(tpm)
-		if tsPubErr != nil {
-			return fmt.Errorf("failed to read old timestamp NV public for 0x%x: %w", tsIndex, tsPubErr)
-		}
-		if _, err := (tpm2.NVUndefineSpace{
-			AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
-			NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(tsIndex), Name: tsPubRsp.NVName},
-		}.Execute(tpm)); err != nil {
-			return fmt.Errorf("NVUndefineSpace for timestamp 0x%x: %w", tsIndex, err)
-		}
-	}
-
-	// Define the seed NV index with PolicyRead/PolicyWrite/PolicyDelete
+	// Define the seed NV index with PolicyRead/PolicyWrite
 	seedDef := tpm2.NVDefineSpace{
 		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
 		Auth:       tpm2.TPM2BAuth{},
@@ -156,64 +130,126 @@ func (c *Client) DefineRecoveryNVSpace(seedIndex uint32, pcrValues map[int][]byt
 		return fmt.Errorf("NVDefineSpace for seed 0x%x: %w", seedIndex, err)
 	}
 	buildtags.Debug("tpm: defined seed NV index 0x%x (size=%d, policy=%x)\n", seedIndex, SeedSize, authPolicy[:8])
-
-	// Define the timestamp NV index with OwnerRead/OwnerWrite (no policy).
-	// This index stores the reference timestamp (8 bytes) and the enrollment-time
-	// branch digests (96 bytes) used by PolicyOR at boot time.
-	tsDef := tpm2.NVDefineSpace{
-		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
-		Auth:       tpm2.TPM2BAuth{},
-		PublicInfo: tpm2.New2B(tpm2.TPMSNVPublic{
-			NVIndex: tpm2.TPMHandle(tsIndex),
-			NameAlg: tpm2.TPMAlgSHA256,
-			Attributes: tpm2.TPMANV{
-				OwnerWrite: true,
-				OwnerRead:  true,
-				NT:         tpm2.TPMNTOrdinary,
-				NoDA:       true,
-				WriteAll:   true,
-			},
-			DataSize: uint16(TimestampNVDataSize),
-		}),
-	}
-	if _, err := tsDef.Execute(tpm); err != nil {
-		return fmt.Errorf("NVDefineSpace for timestamp 0x%x: %w", tsIndex, err)
-	}
-	buildtags.Debug("tpm: defined timestamp NV index 0x%x (size=%d)\n", tsIndex, TimestampNVDataSize)
-
-	// Write the enrollment-time branch digests to the timestamp NV index
-	// (timestamp will be written separately by WriteRecoveryData).
-	tsPubRsp, err := tpm2.NVReadPublic{
-		NVIndex: tpm2.TPMHandle(tsIndex),
-	}.Execute(tpm)
-	if err != nil {
-		return fmt.Errorf("NVReadPublic for timestamp 0x%x: %w", tsIndex, err)
-	}
-	tsData := make([]byte, TimestampNVDataSize)
-	// Timestamp is zero-filled for now; WriteRecoveryData will overwrite it.
-	// Branch digests are packed after the timestamp.
-	for i, bd := range branchDigests {
-		copy(tsData[TimestampSize+i*BranchDigestSize:], bd)
-	}
-	_, err = tpm2.NVWrite{
-		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
-		NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(tsIndex), Name: tsPubRsp.NVName},
-		Data:       tpm2.TPM2BMaxNVBuffer{Buffer: tsData},
-		Offset:     0,
-	}.Execute(tpm)
-	if err != nil {
-		return fmt.Errorf("NVWrite for enrollment branch digests 0x%x: %w", tsIndex, err)
-	}
-	buildtags.Debug("tpm: wrote enrollment branch digests to timestamp NV index\n")
-
 	return nil
 }
 
-// WriteRecoveryData writes the TOTP seed and reference timestamp to the NV indexes.
-// The seed is written via a policy session (PolicyPCR + PolicyOR), requiring
-// the current PCR values to match the authPolicy. The timestamp is written
-// via owner auth (no policy needed).
-func (c *Client) WriteRecoveryData(seedIndex uint32, seed []byte, refTimestamp int64, pcrValues map[int][]byte) error {
+// DefineStateNVIndex defines ONLY the recovery state NV index (0x01C30003),
+// replacing any existing index at that handle, and initializes it to
+// counter=0, failCount=0.
+//
+// The index is protected by the SAME PolicyPCR(PCR 7) authPolicy as the seed
+// (PolicyRead/PolicyWrite). Binding the counter/fail state to PCR 7 means a
+// live-USB boot (different PCR state) cannot read OR reset the counter — an
+// attacker cannot roll the counter back or clear the failed-attempt cap off
+// the trusted boot chain.
+func (c *Client) DefineStateNVIndex(pcrValues map[int][]byte) error {
+	tpm, err := c.openTPM()
+	if err != nil {
+		return err
+	}
+	defer tpm.Close()
+
+	authPolicy, err := computeSeedReadPolicy(AlgSHA256, pcrValues)
+	if err != nil {
+		return fmt.Errorf("failed to compute state index policy: %w", err)
+	}
+
+	stIndex := uint32(DefaultRecoveryStateNVIndex)
+
+	// Undefine existing state index if present
+	if c.nvIndexExists(tpm, stIndex) {
+		buildtags.Debug("tpm: undefining existing recovery state NV index 0x%x\n", stIndex)
+		stPubRsp, stPubErr := tpm2.NVReadPublic{
+			NVIndex: tpm2.TPMHandle(stIndex),
+		}.Execute(tpm)
+		if stPubErr != nil {
+			return fmt.Errorf("failed to read old recovery state NV public for 0x%x: %w", stIndex, stPubErr)
+		}
+		if _, err := (tpm2.NVUndefineSpace{
+			AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
+			NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(stIndex), Name: stPubRsp.NVName},
+		}.Execute(tpm)); err != nil {
+			return fmt.Errorf("NVUndefineSpace for recovery state 0x%x: %w", stIndex, err)
+		}
+	}
+
+	// Define with PolicyRead/PolicyWrite bound to PCR 7. WriteAll is required
+	// because the full 12-byte state is rewritten as a unit.
+	stDef := tpm2.NVDefineSpace{
+		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
+		Auth:       tpm2.TPM2BAuth{},
+		PublicInfo: tpm2.New2B(tpm2.TPMSNVPublic{
+			NVIndex:    tpm2.TPMHandle(stIndex),
+			NameAlg:    tpm2.TPMAlgSHA256,
+			Attributes: tpm2.TPMANV{PolicyWrite: true, PolicyRead: true, NT: tpm2.TPMNTOrdinary, NoDA: true, WriteAll: true},
+			AuthPolicy: tpm2.TPM2BDigest{Buffer: authPolicy},
+			DataSize:   uint16(StateNVDataSize),
+		}),
+	}
+	if _, err := stDef.Execute(tpm); err != nil {
+		return fmt.Errorf("NVDefineSpace for recovery state 0x%x: %w", stIndex, err)
+	}
+	buildtags.Debug("tpm: defined recovery state NV index 0x%x (size=%d, policy=%x)\n", stIndex, StateNVDataSize, authPolicy[:8])
+
+	// Initialize counter=0, failCount=0 via the shared writer. Release the
+	// connection first — WriteRecoveryState opens its own.
+	_ = tpm.Close()
+	if err := c.WriteRecoveryState(0, 0); err != nil {
+		return fmt.Errorf("failed to initialize recovery state: %w", err)
+	}
+	return nil
+}
+
+// undefineSeedNVIndex undefines only the seed index at seedIndex via owner
+// auth (with platform-undefine fallback for PolicyDelete indexes). Never
+// touches the timestamp index.
+func (c *Client) undefineSeedNVIndex(tpm transport.TPM, seedIndex uint32) error {
+	if !c.nvIndexExists(tpm, seedIndex) {
+		return nil
+	}
+	buildtags.Debug("tpm: undefining existing seed NV index 0x%x\n", seedIndex)
+	// Read the NV name first — with CONFIG_TCG_TPM2_HMAC, the kernel
+	// TPM driver requires the Name for HMAC session computation.
+	oldPubRsp, oldPubErr := tpm2.NVReadPublic{
+		NVIndex: tpm2.TPMHandle(seedIndex),
+	}.Execute(tpm)
+	if oldPubErr != nil {
+		return fmt.Errorf("failed to read old seed NV public for 0x%x: %w", seedIndex, oldPubErr)
+	}
+
+	// Try owner undefine first (works if PolicyDelete is not set)
+	if _, err := (tpm2.NVUndefineSpace{
+		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
+		NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(seedIndex), Name: oldPubRsp.NVName},
+	}.Execute(tpm)); err != nil {
+		// If owner undefine fails, try platform undefine special
+		// (needed if PolicyDelete is set on an existing index)
+		_, err2 := (tpm2.NVUndefineSpaceSpecial{
+			NVIndex:  tpm2.AuthHandle{Handle: tpm2.TPMHandle(seedIndex), Name: oldPubRsp.NVName, Auth: tpm2.PasswordAuth(nil)},
+			Platform: tpm2.AuthHandle{Handle: tpm2.TPMRHPlatform, Auth: tpm2.PasswordAuth(nil)},
+		}.Execute(tpm))
+		if err2 != nil {
+			return fmt.Errorf("failed to undefine existing seed NV index 0x%x: owner=%v platform=%v", seedIndex, err, err2)
+		}
+	}
+	return nil
+}
+
+// WriteRecoveryData writes the seed and initializes the recovery state
+// (counter=0, failCount=0). This is the FULL provisioning write used by
+// recovery --enable. Atomic-reseed staging must use WriteSeedOnly so the
+// counter state is not touched while a replacement seed is being staged.
+func (c *Client) WriteRecoveryData(seedIndex uint32, seed []byte, pcrValues map[int][]byte) error {
+	if err := c.WriteSeedOnly(seedIndex, seed, pcrValues); err != nil {
+		return err
+	}
+	return c.WriteRecoveryState(0, 0)
+}
+
+// WriteSeedOnly writes ONLY the HOTP seed to the seed NV index via a policy
+// session (current PCR 7 must match the index authPolicy). It never touches
+// the recovery state index — safe for atomic-reseed temp staging.
+func (c *Client) WriteSeedOnly(seedIndex uint32, seed []byte, pcrValues map[int][]byte) error {
 	if len(seed) != SeedSize {
 		return fmt.Errorf("seed must be %d bytes, got %d", SeedSize, len(seed))
 	}
@@ -224,126 +260,133 @@ func (c *Client) WriteRecoveryData(seedIndex uint32, seed []byte, refTimestamp i
 	}
 	defer tpm.Close()
 
-	// Write the seed via policy session
 	if err := c.writeSeedWithPolicy(tpm, seedIndex, seed, pcrValues); err != nil {
 		return fmt.Errorf("failed to write seed: %w", err)
 	}
-
-	// Write the timestamp via owner auth.
-	// The timestamp NV index also stores the enrollment-time branch digests
-	// (written by DefineRecoveryNVSpace). We only overwrite the timestamp
-	// portion here, preserving the branch digests.
-	tsIndex := uint32(DefaultRecoveryTimestampNVIndex)
-	tsData := make([]byte, TimestampNVDataSize)
-	binary.BigEndian.PutUint64(tsData, uint64(refTimestamp))
-
-	// Copy enrollment branch digests into the data buffer so the write
-	// preserves them (NVWrite replaces the entire index data).
-	branchDigests, err := computeAllBranchDigests(pcrValues)
-	if err != nil {
-		return fmt.Errorf("failed to compute branch digests for timestamp write: %w", err)
-	}
-	for i, bd := range branchDigests {
-		copy(tsData[TimestampSize+i*BranchDigestSize:], bd)
-	}
-
-	tsPubRsp, err := tpm2.NVReadPublic{
-		NVIndex: tpm2.TPMHandle(tsIndex),
-	}.Execute(tpm)
-	if err != nil {
-		return fmt.Errorf("NVReadPublic for timestamp 0x%x: %w", tsIndex, err)
-	}
-
-	_, err = tpm2.NVWrite{
-		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
-		NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(tsIndex), Name: tsPubRsp.NVName},
-		Data:       tpm2.TPM2BMaxNVBuffer{Buffer: tsData},
-		Offset:     0,
-	}.Execute(tpm)
-	if err != nil {
-		return fmt.Errorf("NVWrite for timestamp 0x%x: %w", tsIndex, err)
-	}
-
-	buildtags.Debug("tpm: wrote recovery data (seed=%d bytes, timestamp=%d, branch_digests=%d)\n", len(seed), refTimestamp, len(branchDigests))
+	buildtags.Debug("tpm: wrote seed only (seed=%d bytes, index=0x%x)\n", len(seed), seedIndex)
 	return nil
 }
 
-// ReadRecoveryData reads the TOTP seed, reference timestamp, and enrollment-time
-// branch digests from the NV indexes. The seed is read via a policy session
-// (tries each PolicyOR branch in turn). The timestamp and branch digests are
-// read via owner auth.
-//
-// Returns the 32-byte seed, the reference Unix timestamp, and the enrollment-time
-// branch digests (used by PolicyOR at boot time).
-func (c *Client) ReadRecoveryData(seedIndex uint32) (seed []byte, refTimestamp int64, branchDigests [][]byte, err error) {
+// WriteRecoveryState persists the HOTP counter and failed-attempt count to
+// the recovery state NV index using a PolicyPCR(PCR 7) session. The seed
+// index is never touched. Fails if the current PCR 7 does not match the
+// state index authPolicy (untrusted boot).
+func (c *Client) WriteRecoveryState(counter uint64, failCount uint32) error {
 	tpm, err := c.openTPM()
 	if err != nil {
-		return nil, 0, nil, err
+		return err
 	}
 	defer tpm.Close()
 
-	// Read the timestamp and branch digests FIRST (via owner auth, no policy needed).
-	// The branch digests are needed by readSeedWithPolicy for PolicyOR.
-	tsIndex := uint32(DefaultRecoveryTimestampNVIndex)
-	tsPubRsp, err := tpm2.NVReadPublic{
-		NVIndex: tpm2.TPMHandle(tsIndex),
-	}.Execute(tpm)
+	// Read current PCR 7 and build the policy session.
+	pcrValues, err := c.readSeedPolicyPCRs(tpm)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("NVReadPublic for timestamp 0x%x: %w", tsIndex, err)
+		return fmt.Errorf("failed to read PCRs for state policy: %w", err)
+	}
+	sess, cleanup, err := tpm2.PolicySession(tpm, tpm2.TPMAlgSHA256, 16)
+	if err != nil {
+		return fmt.Errorf("failed to create state policy session: %w", err)
+	}
+	defer cleanup()
+	if err := executePolicyBranch(tpm, sess, SeedReadPolicyPCRs[0], pcrValues); err != nil {
+		return fmt.Errorf("failed to satisfy state write policy (PolicyPCR): %w", err)
 	}
 
-	tsRsp, err := tpm2.NVRead{
-		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
-		NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(tsIndex), Name: tsPubRsp.NVName},
-		Size:       TimestampNVDataSize,
+	stIndex := uint32(DefaultRecoveryStateNVIndex)
+	data := make([]byte, StateNVDataSize)
+	binary.BigEndian.PutUint64(data[0:CounterSize], counter)
+	binary.BigEndian.PutUint32(data[CounterSize:StateNVDataSize], failCount)
+
+	stPubRsp, err := tpm2.NVReadPublic{
+		NVIndex: tpm2.TPMHandle(stIndex),
+	}.Execute(tpm)
+	if err != nil {
+		return fmt.Errorf("NVReadPublic for recovery state 0x%x: %w", stIndex, err)
+	}
+
+	_, err = tpm2.NVWrite{
+		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMHandle(stIndex), Name: stPubRsp.NVName, Auth: sess},
+		NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(stIndex), Name: stPubRsp.NVName},
+		Data:       tpm2.TPM2BMaxNVBuffer{Buffer: data},
 		Offset:     0,
 	}.Execute(tpm)
 	if err != nil {
-		return nil, 0, nil, fmt.Errorf("NVRead for timestamp 0x%x: %w", tsIndex, err)
+		return fmt.Errorf("NVWrite for recovery state 0x%x: %w", stIndex, err)
 	}
 
-	tsData := tsRsp.Data.Buffer
-	if len(tsData) >= TimestampSize {
-		refTimestamp = int64(binary.BigEndian.Uint64(tsData[0:TimestampSize]))
-	}
-
-	// Extract enrollment-time branch digests
-	branchDigests = make([][]byte, 0, NumBranches)
-	for i := 0; i < NumBranches; i++ {
-		start := TimestampSize + i*BranchDigestSize
-		end := start + BranchDigestSize
-		if len(tsData) >= end {
-			bd := make([]byte, BranchDigestSize)
-			copy(bd, tsData[start:end])
-			branchDigests = append(branchDigests, bd)
-		}
-	}
-
-	if len(branchDigests) != NumBranches {
-		return nil, 0, nil, fmt.Errorf("expected %d branch digests in timestamp NV, got %d (index may need re-enrollment)", NumBranches, len(branchDigests))
-	}
-
-	buildtags.Debug("tpm: read enrollment branch digests from timestamp NV index (%d branches)\n", len(branchDigests))
-
-	// Read the seed via policy session, using the stored enrollment branch digests
-	seed, err = c.readSeedWithPolicy(tpm, seedIndex, branchDigests)
-	if err != nil {
-		return nil, 0, nil, fmt.Errorf("failed to read seed: %w", err)
-	}
-
-	buildtags.Debug("tpm: read recovery data (seed=%d bytes, timestamp=%d)\n", len(seed), refTimestamp)
-	return seed, refTimestamp, branchDigests, nil
+	buildtags.Debug("tpm: wrote recovery state (counter=%d, failCount=%d)\n", counter, failCount)
+	return nil
 }
 
-// ReadSeedOnly reads the TOTP seed from the seed NV index WITHOUT requiring
-// the timestamp NV index. This is used when the timestamp index is missing
-// (e.g., after a failed auto-reseed) but the seed may still be readable.
-//
-// The seed is read via a policy session requiring the current PCR 7 value
-// to match the enrollment-time authPolicy. If PCR 7 has changed, this will
-// fail just like ReadRecoveryData.
-//
-// Returns only the seed (no timestamp or branch digests).
+// ReadRecoveryState reads the HOTP counter and failed-attempt count from the
+// recovery state NV index using a PolicyPCR(PCR 7) session. The seed is NOT
+// read here — use ReadSeedOnly/ReadRecoveryData for the seed. Fails if the
+// current PCR 7 does not match the state index authPolicy (untrusted boot).
+func (c *Client) ReadRecoveryState() (counter uint64, failCount uint32, err error) {
+	tpm, err := c.openTPM()
+	if err != nil {
+		return 0, 0, err
+	}
+	defer tpm.Close()
+
+	pcrValues, err := c.readSeedPolicyPCRs(tpm)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to read PCRs for state policy: %w", err)
+	}
+	sess, cleanup, err := tpm2.PolicySession(tpm, tpm2.TPMAlgSHA256, 16)
+	if err != nil {
+		return 0, 0, fmt.Errorf("failed to create state policy session: %w", err)
+	}
+	defer cleanup()
+	if err := executePolicyBranch(tpm, sess, SeedReadPolicyPCRs[0], pcrValues); err != nil {
+		return 0, 0, fmt.Errorf("failed to satisfy state read policy (PolicyPCR): %w", err)
+	}
+
+	stIndex := uint32(DefaultRecoveryStateNVIndex)
+	stPubRsp, err := tpm2.NVReadPublic{
+		NVIndex: tpm2.TPMHandle(stIndex),
+	}.Execute(tpm)
+	if err != nil {
+		return 0, 0, fmt.Errorf("NVReadPublic for recovery state 0x%x: %w", stIndex, err)
+	}
+
+	rsp, err := tpm2.NVRead{
+		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMHandle(stIndex), Name: stPubRsp.NVName, Auth: sess},
+		NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(stIndex), Name: stPubRsp.NVName},
+		Size:       StateNVDataSize,
+		Offset:     0,
+	}.Execute(tpm)
+	if err != nil {
+		return 0, 0, fmt.Errorf("NVRead for recovery state 0x%x: %w", stIndex, err)
+	}
+	data := rsp.Data.Buffer
+	if len(data) < StateNVDataSize {
+		return 0, 0, fmt.Errorf("recovery state NV data too short: %d bytes", len(data))
+	}
+	counter = binary.BigEndian.Uint64(data[0:CounterSize])
+	failCount = binary.BigEndian.Uint32(data[CounterSize:StateNVDataSize])
+	return counter, failCount, nil
+}
+
+// ReadRecoveryData reads the HOTP seed AND the recovery state (counter +
+// fail count). The seed is read via a policy session (PCR 7-bound); the
+// state is read via owner auth.
+func (c *Client) ReadRecoveryData(seedIndex uint32) (seed []byte, counter uint64, failCount uint32, err error) {
+	counter, failCount, err = c.ReadRecoveryState()
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	seed, err = c.ReadSeedOnly(seedIndex)
+	if err != nil {
+		return nil, 0, 0, err
+	}
+	return seed, counter, failCount, nil
+}
+
+// ReadSeedOnly reads the HOTP seed from the seed NV index. The seed is read
+// via a policy session requiring the current PCR 7 value to match the
+// enrollment-time authPolicy. If PCR 7 has changed, this fails with
+// ErrSeedPCRMismatch (see readSeedWithPolicy classification).
 func (c *Client) ReadSeedOnly(seedIndex uint32) ([]byte, error) {
 	tpm, err := c.openTPM()
 	if err != nil {
@@ -351,96 +394,22 @@ func (c *Client) ReadSeedOnly(seedIndex uint32) ([]byte, error) {
 	}
 	defer tpm.Close()
 
-	// readSeedWithPolicy ignores enrollmentBranchDigests with single-branch
-	// policy (line 490: _ = enrollmentBranchDigests). It reads current PCR 7
-	// values directly and uses PolicyPCR. So we can pass nil.
 	seed, err := c.readSeedWithPolicy(tpm, seedIndex, nil)
 	if err != nil {
 		return nil, fmt.Errorf("failed to read seed: %w", err)
 	}
-
-	buildtags.Debug("tpm: read seed only (%d bytes, timestamp skipped)\n", len(seed))
+	buildtags.Debug("tpm: read seed only (%d bytes)\n", len(seed))
 	return seed, nil
 }
 
-// RecreateTimestampOnly recreates the timestamp NV index (0x01C30002) if it
-// is missing, without touching the seed index. This is used by auto-reseed
-// when the seed is still readable (PCR 7 matches) but the timestamp index
-// was lost (e.g., from a previous failed reseed).
-//
-// The timestamp is set to the current time, and the branch digests are
-// recomputed from the current PCR 7 values.
-func (c *Client) RecreateTimestampOnly(pcrValues map[int][]byte) error {
-	tpm, err := c.openTPM()
-	if err != nil {
-		return err
-	}
-	defer tpm.Close()
-
-	tsIndex := uint32(DefaultRecoveryTimestampNVIndex)
-
-	// Check if timestamp index already exists
-	if c.nvIndexExists(tpm, tsIndex) {
-		buildtags.Debug("tpm: timestamp NV index 0x%x already exists, skipping recreation\n", tsIndex)
-		return nil
-	}
-
-	// Define the timestamp NV index with OwnerRead/OwnerWrite
-	tsDef := tpm2.NVDefineSpace{
-		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
-		Auth:       tpm2.TPM2BAuth{},
-		PublicInfo: tpm2.New2B(tpm2.TPMSNVPublic{
-			NVIndex:    tpm2.TPMHandle(tsIndex),
-			NameAlg:    tpm2.TPMAlgSHA256,
-			Attributes: tpm2.TPMANV{OwnerWrite: true, OwnerRead: true, NT: tpm2.TPMNTOrdinary, NoDA: true},
-			DataSize:   uint16(TimestampNVDataSize),
-		}),
-	}
-	if _, err := tsDef.Execute(tpm); err != nil {
-		return fmt.Errorf("failed to define timestamp NV index 0x%x: %w", tsIndex, err)
-	}
-
-	// Write the timestamp data: current timestamp + branch digests
-	tsData := make([]byte, TimestampNVDataSize)
-	binary.BigEndian.PutUint64(tsData, uint64(time.Now().Unix()))
-
-	branchDigests, err := computeAllBranchDigests(pcrValues)
-	if err != nil {
-		return fmt.Errorf("failed to compute branch digests: %w", err)
-	}
-	for i, bd := range branchDigests {
-		copy(tsData[TimestampSize+i*BranchDigestSize:], bd)
-	}
-
-	tsPubRsp, err := tpm2.NVReadPublic{
-		NVIndex: tpm2.TPMHandle(tsIndex),
-	}.Execute(tpm)
-	if err != nil {
-		return fmt.Errorf("NVReadPublic for new timestamp 0x%x: %w", tsIndex, err)
-	}
-
-	_, err = tpm2.NVWrite{
-		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
-		NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(tsIndex), Name: tsPubRsp.NVName},
-		Data:       tpm2.TPM2BMaxNVBuffer{Buffer: tsData},
-		Offset:     0,
-	}.Execute(tpm)
-	if err != nil {
-		return fmt.Errorf("NVWrite for timestamp 0x%x: %w", tsIndex, err)
-	}
-
-	buildtags.Debug("tpm: recreated timestamp NV index 0x%x\n", tsIndex)
-	return nil
-}
-
-// TimestampNVExists checks if the timestamp NV index is defined.
-func (c *Client) TimestampNVExists() bool {
+// StateNVExists checks if the recovery state NV index is defined.
+func (c *Client) StateNVExists() bool {
 	tpm, err := c.openTPM()
 	if err != nil {
 		return false
 	}
 	defer tpm.Close()
-	return c.nvIndexExists(tpm, uint32(DefaultRecoveryTimestampNVIndex))
+	return c.nvIndexExists(tpm, uint32(DefaultRecoveryStateNVIndex))
 }
 
 // RecoveryNVExists checks if the seed NV index is defined.
@@ -453,10 +422,13 @@ func (c *Client) RecoveryNVExists(seedIndex uint32) bool {
 	return c.nvIndexExists(tpm, seedIndex)
 }
 
-// UndefineRecoveryNVSpace removes both recovery NV indexes.
-// The seed index uses PolicyRead/PolicyWrite (no PolicyDelete), so it can
-// be undefined via NVUndefineSpace with owner auth. The timestamp index
-// also uses NVUndefineSpace with owner auth.
+// UndefineRecoveryNVSpace removes BOTH recovery NV indexes (seed + state).
+// This is the full teardown used by recovery --disable/--clean and by
+// DefineRecoveryNVSpace before full re-provisioning.
+//
+// Atomic-reseed temp cleanup must use UndefineSeedNVSpace instead —
+// deleting a temp seed through this function would also destroy the
+// shared state index.
 //
 // Note: Without PolicyDelete, an attacker with owner auth can undefine the
 // seed index (DoS). However, they cannot read or write the seed without
@@ -469,94 +441,45 @@ func (c *Client) UndefineRecoveryNVSpace(seedIndex uint32, pcrValues map[int][]b
 	}
 	defer tpm.Close()
 
-	// Undefine the seed index via NVUndefineSpace (owner auth)
-	// Read the NV name first — with CONFIG_TCG_TPM2_HMAC, the kernel
-	// TPM driver requires the Name for HMAC session computation.
-	if c.nvIndexExists(tpm, seedIndex) {
-		pubRsp, err := tpm2.NVReadPublic{
-			NVIndex: tpm2.TPMHandle(seedIndex),
-		}.Execute(tpm)
-		if err != nil {
-			return fmt.Errorf("NVReadPublic for seed 0x%x: %w", seedIndex, err)
-		}
-
-		_, err = tpm2.NVUndefineSpace{
-			AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
-			NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(seedIndex), Name: pubRsp.NVName},
-		}.Execute(tpm)
-		if err != nil {
-			return fmt.Errorf("NVUndefineSpace for seed 0x%x: %w", seedIndex, err)
-		}
-		buildtags.Debug("tpm: undefined seed NV index 0x%x\n", seedIndex)
+	if err := c.undefineSeedNVIndex(tpm, seedIndex); err != nil {
+		return err
 	}
-
-	// Undefine the timestamp index via NVUndefineSpace (owner auth only)
-	tsIndex := uint32(DefaultRecoveryTimestampNVIndex)
-	if c.nvIndexExists(tpm, tsIndex) {
-		tsPubRsp, tsPubErr := tpm2.NVReadPublic{
-			NVIndex: tpm2.TPMHandle(tsIndex),
-		}.Execute(tpm)
-		if tsPubErr != nil {
-			return fmt.Errorf("NVReadPublic for timestamp 0x%x: %w", tsIndex, tsPubErr)
-		}
-		_, err := tpm2.NVUndefineSpace{
-			AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
-			NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(tsIndex), Name: tsPubRsp.NVName},
-		}.Execute(tpm)
-		if err != nil {
-			return fmt.Errorf("NVUndefineSpace for timestamp 0x%x: %w", tsIndex, err)
-		}
-		buildtags.Debug("tpm: undefined timestamp NV index 0x%x\n", tsIndex)
-	}
-
-	return nil
+	return c.undefineStateNVIndex(tpm)
 }
 
-// UpdateRecoveryTimestamp updates only the reference timestamp in the NV index,
-// keeping the existing branch digests. Called after a successful boot to keep the
-// timestamp fresh for RTC drift detection on the next boot.
-func (c *Client) UpdateRecoveryTimestamp(refTimestamp int64) error {
+// UndefineSeedNVSpace removes ONLY the seed NV index at seedIndex. The
+// recovery state index is untouched. Safe for atomic-reseed temp cleanup.
+func (c *Client) UndefineSeedNVSpace(seedIndex uint32) error {
 	tpm, err := c.openTPM()
 	if err != nil {
 		return err
 	}
 	defer tpm.Close()
+	return c.undefineSeedNVIndex(tpm, seedIndex)
+}
 
-	tsIndex := uint32(DefaultRecoveryTimestampNVIndex)
-
-	// Read the existing data to preserve the branch digests
-	tsPubRsp, err := tpm2.NVReadPublic{
-		NVIndex: tpm2.TPMHandle(tsIndex),
+// undefineStateNVIndex removes the recovery state index via owner auth.
+// Caller must supply an open TPM connection.
+func (c *Client) undefineStateNVIndex(tpm transport.TPM) error {
+	stIndex := uint32(DefaultRecoveryStateNVIndex)
+	if !c.nvIndexExists(tpm, stIndex) {
+		return nil
+	}
+	stPubRsp, stPubErr := tpm2.NVReadPublic{
+		NVIndex: tpm2.TPMHandle(stIndex),
+	}.Execute(tpm)
+	if stPubErr != nil {
+		return fmt.Errorf("NVReadPublic for recovery state 0x%x: %w", stIndex, stPubErr)
+	}
+	_, err := tpm2.NVUndefineSpace{
+		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
+		NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(stIndex), Name: stPubRsp.NVName},
 	}.Execute(tpm)
 	if err != nil {
-		return fmt.Errorf("NVReadPublic for timestamp: %w", err)
+		return fmt.Errorf("NVUndefineSpace for recovery state 0x%x: %w", stIndex, err)
 	}
-
-	existingRsp, err := tpm2.NVRead{
-		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
-		NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(tsIndex), Name: tsPubRsp.NVName},
-		Size:       TimestampNVDataSize,
-		Offset:     0,
-	}.Execute(tpm)
-	if err != nil {
-		return fmt.Errorf("NVRead for existing timestamp data: %w", err)
-	}
-
-	// Build the new data: new timestamp + preserved branch digests
-	tsData := make([]byte, TimestampNVDataSize)
-	binary.BigEndian.PutUint64(tsData, uint64(refTimestamp))
-	// Copy the branch digests from the existing data
-	if len(existingRsp.Data.Buffer) >= TimestampNVDataSize {
-		copy(tsData[TimestampSize:], existingRsp.Data.Buffer[TimestampSize:])
-	}
-
-	_, err = tpm2.NVWrite{
-		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
-		NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(tsIndex), Name: tsPubRsp.NVName},
-		Data:       tpm2.TPM2BMaxNVBuffer{Buffer: tsData},
-		Offset:     0,
-	}.Execute(tpm)
-	return err
+	buildtags.Debug("tpm: undefined recovery state NV index 0x%x\n", stIndex)
+	return nil
 }
 
 // --- Internal helpers for policy session-based NV access ---
@@ -602,6 +525,11 @@ func (c *Client) writeSeedWithPolicy(tpm transport.TPM, seedIndex uint32, seed [
 // digest, no PolicyOR wrapping).
 func (c *Client) readSeedWithPolicy(tpm transport.TPM, seedIndex uint32, enrollmentBranchDigests [][]byte) ([]byte, error) {
 	_ = enrollmentBranchDigests // not used with single-branch policy
+	// Distinguish genuine PCR-policy mismatches from transport/session
+	// failures: a transient error must never be mistaken for "PCR 7
+	// changed" (auto-reseed acts destructively on that diagnosis).
+	var pcrMismatch bool
+	var lastErr error
 
 	// Read current PCR values needed for the policy
 	pcrValues, err := c.readSeedPolicyPCRs(tpm)
@@ -626,6 +554,11 @@ func (c *Client) readSeedWithPolicy(tpm transport.TPM, seedIndex uint32, enrollm
 
 		sess, cleanup, err := tpm2.PolicySession(tpm, tpm2.TPMAlgSHA256, 16)
 		if err != nil {
+			// Transport/session failures are NOT PCR mismatches — they must
+			// not trigger a destructive reseed. Record the error; if the
+			// transport is broken, every branch records the same class of
+			// error and the caller sees ErrSeedReadTransient.
+			lastErr = fmt.Errorf("failed to create policy session: %w", err)
 			buildtags.Debug("tpm: seed read branch %d: failed to create session: %v\n", branchIdx, err)
 			continue
 		}
@@ -633,6 +566,14 @@ func (c *Client) readSeedWithPolicy(tpm transport.TPM, seedIndex uint32, enrollm
 		err = executePolicyBranch(tpm, sess, pcrSet, pcrValues)
 		if err != nil {
 			cleanup()
+			if isPolicyMismatch(err) {
+				// TPM_RC_PCR (or PCR-changed) from PolicyPCR: the session's
+				// PCR digest does not match the index authPolicy — this is the
+				// genuine "PCR 7 changed" signal.
+				pcrMismatch = true
+			} else {
+				lastErr = fmt.Errorf("PolicyPCR failed: %w", err)
+			}
 			buildtags.Debug("tpm: seed read branch %d (PCRs %v): PolicyPCR failed: %v\n", branchIdx, pcrSet, err)
 			continue
 		}
@@ -646,6 +587,7 @@ func (c *Client) readSeedWithPolicy(tpm transport.TPM, seedIndex uint32, enrollm
 		}.Execute(tpm)
 		if err != nil {
 			cleanup()
+			lastErr = fmt.Errorf("NVReadPublic failed: %w", err)
 			buildtags.Debug("tpm: seed read branch %d: NVReadPublic failed: %v\n", branchIdx, err)
 			continue
 		}
@@ -658,6 +600,13 @@ func (c *Client) readSeedWithPolicy(tpm transport.TPM, seedIndex uint32, enrollm
 		}.Execute(tpm)
 		cleanup()
 		if err != nil {
+			// NVRead auth failure with a satisfied policy session is also a
+			// policy-class mismatch (authPolicy not satisfied by this session).
+			if isPolicyMismatch(err) || isAuthFailure(err) {
+				pcrMismatch = true
+			} else {
+				lastErr = fmt.Errorf("NVRead failed: %w", err)
+			}
 			buildtags.Debug("tpm: seed read branch %d: NVRead failed: %v\n", branchIdx, err)
 			continue
 		}
@@ -673,7 +622,49 @@ func (c *Client) readSeedWithPolicy(tpm transport.TPM, seedIndex uint32, enrollm
 		return seed, nil
 	}
 
-	return nil, fmt.Errorf("no policy branch matched — current PCR state does not allow seed access (possible tampering or untrusted boot)")
+	if pcrMismatch {
+		return nil, fmt.Errorf("%w: current PCR state does not allow seed access (Secure Boot state changed or untrusted boot)", ErrSeedPCRMismatch)
+	}
+	if lastErr != nil {
+		return nil, fmt.Errorf("%w: %v", ErrSeedReadTransient, lastErr)
+	}
+	return nil, fmt.Errorf("%w: no policy branch attempted", ErrSeedReadTransient)
+}
+
+// canonicalTPMRC strips the format-1 handle/parameter/session index bits
+// from a raw TPM response code, mirroring go-tpm's internal isFmt1Error
+// canonicalization. The TPM returns e.g. TPM_RC_POLICY_FAIL with the
+// session index set (0x99D for session 1); the exported canonical constant
+// is 0x9D — direct comparison would silently misclassify.
+func canonicalTPMRC(rc tpm2.TPMRC) tpm2.TPMRC {
+	// Mask out the index field (bits 8-11) and the rcP/rcS subject bits,
+	// matching isFmt1Error: r ^= rcP / r ^= rcS, then r &= 0xFFFFF0FF.
+	return rc &^ tpm2.TPMRC(0xF00) &^ tpm2.TPMRC(0x40) &^ tpm2.TPMRC(0x800)
+}
+
+// isPolicyMismatch reports whether err is a TPM policy-failure response code
+// (TPM_RC_PCR from PolicyPCR, or TPM_RC_POLICY / TPM_RC_POLICY_FAIL from
+// policy-authorized access). go-tpm returns TPMRC values directly as errors;
+// the code may carry session/handle index bits, so compare canonically.
+func isPolicyMismatch(err error) bool {
+	var rc tpm2.TPMRC
+	if errors.As(err, &rc) {
+		rc = canonicalTPMRC(rc)
+		return rc == tpm2.TPMRCPCR || rc == tpm2.TPMRCPolicy || rc == tpm2.TPMRCPolicyFail || rc == tpm2.TPMRCPCRChanged
+	}
+	return false
+}
+
+// isAuthFailure reports whether err is a TPM authorization failure response
+// code (TPM_RC_AUTH_FAIL / TPM_RC_AUTH_TYPE / TPM_RC_AUTH_MISSING), with
+// the same canonicalization as isPolicyMismatch.
+func isAuthFailure(err error) bool {
+	var rc tpm2.TPMRC
+	if errors.As(err, &rc) {
+		rc = canonicalTPMRC(rc)
+		return rc == tpm2.TPMRCAuthFail || rc == tpm2.TPMRCAuthType || rc == tpm2.TPMRCAuthMissing
+	}
+	return false
 }
 
 // readSeedPolicyPCRs reads the PCR values needed for the seed read policy
@@ -713,25 +704,6 @@ func executePolicyBranch(tpm transport.TPM, sess tpm2.Session, pcrSet []int, pcr
 	return err
 }
 
-// computeAllBranchDigests computes the offline digest for each policy branch.
-// With the single-branch design, this returns one digest (PolicyPCR for PCR 7).
-func computeAllBranchDigests(pcrValues map[int][]byte) ([][]byte, error) {
-	var digests [][]byte
-	for _, pcrSet := range SeedReadPolicyPCRs {
-		pcrDigest, err := computePCRDigest(AlgSHA256, pcrValues, pcrSet)
-		if err != nil {
-			return nil, err
-		}
-		sel := buildPCRLSelection(AlgSHA256, pcrSet)
-		branchDigest, err := computePolicyPCRHash(AlgSHA256, nil, pcrDigest, sel)
-		if err != nil {
-			return nil, err
-		}
-		digests = append(digests, branchDigest)
-	}
-	return digests, nil
-}
-
 // nvIndexExists checks if an NV index is defined on the TPM.
 func (c *Client) nvIndexExists(tpm transport.TPM, index uint32) bool {
 	_, err := tpm2.NVReadPublic{
@@ -747,9 +719,4 @@ func convertToTPM2BDigests(digests [][]byte) []tpm2.TPM2BDigest {
 		result[i] = tpm2.TPM2BDigest{Buffer: d}
 	}
 	return result
-}
-
-// CurrentTimestamp returns the current Unix timestamp.
-func CurrentTimestamp() int64 {
-	return time.Now().Unix()
 }

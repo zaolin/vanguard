@@ -34,12 +34,27 @@ var LogFunc func(event string, kvPairs ...string) = func(event string, kvPairs .
 
 // StrictMode disables passphrase fallback when TPM2 token is present.
 // Always true — strict mode is the default and only mode.
-// Passphrase fallback requires TOTP recovery (see init/recovery/recovery.go).
+// Passphrase fallback requires HOTP recovery (see init/recovery/recovery.go).
 // There is no kernel cmdline override and no build-tag option.
 var StrictMode bool = true
 
 // Maximum PIN retry attempts.
 const maxPINAttempts = 3
+
+// recoveryStateCleared ensures the HOTP fail-count reset runs at most once
+// per boot, on the first successful unlock.
+var recoveryStateCleared bool
+
+// clearRecoveryFailCount resets the persisted HOTP failure counter after a
+// successful disk unlock. Failures are logged and never block boot.
+func clearRecoveryFailCount() {
+	client := intpm.New()
+	if !client.WaitForDevice(3 * time.Second) {
+		Debug("luks: recovery fail-count reset skipped (TPM unavailable)\n")
+		return
+	}
+	recovery.ResetFailCount(client)
+}
 
 // ErrNoDevices indicates no LUKS devices were found.
 var ErrNoDevices = errors.New("no LUKS devices found")
@@ -78,6 +93,15 @@ func UnlockDevices() (bool, error) {
 		// Close device after successful unlock to free resources
 		// The dm-crypt mapping remains active after Close()
 		dev.Close()
+
+		// A successful unlock proves the legitimate holder is present:
+		// clear the persisted HOTP failure counter so earlier typos do not
+		// count against future recovery attempts. Non-fatal; skipped in
+		// test mode (no TPM).
+		if !isTestMode() && !recoveryStateCleared {
+			recoveryStateCleared = true
+			clearRecoveryFailCount()
+		}
 	}
 
 	return true, nil
@@ -211,19 +235,19 @@ func (d *Device) Unlock() error {
 
 		console.DebugPrint("luks: TPM2 unlock failed: %v\n", err)
 
-		// Strict mode: try TOTP recovery before halting
+		// Strict mode: try HOTP recovery before halting
 		if StrictMode {
-			// Quit TUI so console prompts are visible for TOTP recovery
+			// Quit TUI so console prompts are visible for HOTP recovery
 			if tui.IsEnabled() {
 				tui.Quit()
 				tui.ForceReset()
 			}
-			// Attempt TOTP recovery — if successful, enable passphrase fallback
+			// Attempt HOTP recovery — if successful, enable passphrase fallback
 			// for this boot only
 			tpmClient := intpm.New()
-			if recovery.TryTOTP(tpmClient, d.Path) {
-				console.Print("luks: TOTP recovery accepted, passphrase fallback enabled\n")
-				LogFunc("RECOVERY_SUCCESS", "device", d.Path, "method", "totp")
+			if recovery.TryHOTP(tpmClient, d.Path) {
+				console.Print("luks: HOTP recovery accepted, passphrase fallback enabled\n")
+				LogFunc("RECOVERY_SUCCESS", "device", d.Path, "method", "hotp")
 				// Fall through to passphrase fallback below
 			} else {
 				console.Print("luks: strict mode - no passphrase fallback\n")
@@ -233,7 +257,7 @@ func (d *Device) Unlock() error {
 			}
 		}
 
-		// Normal mode or TOTP recovery succeeded: fall back to passphrase
+		// Normal mode or HOTP recovery succeeded: fall back to passphrase
 		console.Print("luks: falling back to passphrase: %v\n", err)
 
 		// Show failure reason in TUI
@@ -323,6 +347,38 @@ func (d *Device) UnlockWithTPM2() error {
 		return err
 	}
 
+	// Test hook: force token-unseal failure to exercise the HOTP recovery
+	// path end-to-end in QEMU (vanguard.testmode=1 vanguard.testhotp=1).
+	// The strict-mode failure path continues into HOTP recovery instead of
+	// an immediate hard error.
+	if testForceHOTP() {
+		Debug("luks: test mode: forcing TPM2 unseal failure for HOTP recovery test\n")
+		LogFunc("TPM_TEST_FORCED_FAIL", "device", d.Path)
+		if StrictMode {
+			// Quit TUI so console prompts are visible for HOTP recovery
+			// (matches the normal strict-mode failure path).
+			if tui.IsEnabled() {
+				tui.Quit()
+				tui.ForceReset()
+			}
+			tpmClient := intpm.New()
+			if recovery.TryHOTP(tpmClient, d.Path) {
+				console.Print("luks: HOTP recovery accepted, passphrase fallback enabled\n")
+				LogFunc("RECOVERY_SUCCESS", "device", d.Path, "method", "hotp")
+				// Continue into passphrase fallback below with the test passphrase
+				console.Print("luks: falling back to passphrase\n")
+				if err := d.UnlockWithPassphrase(); err != nil {
+					LogFunc("LUKS_FAIL", "device", d.Path, "method", "passphrase", "error", err.Error())
+					return err
+				}
+				LogFunc("LUKS_UNLOCK", "device", d.Path, "method", "passphrase", "status", "ok")
+				return nil
+			}
+			LogFunc("LUKS_FAIL", "device", d.Path, "method", "hotp", "mode", "strict-test")
+			return fmt.Errorf("test-forced HOTP recovery failed")
+		}
+	}
+
 	// Detect TPM2 token strategy
 	detection, _ := DetectTPM2TokenStrategy(d.Path)
 	var pcrlockPolicy *intpm.PCRLockPolicy
@@ -355,22 +411,11 @@ func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, pc
 	var pin string
 	var err error
 
-	// zeroPIN overwrites the PIN string's backing buffer after use to reduce
-	// the cold-boot PIN extraction window. Go strings are immutable, so we
-	// convert to []byte, use it, then zero the original string's backing store.
-	// This is best-effort — the GC may have copied the string, and the TUI
-	// may retain its own copy. Still better than leaving it in heap indefinitely.
-	zeroPIN := func() {
-		if len(pin) > 0 {
-			// Convert string to mutable bytes (unsafe but the string is ours)
-			pinBytes := []byte(pin)
-			for i := range pinBytes {
-				pinBytes[i] = 0
-			}
-			pin = ""
-		}
-	}
-	defer zeroPIN()
+	// Zero the PIN string's backing buffer after use to reduce the cold-boot
+	// PIN extraction window (console.ZeroString). This is best-effort — the
+	// GC may have copied the string, and the TUI may retain its own copy.
+	// Still better than leaving it in heap indefinitely.
+	defer console.ZeroString(&pin)
 
 	for attempt := 1; attempt <= maxPINAttempts; attempt++ {
 		// Prompt for PIN
@@ -458,27 +503,6 @@ func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, pc
 	}
 
 	return fmt.Errorf("failed to unlock after %d PIN attempts: %w", maxPINAttempts, lastError)
-}
-
-// unlockWithKey unlocks the device with a decrypted key/password.
-func (d *Device) unlockWithKey(key []byte) error {
-	slots := d.dev.Slots()
-	Debug("luks: unlockWithKey: %d keyslots available, key length=%d\n", len(slots), len(key))
-	for _, slot := range slots {
-		volume, err := d.dev.UnsealVolume(slot, key)
-		if err != nil {
-			Debug("luks: keyslot %d: UnsealVolume failed: %v\n", slot, err)
-			continue
-		}
-		Debug("luks: keyslot %d: UnsealVolume succeeded\n", slot)
-
-		if err := d.setupDMCrypt(volume); err != nil {
-			return err
-		}
-		return nil
-	}
-
-	return errors.New("key did not match any keyslot")
 }
 
 // unlockWithKeyForToken unlocks the device using only the keyslots assigned to a specific TPM2 token.
@@ -709,6 +733,20 @@ func getTestPin() string {
 		}
 	}
 	return ""
+}
+
+// testForceHOTP checks the kernel cmdline for vanguard.testhotp=1. Only
+// honored in test mode: when set, the TPM2 unseal path fails unconditionally
+// so the HOTP recovery flow is exercised in QEMU tests.
+func testForceHOTP() bool {
+	if !isTestMode() {
+		return false
+	}
+	data, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		return false
+	}
+	return strings.Contains(string(data), "vanguard.testhotp=1")
 }
 
 // isTestMode checks the kernel command line for vanguard.testmode=1.

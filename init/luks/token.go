@@ -9,6 +9,7 @@ import (
 
 	"github.com/zaolin/vanguard/init/buildtags"
 	lk "github.com/zaolin/vanguard/internal/luks"
+	"github.com/zaolin/vanguard/internal/pcrlock"
 	intpm "github.com/zaolin/vanguard/internal/tpm"
 )
 
@@ -138,24 +139,13 @@ func ParseTPM2Token(token lk.Token) (*TPM2Token, error) {
 	usePCRLock := payload.PCRLock || payload.PCRLockAlt || payload.PCRLockNV != 0 || payload.PCRLockNVDataAlt != ""
 	pcrlockNV := payload.PCRLockNV
 	if pcrlockNV == 0 && payload.PCRLockNVDataAlt != "" {
-		// Decode base64 NV index data for v255+ format
-		// The NV index is embedded in the TPM2B_NV_PUBLIC blob at offset 2
-		// (after the 2-byte TPM2B size prefix), not offset 0.
-		nvData, err := base64.StdEncoding.DecodeString(payload.PCRLockNVDataAlt)
-		if err == nil && len(nvData) >= 6 {
-			// Try offset 2 first (spec-compliant TPM2B_NV_PUBLIC)
-			nvIdx := uint32(nvData[2])<<24 | uint32(nvData[3])<<16 |
-				uint32(nvData[4])<<8 | uint32(nvData[5])
-			if isPcrlockNVRange(nvIdx) {
-				pcrlockNV = nvIdx
-			} else if len(nvData) >= 4 {
-				// Fallback: offset 0 (no TPM2B wrapping, older format)
-				nvIdx = uint32(nvData[0])<<24 | uint32(nvData[1])<<16 |
-					uint32(nvData[2])<<8 | uint32(nvData[3])
-				if isPcrlockNVRange(nvIdx) {
-					pcrlockNV = nvIdx
-				}
-			}
+		// Use the shared validated parser (offset 2 spec-compliant, offset 0
+		// legacy fallback, pcrlock range check) — must match the detection
+		// path in detect.go and the host-side parser in internal/pcrlock.
+		if idx, err := pcrlock.ParseNVIndexFromBlob(payload.PCRLockNVDataAlt); err == nil {
+			pcrlockNV = idx
+		} else {
+			buildtags.Debug("tpm2 token: failed to parse NV index from blob: %v\n", err)
 		}
 	}
 	if usePCRLock {
@@ -269,12 +259,4 @@ func (t *TPM2Token) Unseal(tpmClient *intpm.Client, pin []byte, pcrlockPolicy *i
 	encoded := base64.StdEncoding.EncodeToString(result)
 	buildtags.Debug("tpm token: unsealed %d bytes, base64-encoded to %d chars for LUKS2\n", len(result), len(encoded))
 	return []byte(encoded), nil
-}
-
-// isPcrlockNVRange checks whether a uint32 is in the pcrlock owner NV index range
-// (0x01800000–0x01BFFFFF) or the default pcrlock range (0x01C20000).
-// This prevents token fields from pointing at vanguard's own recovery NV index
-// (0x01C30001) or other non-pcrlock indexes.
-func isPcrlockNVRange(idx uint32) bool {
-	return (idx >= 0x01800000 && idx <= 0x01BFFFFF) || idx == 0x01C20000
 }

@@ -1,4 +1,4 @@
-.PHONY: all clean build embed install install-systemd ci build-cover
+.PHONY: all clean build embed install install-systemd ci lint build-cover
 
 VERSION ?= $(shell git describe --tags --always --dirty 2>/dev/null || echo "dev")
 
@@ -23,11 +23,15 @@ cmd/vanguard/embed/init-debug: $(wildcard init/*.go) $(wildcard init/**/*.go) $(
 
 # CI target: run all fast checks
 ci: build
-	go test -count=1 ./...
+	go test -count=1 -race ./...
 	go vet ./...
 	@FILES=$$(gofmt -l $$(find . -name "*.go" -not -path "./graphify-out/*" -not -path "./testdata/*")); \
 	if [ -n "$$FILES" ]; then echo "gofmt FAIL:"; echo "$$FILES"; exit 1; \
 	else echo "gofmt: OK"; fi
+
+# Lint target matching the lint CI workflow (requires golangci-lint)
+lint:
+	golangci-lint run ./...
 
 # Build covered init binary + C wrapper for QEMU coverage testing
 build-cover: build
@@ -43,6 +47,11 @@ install: embed
 	go install ./cmd/vanguard/
 
 # Install systemd unit for automatic firmware update recovery
-install-systemd: install
+# The relock service ExecStart=/usr/bin/vanguard — install the binary there too.
+# Depends on build (not embed): embed only builds the init binaries; the
+# CLI binary that the service runs comes from the build target.
+install-systemd: build
+	install -d $(DESTDIR)/usr/bin
+	install -m755 vanguard $(DESTDIR)/usr/bin/vanguard
 	install -d $(DESTDIR)/usr/lib/systemd/system
 	install -m644 cmd/vanguard/embed/vanguard-pcrlock-relock.service $(DESTDIR)/usr/lib/systemd/system/

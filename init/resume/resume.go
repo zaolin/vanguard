@@ -129,6 +129,10 @@ func normalizeLVMPath(device string) string {
 		if resolved != "" {
 			return resolved
 		}
+		// Unresolvable (no /dev/disk/by-* link): log so the subsequent
+		// waitForDevice timeout is explainable, then continue boot without
+		// resume (graceful skip).
+		Debug("resume: %s unresolvable — no /dev/disk/by-* link (persistent-disk udev rule may not have run yet), skipping resume\n", device)
 		return device
 	}
 

@@ -78,11 +78,13 @@ func Open(path string) (Device, error) {
 	// LUKS Magic and version are stored in the first 8 bytes of the LUKS header
 	header := make([]byte, 8)
 	if _, err := f.ReadAt(header[:], 0); err != nil {
+		f.Close()
 		return nil, err
 	}
 
 	// verify header magic
 	if !bytes.Equal(header[0:6], []byte("LUKS\xba\xbe")) {
+		f.Close()
 		return nil, fmt.Errorf("invalid LUKS header")
 	}
 
@@ -93,6 +95,7 @@ func Open(path string) (Device, error) {
 	case 2:
 		return initV2Device(path, f)
 	default:
+		f.Close()
 		return nil, fmt.Errorf("invalid LUKS version %v", version)
 	}
 }

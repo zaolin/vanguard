@@ -1,7 +1,6 @@
 package main
 
 import (
-	"os"
 	"testing"
 )
 
@@ -139,14 +138,6 @@ func TestDetectIOMMU(t *testing.T) {
 	}
 	if status == "active" && groups <= 0 {
 		t.Error("active IOMMU should have groups > 0")
-	}
-}
-
-func writeFile(t *testing.T, dir, name, content string) {
-	t.Helper()
-	path := dir + "/" + name
-	if err := os.WriteFile(path, []byte(content), 0644); err != nil {
-		t.Fatalf("writeFile %s: %v", name, err)
 	}
 }
 

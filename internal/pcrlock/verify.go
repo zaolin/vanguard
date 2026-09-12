@@ -47,6 +47,27 @@ func ParsePolicy(path string) (*Policy, error) {
 	return &policy, nil
 }
 
+// zeroPCRValueHex is the all-zero SHA256 PCR value: a policy listing only
+// this value for a PCR leaves it unbound (prediction accepts any state).
+const zeroPCRValueHex = "0000000000000000000000000000000000000000000000000000000000000000"
+
+// IsEnforcedValues reports whether a pcrValues entry actually enforces a
+// PCR: it is enforced when at least one allowed value decodes to a non-all-
+// zero digest. Undecodable values are treated as enforced (a garbage value
+// still constrains the PolicyOR). This is the single source of truth shared
+// by `vanguard status` and `vanguard verify`.
+func IsEnforcedValues(values []string) bool {
+	for _, v := range values {
+		if strings.ToLower(strings.TrimSpace(v)) == zeroPCRValueHex {
+			continue
+		}
+		// Any other value enforces, whether or not it decodes cleanly —
+		// an undecodable value cannot match all-zeros PCR state.
+		return true
+	}
+	return false
+}
+
 // VerifyNVIndex checks if the TPM NV Index matches the policy expectation.
 // It compares the auth policy and data size against the values derived from
 // the policy's base64-encoded nvPublic field.

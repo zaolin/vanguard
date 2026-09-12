@@ -36,22 +36,55 @@ jobs:
             exit 0
           }
 
+      # Resolve the OVMF paths the same way scripts/qemu-test.sh does, so the
+      # CODE/VARS pair is guaranteed to match the provisioned NVRAM.
+      - name: Resolve OVMF paths
+        run: |
+          for dir in /usr/share/edk2/OvmfX64 /usr/share/OVMF; do
+            if [ -f "${dir}/OVMF_CODE.secboot.fd" ]; then
+              echo "OVMF_CODE=${dir}/OVMF_CODE.secboot.fd" >> "$GITHUB_ENV"
+              break
+            fi
+            if [ -f "${dir}/OVMF_CODE_4M.secboot.fd" ]; then
+              echo "OVMF_CODE=${dir}/OVMF_CODE_4M.secboot.fd" >> "$GITHUB_ENV"
+              break
+            fi
+          done
+          if [ -z "${OVMF_CODE}" ]; then
+            echo "OVMF Secure Boot firmware not found"
+            exit 1
+          fi
+          echo "OVMF_VARS=$(dirname "${OVMF_CODE}")/$(basename "${OVMF_CODE}" | sed 's/^OVMF_CODE/OVMF_VARS/')" >> "$GITHUB_ENV"
+
       - name: Test unsigned UKI rejected
         run: |
           timeout 15 qemu-system-x86_64 \
             -machine q35,smm=on -m 2G -nographic -no-reboot \
-            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
             -drive if=pflash,format=raw,file=test/ovmf/OVMF_VARS.secboot.fd \
             -drive id=esp,format=raw,if=none,file=test/esp.img \
             -device ich9-ahci,id=ahci -device ide-hd,drive=esp,bus=ahci.0 \
-            -serial mon:stdio 2>&1 | grep -q "Access Denied" && echo "PASS: unsigned UKI rejected" || echo "WARN: unsigned UKI not rejected"
+            -serial mon:stdio 2>&1 | tee test/unsigned-boot.log
+          # Hard assertion: unsigned UKI must be rejected.
+          grep -q "Access Denied" test/unsigned-boot.log || {
+            echo "FAIL: unsigned UKI was not rejected"
+            exit 1
+          }
+          echo "PASS: unsigned UKI rejected"
 
       - name: Test signed UKI accepted
         run: |
           timeout 30 qemu-system-x86_64 \
             -machine q35,smm=on -m 2G -nographic -no-reboot \
-            -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd \
+            -drive if=pflash,format=raw,readonly=on,file="${OVMF_CODE}" \
             -drive if=pflash,format=raw,file=test/ovmf/OVMF_VARS.secboot.fd \
             -drive id=esp,format=raw,if=none,file=test/esp.img \
             -device ich9-ahci,id=ahci -device ide-hd,drive=esp,bus=ahci.0 \
-            -serial mon:stdio 2>&1 | head -10
+            -serial mon:stdio 2>&1 | tee test/signed-boot.log
+          # Hard assertion: the signed UKI must get past Secure Boot far
+          # enough to boot the kernel (Access Denied means rejection).
+          grep -q "Access Denied" test/signed-boot.log && {
+            echo "FAIL: signed UKI was rejected"
+            exit 1
+          }
+          echo "PASS: signed UKI accepted"

@@ -1,11 +1,17 @@
 package luks
 
 import (
+	"encoding/base64"
 	"encoding/binary"
 	"testing"
+
+	"github.com/zaolin/vanguard/internal/pcrlock"
 )
 
-func TestParseNVIndexFromPublic_SpecCompliant(t *testing.T) {
+// b64Blob encodes raw bytes as base64 for the shared blob parser.
+func b64Blob(data []byte) string { return base64.StdEncoding.EncodeToString(data) }
+
+func TestParseNVIndexFromBlob_SpecCompliant(t *testing.T) {
 	// Build a proper TPM2B_NV_PUBLIC:
 	// [2 size][4 nvIndex][2 nameAlg][4 attributes][2 authPolicySize=0][2 dataSize]
 	data := make([]byte, 16)
@@ -16,13 +22,16 @@ func TestParseNVIndexFromPublic_SpecCompliant(t *testing.T) {
 	binary.BigEndian.PutUint16(data[12:14], 0)         // authPolicySize = 0
 	binary.BigEndian.PutUint16(data[14:16], 34)        // dataSize
 
-	got := parseNVIndexFromPublic(data)
+	got, err := pcrlock.ParseNVIndexFromBlob(b64Blob(data))
+	if err != nil {
+		t.Fatalf("ParseNVIndexFromBlob: %v", err)
+	}
 	if got != 0x01800001 {
 		t.Errorf("expected 0x01800001, got 0x%x", got)
 	}
 }
 
-func TestParseNVIndexFromPublic_WithAuthPolicy(t *testing.T) {
+func TestParseNVIndexFromBlob_WithAuthPolicy(t *testing.T) {
 	// Build TPM2B_NV_PUBLIC with 32-byte authPolicy:
 	// [2 size][4 nvIndex][2 nameAlg][4 attributes][2 authPolicySize=32][32 authPolicy][2 dataSize]
 	authPolicy := make([]byte, 32)
@@ -38,68 +47,66 @@ func TestParseNVIndexFromPublic_WithAuthPolicy(t *testing.T) {
 	copy(data[14:46], authPolicy)
 	binary.BigEndian.PutUint16(data[46:48], 34) // dataSize
 
-	got := parseNVIndexFromPublic(data)
+	got, err := pcrlock.ParseNVIndexFromBlob(b64Blob(data))
+	if err != nil {
+		t.Fatalf("ParseNVIndexFromBlob: %v", err)
+	}
 	if got != 0x01ABCDEF {
 		t.Errorf("expected 0x01ABCDEF, got 0x%x", got)
 	}
 }
 
-func TestParseNVIndexFromPublic_Offset0(t *testing.T) {
+func TestParseNVIndexFromBlob_Offset0(t *testing.T) {
 	// NV index directly at offset 0 (no TPM2B wrapping)
 	data := make([]byte, 4)
 	binary.BigEndian.PutUint32(data[0:4], 0x018188A3)
 
-	got := parseNVIndexFromPublic(data)
+	got, err := pcrlock.ParseNVIndexFromBlob(b64Blob(data))
+	if err != nil {
+		t.Fatalf("ParseNVIndexFromBlob: %v", err)
+	}
 	if got != 0x018188A3 {
 		t.Errorf("expected 0x018188A3, got 0x%x", got)
 	}
 }
 
-func TestParseNVIndexFromPublic_TooShort(t *testing.T) {
+func TestParseNVIndexFromBlob_TooShort(t *testing.T) {
 	data := []byte{0x01, 0x80}
-	got := parseNVIndexFromPublic(data)
-	if got != 0 {
-		t.Errorf("expected 0 for short data, got 0x%x", got)
+	if _, err := pcrlock.ParseNVIndexFromBlob(b64Blob(data)); err == nil {
+		t.Error("expected error for short data")
 	}
 }
 
-func TestParseNVIndexFromPublic_InvalidRange(t *testing.T) {
-	// NV index outside owner hierarchy range
+func TestParseNVIndexFromBlob_InvalidRange(t *testing.T) {
+	// NV index outside pcrlock range
 	data := make([]byte, 4)
 	binary.BigEndian.PutUint32(data[0:4], 0xDEADBEEF)
 
-	got := parseNVIndexFromPublic(data)
-	if got != 0 {
-		t.Errorf("expected 0 for invalid range, got 0x%x", got)
+	if _, err := pcrlock.ParseNVIndexFromBlob(b64Blob(data)); err == nil {
+		t.Error("expected error for invalid range")
 	}
 }
 
-func TestParseNVIndexFromPublic_Empty(t *testing.T) {
-	got := parseNVIndexFromPublic(nil)
-	if got != 0 {
-		t.Errorf("expected 0 for nil, got 0x%x", got)
+func TestParseNVIndexFromBlob_Empty(t *testing.T) {
+	if _, err := pcrlock.ParseNVIndexFromBlob(b64Blob(nil)); err == nil {
+		t.Error("expected error for nil data")
 	}
 }
 
-func TestIsValidNVIndex(t *testing.T) {
-	tests := []struct {
-		idx  uint32
-		want bool
-	}{
-		{0x01000000, true},
-		{0x01800000, true},
-		{0x01BFFFFF, true},
-		{0x01FFFFFF, true},
-		{0x00800000, false},
-		{0x02000000, false},
-		{0xDEADBEEF, false},
-		{0x00000000, false},
+func TestIsPcrlockNVIndex_SharedValidator(t *testing.T) {
+	// The shared validator is stricter than the old isValidNVIndex: only the
+	// pcrlock owner range (0x01800000–0x01BFFFFF) and the legacy default
+	// (0x01C20000) count. This excludes vanguard's own recovery indexes.
+	valid := []uint32{0x01800000, 0x01BFFFFF, 0x01C20000}
+	for _, idx := range valid {
+		if !pcrlock.IsPcrlockNVIndex(idx) {
+			t.Errorf("IsPcrlockNVIndex(0x%x) = false, want true", idx)
+		}
 	}
-
-	for _, tt := range tests {
-		got := isValidNVIndex(tt.idx)
-		if got != tt.want {
-			t.Errorf("isValidNVIndex(0x%x) = %v, want %v", tt.idx, got, tt.want)
+	invalid := []uint32{0x01000000, 0x017FFFFF, 0x01C00000, 0x01C30001, 0x01FFFFFF, 0xDEADBEEF, 0x00000000}
+	for _, idx := range invalid {
+		if pcrlock.IsPcrlockNVIndex(idx) {
+			t.Errorf("IsPcrlockNVIndex(0x%x) = true, want false", idx)
 		}
 	}
 }

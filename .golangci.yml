@@ -1,0 +1,51 @@
+# golangci-lint configuration for vanguard.
+# gofmt + go vet already run in `make ci`. This adds correctness linters.
+#
+# Currently disabled, with the intent to tighten over time:
+#   - errcheck: ~380 pre-existing unchecked-error sites (deferred Close,
+#     best-effort archive writes). Fix the backlog, then enable.
+#   - ST1000/ST1005/ST1021/ST1022/QF10xx: doc-comment and formatting style
+#     nits across the existing tree; batch-fix separately.
+#   - ineffassign: 2 pre-existing sites.
+version: "2"
+
+run:
+  timeout: 5m
+
+linters:
+  enable:
+    - govet         # superset of go vet
+    - staticcheck   # correctness + simplicity
+    - unused        # unused code (respects exported API)
+    - misspell      # typos in comments/strings
+  disable:
+    - errcheck
+
+  settings:
+    staticcheck:
+      checks:
+        - all
+        - -SA9003   # empty branch: readability nit, heavy in builders
+        - -QF1003   # tagged switch: style nit
+        - -QF1007   # merge static if/else: style nit
+        - -QF1012   # Fprintf vs WriteString(Sprintf): style nit
+        - -S1039    # Sprintf literals: style nit
+        - -ST1000   # package comment: style nit
+        - -ST1003   # naming: Go initialisms in domain terms (LUKS/UKI)
+        - -ST1005   # error strings capitalized: style nit
+        - -ST1021   # comment on exported type: style nit
+        - -ST1022   # comment on exported var: style nit
+        # SA1019: ripemd160/twofish are required — they are LUKS1 key-der
+        # IV/cipher options that must be parseable for old volumes.
+        # SA4023: switchroot.SwitchRoot ends in unix.Exec (never returns on
+        # success), so the retry loop in init/main.go trips "always true";
+        # the loop structure is intentional, cleanup needs a redesign.
+        - -SA1019
+        - -SA4023
+
+  exclusions:
+    rules:
+      # Test helpers may be intentionally single-use.
+      - path: _test\.go
+        linters:
+          - unused

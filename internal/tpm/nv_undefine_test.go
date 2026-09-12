@@ -2,7 +2,6 @@ package tpm
 
 import (
 	"testing"
-	"time"
 
 	"github.com/zaolin/vanguard/internal/tpm/swtpmtest"
 )
@@ -164,7 +163,7 @@ func TestReadSeedOnly_AfterFullEnrollment(t *testing.T) {
 	defer client.UndefineRecoveryNVSpace(testIndex, nil)
 
 	seed := []byte("0123456789ABCDEF0123456789ABCDEF") // 32 bytes
-	if err := client.WriteRecoveryData(testIndex, seed, time.Now().Unix(), pcrValues); err != nil {
+	if err := client.WriteRecoveryData(testIndex, seed, pcrValues); err != nil {
 		t.Fatalf("WriteRecoveryData: %v", err)
 	}
 
@@ -181,52 +180,6 @@ func TestReadSeedOnly_AfterFullEnrollment(t *testing.T) {
 			t.Errorf("seed mismatch at byte %d", i)
 			break
 		}
-	}
-}
-
-func TestReadSeedOnly_TimestampMissing(t *testing.T) {
-	tpmTransport, cleanup := swtpmtest.Setup(t)
-	defer cleanup()
-
-	client := NewWithTransport(tpmTransport)
-	testIndex := uint32(0x01C30041)
-	pcrValues := map[int][]byte{7: make([]byte, 32)}
-
-	// Define + write recovery data
-	if err := client.DefineRecoveryNVSpace(testIndex, pcrValues); err != nil {
-		t.Fatalf("DefineRecoveryNVSpace: %v", err)
-	}
-	defer client.UndefineRecoveryNVSpace(testIndex, nil)
-
-	seed := []byte("AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA") // 32 bytes
-	if err := client.WriteRecoveryData(testIndex, seed, time.Now().Unix(), pcrValues); err != nil {
-		t.Fatalf("WriteRecoveryData: %v", err)
-	}
-
-	// Delete ONLY the timestamp index (simulating the bug)
-	tsIndex := uint32(DefaultRecoveryTimestampNVIndex)
-	if err := client.NVUndefineSpace(tsIndex); err != nil {
-		t.Fatalf("NVUndefineSpace timestamp: %v", err)
-	}
-
-	// ReadRecoveryData should fail (timestamp missing)
-	_, _, _, err := client.ReadRecoveryData(testIndex)
-	if err == nil {
-		t.Error("ReadRecoveryData should fail when timestamp is missing")
-	}
-
-	// TimestampNVExists should return false
-	if client.TimestampNVExists() {
-		t.Error("TimestampNVExists should return false after deleting timestamp")
-	}
-
-	// ReadSeedOnly should STILL WORK (doesn't need timestamp)
-	readSeed, err := client.ReadSeedOnly(testIndex)
-	if err != nil {
-		t.Fatalf("ReadSeedOnly should work without timestamp: %v", err)
-	}
-	if len(readSeed) != SeedSize {
-		t.Errorf("seed length: got %d, want %d", len(readSeed), SeedSize)
 	}
 }
 
@@ -248,7 +201,7 @@ func TestReadSeedOnly_WrongPCR7(t *testing.T) {
 	defer client1.UndefineRecoveryNVSpace(testIndex, nil)
 
 	seed := []byte("BBBBBBBBBBBBBBBBBBBBBBBBBBBBBBBB")
-	if err := client1.WriteRecoveryData(testIndex, seed, time.Now().Unix(), pcrValuesZero); err != nil {
+	if err := client1.WriteRecoveryData(testIndex, seed, pcrValuesZero); err != nil {
 		t.Fatalf("Write: %v", err)
 	}
 
@@ -267,113 +220,3 @@ func TestReadSeedOnly_WrongPCR7(t *testing.T) {
 }
 
 // --- RecreateTimestampOnly tests ---
-
-func TestRecreateTimestampOnly_TimestampMissing(t *testing.T) {
-	tpmTransport, cleanup := swtpmtest.Setup(t)
-	defer cleanup()
-
-	client := NewWithTransport(tpmTransport)
-	testIndex := uint32(0x01C30043)
-	pcrValues := map[int][]byte{7: make([]byte, 32)}
-
-	// Full enrollment
-	if err := client.DefineRecoveryNVSpace(testIndex, pcrValues); err != nil {
-		t.Fatalf("Define: %v", err)
-	}
-	defer client.UndefineRecoveryNVSpace(testIndex, nil)
-
-	seed := []byte("CCCCCCCCCCCCCCCCCCCCCCCCCCCCCCCC")
-	if err := client.WriteRecoveryData(testIndex, seed, time.Now().Unix(), pcrValues); err != nil {
-		t.Fatalf("Write: %v", err)
-	}
-
-	// Delete timestamp
-	tsIndex := uint32(DefaultRecoveryTimestampNVIndex)
-	if err := client.NVUndefineSpace(tsIndex); err != nil {
-		t.Fatalf("Delete timestamp: %v", err)
-	}
-
-	// Verify timestamp is gone
-	if client.TimestampNVExists() {
-		t.Fatal("Timestamp should be missing")
-	}
-
-	// Recreate timestamp
-	if err := client.RecreateTimestampOnly(pcrValues); err != nil {
-		t.Fatalf("RecreateTimestampOnly: %v", err)
-	}
-
-	// Verify timestamp exists now
-	if !client.TimestampNVExists() {
-		t.Error("Timestamp should exist after RecreateTimestampOnly")
-	}
-
-	// ReadRecoveryData should now work
-	readSeed, _, _, err := client.ReadRecoveryData(testIndex)
-	if err != nil {
-		t.Fatalf("ReadRecoveryData after timestamp recreation: %v", err)
-	}
-	if len(readSeed) != SeedSize {
-		t.Errorf("seed length: got %d, want %d", len(readSeed), SeedSize)
-	}
-}
-
-func TestRecreateTimestampOnly_AlreadyExists(t *testing.T) {
-	tpmTransport, cleanup := swtpmtest.Setup(t)
-	defer cleanup()
-
-	client := NewWithTransport(tpmTransport)
-	testIndex := uint32(0x01C30044)
-	pcrValues := map[int][]byte{7: make([]byte, 32)}
-
-	// Full enrollment (timestamp is created by DefineRecoveryNVSpace)
-	if err := client.DefineRecoveryNVSpace(testIndex, pcrValues); err != nil {
-		t.Fatalf("Define: %v", err)
-	}
-	defer client.UndefineRecoveryNVSpace(testIndex, nil)
-
-	// Timestamp should already exist
-	if !client.TimestampNVExists() {
-		t.Fatal("Timestamp should exist after enrollment")
-	}
-
-	// RecreateTimestampOnly should be a no-op (timestamp already exists)
-	if err := client.RecreateTimestampOnly(pcrValues); err != nil {
-		t.Fatalf("RecreateTimestampOnly on existing timestamp should not error: %v", err)
-	}
-
-	// Timestamp should still exist
-	if !client.TimestampNVExists() {
-		t.Error("Timestamp should still exist after no-op recreation")
-	}
-}
-
-func TestTimestampNVExists_FreshTPM(t *testing.T) {
-	tpmTransport, cleanup := swtpmtest.Setup(t)
-	defer cleanup()
-
-	client := NewWithTransport(tpmTransport)
-
-	// Fresh swtpm should not have timestamp index
-	if client.TimestampNVExists() {
-		t.Error("Fresh TPM should not have timestamp NV index")
-	}
-}
-
-func TestTimestampNVExists_AfterEnrollment(t *testing.T) {
-	tpmTransport, cleanup := swtpmtest.Setup(t)
-	defer cleanup()
-
-	client := NewWithTransport(tpmTransport)
-	testIndex := uint32(0x01C30045)
-	pcrValues := map[int][]byte{7: make([]byte, 32)}
-
-	if err := client.DefineRecoveryNVSpace(testIndex, pcrValues); err != nil {
-		t.Fatalf("Define: %v", err)
-	}
-	defer client.UndefineRecoveryNVSpace(testIndex, nil)
-
-	if !client.TimestampNVExists() {
-		t.Error("Timestamp should exist after enrollment")
-	}
-}

@@ -76,9 +76,16 @@ func Start() error {
 		console.DebugPrint("udev: db_persist rule write failed: %v\n", err)
 	}
 
-	// Reload udev rules so the db_persist rule takes effect
-	reloadCmd := exec.Command(udevadmPaths[0], "control", "--reload")
-	reloadCmd.Run()
+	// Reload udev rules so the db_persist rule takes effect.
+	// Use findBinary like the udevd start path — hardcoding udevadmPaths[0]
+	// silently skips the reload when /usr/bin/udevadm is missing (Gentoo
+	// ships /sbin/udevadm), which would drop the db_persist rule and lose
+	// /dev/mapper symlinks at switch_root.
+	udevadm := findBinary(udevadmPaths)
+	if udevadm != "" {
+		reloadCmd := exec.Command(udevadm, "control", "--reload")
+		reloadCmd.Run()
+	}
 
 	return nil
 }

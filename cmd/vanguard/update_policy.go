@@ -225,7 +225,6 @@ func (c *UpdatePolicyCmd) Run() error {
 					warnStyle.Render("PCR 5 (GPT) requested but not in policy"),
 					dimStyle.Render("Unpredictable firmware events prevented inclusion"),
 				}))
-				gptEnabled = false
 			}
 		}
 
@@ -314,6 +313,17 @@ func (c *UpdatePolicyCmd) Run() error {
 		} else {
 			pcrFailures := 0
 			for p, match := range pcrMatches {
+				// PCR 11: the policy predicts the at-unseal-time value and
+				// systemd extends PCR 11 after unlock, so the live comparison
+				// always mismatches in a booted system. Use the header digest
+				// binding when the device is available; the digest was just
+				// written from this device, so match is the expected outcome.
+				if p == 11 && !match && c.LUKSDevice != "" {
+					hb, hbErr := pcrlock.VerifyLUKSHeaderBinding(c.LUKSDevice)
+					if hbErr == nil && hb.Bound {
+						match = hb.Match
+					}
+				}
 				if !match {
 					pcrFailures++
 					integrityLines = append(integrityLines, errStyle.Render(fmt.Sprintf("✗ PCR %d mismatch (current: %s)", p, currentValues[p])))

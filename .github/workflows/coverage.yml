@@ -22,9 +22,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y \
             qemu-system-x86 swtpm swtpm-tools cryptsetup lvm2 \
-            busybox gcc make mtools e2tools \
-            efitools sbsigntool ovmf fwupd \
-            systemd systemd-ukify systemd-boot-efi
+            busybox gcc make mtools e2tools
 
       - name: Build vanguard
         run: |
@@ -182,7 +180,7 @@ jobs:
           fi
 
       - name: Install gocovmerge
-        run: go install github.com/wadey/gocovmerge@latest
+        run: go install github.com/wadey/gocovmerge@v0.0.0-20150915045627-0c7f4e9dd1e2
 
       - name: Run go test coverage
         env:
@@ -251,7 +249,7 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add .github/coverage.json
           git diff --staged --quiet || git commit -m "chore: update coverage badge data [skip ci]"
-          git push || true
+          git push || echo 'warning: badge push failed (non-fatal)'
 
       - uses: actions/upload-artifact@v4
         with:
@@ -265,4 +263,3 @@ jobs:
       - name: Cleanup
         if: always()
         run: pkill swtpm 2>/dev/null || true
-# This is added by the edit tool

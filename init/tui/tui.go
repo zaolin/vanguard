@@ -34,16 +34,8 @@ const (
 
 // Styles
 var (
-	titleStyle = lipgloss.NewStyle().
-			Bold(true).
-			Foreground(lipgloss.Color("86")).
-			MarginBottom(1)
-
 	stageStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("252"))
-
-	successStyle = lipgloss.NewStyle().
-			Foreground(lipgloss.Color("42"))
 
 	errorStyle = lipgloss.NewStyle().
 			Foreground(lipgloss.Color("196"))

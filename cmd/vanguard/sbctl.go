@@ -33,20 +33,6 @@ type sbctlVerified struct {
 	IsSigned int8   `json:"is_signed"`
 }
 
-// sbctlEnrolledKey represents a single certificate from sbctl list-enrolled-keys.
-type sbctlEnrolledKey struct {
-	CommonName string `json:"commonName"`
-	NotBefore  string `json:"notBefore"`
-	NotAfter   string `json:"notAfter"`
-}
-
-// sbctlEnrolledKeys holds the parsed key info from sbctl list-enrolled-keys.
-type sbctlEnrolledKeys struct {
-	PK  []sbctlEnrolledKey `json:"pk"`
-	KEK []sbctlEnrolledKey `json:"kek"`
-	DB  []sbctlEnrolledKey `json:"db"`
-}
-
 // collectSbctlStatus gathers sbctl data if sbctl is installed.
 // Returns Installed=false if sbctl is not on PATH (silent skip).
 func collectSbctlStatus() *sbctlInfo {
@@ -80,49 +66,6 @@ func collectSbctlStatus() *sbctlInfo {
 	}
 
 	return info
-}
-
-// collectSbctlEnrolledKeys reads PK/KEK/db cert metadata via
-// `sbctl list-enrolled-keys --json` (no root needed — reads EFI vars).
-// Returns nil if sbctl is not installed or the command fails.
-func collectSbctlEnrolledKeys() *sbctlEnrolledKeys {
-	if _, err := exec.LookPath("sbctl"); err != nil {
-		return nil
-	}
-
-	output, err := exec.Command("sbctl", "list-enrolled-keys", "--json").Output()
-	if err != nil {
-		return nil
-	}
-
-	// sbctl list-enrolled-keys --json returns a map with "PK", "KEK", "DB" keys.
-	// Each value is an array of Go x509.Certificate JSON structs.
-	// We only extract CommonName, NotBefore, NotAfter for display.
-	var raw map[string][]map[string]interface{}
-	if err := json.Unmarshal(output, &raw); err != nil {
-		return nil
-	}
-
-	result := &sbctlEnrolledKeys{}
-	result.PK = parseEnrolledKeyList(raw["PK"])
-	result.KEK = parseEnrolledKeyList(raw["KEK"])
-	result.DB = parseEnrolledKeyList(raw["DB"])
-	return result
-}
-
-func parseEnrolledKeyList(certs []map[string]interface{}) []sbctlEnrolledKey {
-	var keys []sbctlEnrolledKey
-	for _, c := range certs {
-		key := sbctlEnrolledKey{
-			NotBefore: getString(c, "NotBefore"),
-			NotAfter:  getString(c, "NotAfter"),
-		}
-		if subject, ok := c["Subject"].(map[string]interface{}); ok {
-			key.CommonName = getString(subject, "CommonName")
-		}
-		keys = append(keys, key)
-	}
-	return keys
 }
 
 func getString(m map[string]interface{}, key string) string {

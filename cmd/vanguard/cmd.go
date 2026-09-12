@@ -17,10 +17,18 @@ type CLI struct {
 
 // GenerateCmd generates a new initramfs image
 type GenerateCmd struct {
-	Output      string   `short:"o" required:"" help:"Output path for initramfs image"`
+	// Output is optional: falls back to the config file's `output` key
+	// (default /boot/initramfs-linux.img) when omitted.
+	Output string `short:"o" help:"Output path for initramfs image (default: config output key or /boot/initramfs-linux.img)"`
+	// Compression is optional: empty means "use config/default", so a
+	// config-file compression key can take effect without a CLI flag.
+	// NOTE: no enum tag here — kong v0.8 requires enum fields to be
+	// required or defaulted, which would either panic (no default) or
+	// clobber the config fallback (default:"zstd"). Validated in Run()
+	// against the same set instead.
+	Compression string   `short:"c" placeholder:"zstd" help:"Compression algorithm: zstd, gzip, or none (default: config compression key or zstd)"`
 	Firmware    []string `short:"f" sep:"," help:"Firmware files to include (relative to /lib/firmware/)"`
 	Modules     []string `short:"m" sep:"," help:"Kernel modules to include"`
-	Compression string   `short:"c" default:"zstd" enum:"gzip,zstd,none" help:"Compression algorithm"`
 	Debug       bool     `short:"d" help:"Enable debug output in init binary"`
 	Verbose     bool     `short:"v" help:"Show verbose output during generation"`
 	Config      string   `type:"path" help:"Path to TOML config file"`

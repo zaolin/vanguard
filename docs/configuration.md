@@ -16,12 +16,14 @@ vanguard generate [options]
 
 | Option | Short | Type | Default | Description |
 |--------|-------|------|---------|-------------|
-| `--output` | `-o` | string | *required* | Output path for the initramfs image |
+| `--output` | `-o` | string | config `output` key or `/boot/initramfs-linux.img` | Output path for the initramfs image |
 | `--firmware` | `-f` | string | | Comma-separated list of firmware files to include |
 | `--modules` | `-m` | string | | Comma-separated list of kernel modules to include |
-| `--compression` | `-c` | string | `zstd` | Compression algorithm: `zstd`, `gzip`, or `none` |
+| `--compression` | `-c` | string | config `compression` key or `zstd` | Compression algorithm: `zstd`, `gzip`, or `none` |
 | `--debug` | `-d` | bool | `false` | Enable verbose debug output in init |
+| `--verbose` | `-v` | bool | `false` | Show verbose output during generation |
 | `--config` | | string | | Path to TOML configuration file |
+| `--init-binary` | | string | embedded binary | Custom init binary (testing with `-cover`) |
 
 #### Examples
 
@@ -56,13 +58,17 @@ vanguard update [options]
 
 | Option | Short | Type | Default | Description |
 |--------|-------|------|---------|-------------|
-| `--uki-path` | `-u` | string | *required* | Path to the Unified Kernel Image (UKI) |
+| `--uki-path` | `-u` | string | *required* (or config `uki_path`) | Path to the Unified Kernel Image (UKI) |
 | `--policy-output` | `-p` | string | `<uki-path>.pcrlock.json` | Output path for policy JSON |
-| `--luks-device` | `-l` | string | | LUKS device for token verification (enables GPT binding) |
+| `--luks-device` | `-l` | string | | LUKS device for token verification (enables GPT + LUKS header binding) |
 | `--no-gpt` | | bool | `false` | Disable GPT partition table binding (PCR 5) |
+| `--no-luks-header` | | bool | `false` | Disable LUKS header measurement binding (PCR 11) |
 | `--no-verify` | | bool | `false` | Skip policy verification step |
 | `--verbose` | `-v` | bool | `false` | Show verbose output from pcrlock tools |
 | `--cleanup` | `-c` | bool | `false` | Remove old unused pcrlock NV indices from TPM |
+| `--dry-run` | | bool | `false` | Show what would be done without modifying TPM or writing policy |
+| `--json` | | bool | `false` | Output results as JSON (implies `--dry-run` for non-mutating commands) |
+| `--config` | | string | | Path to TOML config file (reads `uki_path` and `luks_device`) |
 
 #### 5-Phase Execution
 
@@ -104,7 +110,8 @@ vanguard verify [options]
 | Option | Short | Type | Default | Description |
 |--------|-------|------|---------|-------------|
 | `--policy-path` | `-p` | string | *required* | Path to pcrlock.json policy file |
-| `--luks-device` | `-l` | string | | LUKS device to verify token on |
+| `--luks-device` | `-l` | string | | LUKS device to verify token on (also enables PCR 11 header digest check) |
+| `--json` | | bool | `false` | Machine-readable JSON output |
 
 #### Checks Performed
 
@@ -148,7 +155,7 @@ A threat-model-first view organized by attack vectors:
   - DMA Attack - IOMMU, pre-boot DMA protection, Thunderbolt
   - Kernel Runtime Attack - lockdown, module sigs, CET, SMAP, kernel tainted
   - Cold Boot Attack - memory encryption (informational, doesn't affect tier)
-  - Brute-Force / Key Theft - TPM2 token, PIN, PCRLock binding, TOTP fallback
+  - Brute-Force / Key Theft - TPM2 token, PIN, PCRLock binding, HOTP fallback
   - Physical Debug Attack - debug interface locked, fused part (via fwupd/HSTI)
   - Firmware Tampering - SPI write/replay protection, anti-rollback (via fwupd/HSTI)
   - SMM Attack - SMM locked (via fwupd)
@@ -166,7 +173,7 @@ vanguard status --json
 
 ### recovery
 
-Manage TOTP-based boot recovery. Without flags, prints recovery instructions.
+Manage HOTP-based boot recovery. Without flags, prints recovery instructions.
 
 ```bash
 vanguard recovery [options]
@@ -176,9 +183,10 @@ vanguard recovery [options]
 
 | Option | Description |
 |--------|-------------|
-| `--enable` | Generate TOTP seed, write to TPM NVRAM, display QR code for authenticator app enrollment |
-| `--show` | Show current TOTP seed and QR code (for re-enrollment). Also displays pending re-provisioned seed if `--auto-reseed` ran after firmware update |
-| `--disable` | Remove TOTP recovery seed from TPM NVRAM |
+| `--enable` | Generate HOTP seed, write to TPM NVRAM, display QR code for authenticator app enrollment |
+| `--show` | Show current HOTP seed and QR code (for re-enrollment). Also displays pending re-provisioned seed if `--auto-reseed` ran after firmware update |
+| `--check` | Verify that HOTP recovery is properly configured and the seed is readable (PCR 7 + state index checks) |
+| `--disable` | Remove HOTP recovery seed from TPM NVRAM |
 | `--clean` | Forcefully remove old/legacy recovery NV indexes (for migration from older vanguard versions) |
 | `--auto-reseed` | Automatically re-provision recovery seed if unreadable (PCR 7 changed after firmware update). Non-interactive - for systemd service use |
 | `-l, --luks-device` | LUKS device path (used in recovery instructions) |
@@ -187,7 +195,7 @@ vanguard recovery [options]
 #### Examples
 
 ```bash
-# Enable TOTP recovery (interactive - displays QR code, prompts for verification)
+# Enable HOTP recovery (interactive - displays QR code, prompts for verification)
 sudo vanguard recovery --enable
 
 # Show current seed and QR code
@@ -233,7 +241,10 @@ vanguard inspect -p <path> [options]
 
 ## Configuration File
 
-Vanguard can be configured using a TOML file. By default, it looks for `/etc/vanguard.toml`.
+Vanguard can be configured using a TOML file. There is no implicit default
+path — pass the file explicitly with `--config` (e.g. `vanguard generate
+--config /etc/vanguard.toml`, or the shipped
+`vanguard-pcrlock-relock.service`, which passes `--config /etc/vanguard.toml`).
 
 ### File Format
 
@@ -280,12 +291,13 @@ luks_device = "/dev/nvme0n1p2"
 #### output
 - **Type:** string
 - **Default:** `/boot/initramfs-linux.img`
-- **Description:** Path where the generated initramfs will be written.
+- **Description:** Path where the generated initramfs will be written. Equivalent to the `-o` flag; the flag wins when both are given.
 
 #### compression
 - **Type:** string
 - **Default:** `zstd`
 - **Values:** `zstd`, `gzip`, `none`
+- **Description:** Compression for the initramfs. The `-c` flag wins when both are given; omitting `-c` lets the config value take effect.
 
 | Algorithm | Speed | Size | Notes |
 |-----------|-------|------|-------|
@@ -381,6 +393,10 @@ Example:
 # Command line wins:
 vanguard generate -c zstd --config /etc/vanguard.toml -o /boot/initramfs.img
 # Result: zstd compression is used
+
+# Omitting the flag lets the config value take effect:
+vanguard generate --config /etc/vanguard.toml -o /boot/initramfs.img
+# Result: gzip compression is used
 ```
 
 ## Validation

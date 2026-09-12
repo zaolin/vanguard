@@ -1,4 +1,4 @@
-package totp
+package hotp
 
 import (
 	"fmt"

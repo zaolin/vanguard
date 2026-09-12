@@ -53,7 +53,7 @@ func (c *EnrollCmd) Run() error {
 
 	updateArgs := []string{"vanguard", "update", "-u", c.UKIPath, "-l", c.LUKSDevice, "-p", policyPath}
 	if c.Verbose {
-		updateArgs = append(updateArgs, "-V")
+		updateArgs = append(updateArgs, "-v")
 	}
 
 	fmt.Printf("  Running: %s\n", updateArgs[1])
@@ -96,7 +96,7 @@ func (c *EnrollCmd) Run() error {
 	fmt.Printf("  %s TPM2 token enrolled successfully on %s\n", okStyle.Render("✓"), c.LUKSDevice)
 	fmt.Printf("  Policy: %s\n", policyPath)
 	fmt.Println()
-	fmt.Printf("  %s Tip: run 'vanguard recovery --enable' to set up TOTP recovery\n",
+	fmt.Printf("  %s Tip: run 'vanguard recovery --enable' to set up HOTP recovery\n",
 		dimStyle.Render("•"))
 	fmt.Println()
 

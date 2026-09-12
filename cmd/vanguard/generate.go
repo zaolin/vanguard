@@ -59,7 +59,29 @@ func (c *GenerateCmd) Run() error {
 		cfg.InitBinary = c.InitBinary
 	}
 
+	// Output was previously a kong-required flag; validate after config
+	// loading so the config file's `output` key can supply it.
+	if cfg.Output == "" {
+		return fmt.Errorf("output path required: use -o <path> or set output in config file")
+	}
+
+	// Compression was previously a kong-enum flag; validate after config
+	// loading so the config file's `compression` key can supply it.
+	if !isValidCompression(cfg.Compression) {
+		return fmt.Errorf("invalid compression %q: must be zstd, gzip, or none", cfg.Compression)
+	}
+
 	return runGenerate(cfg)
+}
+
+// isValidCompression reports whether v is an accepted compression setting
+// (empty means "unset" and resolves to the config default).
+func isValidCompression(v string) bool {
+	switch v {
+	case "", "zstd", "gzip", "none":
+		return true
+	}
+	return false
 }
 
 // extractGroupsFromRule parses a udev rule file and extracts GROUP and OWNER values.
@@ -666,6 +688,19 @@ LABEL="dm_persist_end"
 `
 	if err := archive.AddFile("usr/lib/udev/rules.d/09-dm-persist.rules", []byte(dbPersistRule), 0644); err != nil {
 		fmt.Printf("  warning: failed to add db_persist rule: %v\n", err)
+	} else {
+		rulesAdded++
+	}
+
+	// Add custom rule for /dev/disk/by-uuid and /dev/disk/by-partuuid
+	// symlinks on physical partitions. The standard rule that creates these
+	// (60-persistent-storage.rules) is not shipped (it needs ata_id/scsi_id
+	// binaries we don't include); without it, root=UUID= and fstab UUID=
+	// root entries cannot resolve at boot. This rule uses only the blkid
+	// builtin (present in udevd itself).
+	vgDiskRule := embed.PersistentDiskRule
+	if err := archive.AddFile("usr/lib/udev/rules.d/60-vanguard-persistent-disk.rules", []byte(vgDiskRule), 0644); err != nil {
+		fmt.Printf("  warning: failed to add persistent-disk rule: %v\n", err)
 	} else {
 		rulesAdded++
 	}

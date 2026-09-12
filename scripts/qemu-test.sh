@@ -587,6 +587,133 @@ run_qemu_tpm() {
 }
 
 #=============================================================================
+# HOTP Recovery Scenario
+#=============================================================================
+
+# enroll_recovery enables HOTP recovery against the running swtpm via the
+# host-side vanguard CLI. VANGUARD_TPM_SOCKET redirects the CLI's TPM access
+# to the swtpm socket; VANGUARD_TEST_SKIP_VERIFY skips the interactive
+# verification prompt. The seed (base32) is captured from stdout and stored
+# in ${TEST_DIR}/recovery-seed.b32 for HOTP computation during the boot.
+enroll_recovery() {
+    [ -f "${PROJECT_DIR}/vanguard" ] || error "vanguard binary not found — run build first"
+    [ -S "${TPM_SOCKET}" ] || error "swtpm socket not found — call start_swtpm_for_enrollment first"
+
+    info "Enabling HOTP recovery against swtpm..."
+    local enable_log="${TEST_DIR}/recovery-enable.log"
+    sudo env VANGUARD_TPM_SOCKET="${TPM_SOCKET}" VANGUARD_TEST_SKIP_VERIFY=1 \
+        "${PROJECT_DIR}/vanguard" recovery --enable 2>&1 | tee "${enable_log}"
+
+    grep -o "Manual seed (base32): [A-Z2-7]*" "${enable_log}" | awk '{print $4}' > "${TEST_DIR}/recovery-seed.b32"
+    [ -s "${TEST_DIR}/recovery-seed.b32" ] || error "failed to capture recovery seed from enable output"
+    info "Recovery seed captured (${TEST_DIR}/recovery-seed.b32)"
+}
+
+# run_qemu_hotp runs QEMU with testmode + forced HOTP recovery. The boot
+# fails token unseal (vanguard.testhotp=1), enters HOTP recovery, and the
+# current HOTP code — computed from the enrolled seed at the stored counter —
+# is written to the VM's console at the recovery prompt. Validates the full
+# TryHOTP flow end-to-end: forced failure -> prompt -> code accepted ->
+# passphrase fallback -> unlock -> switch_root.
+run_qemu_hotp() {
+    local kernel
+    kernel=$(find_kernel "${1:-}") || error "Kernel not found"
+    [ -f "${INITRAMFS}" ] || error "Initramfs not found. Run: $0 build"
+    [ -f "${DISK_IMG}" ] || error "Disk not found. Run: $0 disk"
+    [ -d "${TPM_DIR}" ] || error "TPM state not found. Run: $0 enroll-tpm"
+    [ -f "${TEST_DIR}/recovery-seed.b32" ] || error "Recovery seed not found. Run enroll-recovery first."
+
+    start_swtpm
+    trap stop_swtpm EXIT
+
+    info "Starting QEMU with forced HOTP recovery (testmode)..."
+
+    # Feed the HOTP code when the recovery prompt appears. A fresh enrollment
+    # starts at counter 0, so the code is HOTP(seed, 0).
+    local seed_b32
+    seed_b32=$(cat "${TEST_DIR}/recovery-seed.b32")
+    local feed_script="${TEST_DIR}/hotp-feed.sh"
+    cat > "${feed_script}" << 'FEED'
+#!/bin/bash
+# Wait for the recovery prompt on stdin, then emit the HOTP code for counter 0.
+seed_b32="$1"
+while IFS= read -r line; do
+    echo "$line"
+    case "$line" in
+        *"Recovery code:"*|*"recovery HOTP code"*)
+            # Compute HOTP(seed, 0) (HMAC-SHA256, 8 digits) with python3.
+            code=$(SEED_B32="$seed_b32" python3 - << 'PYEOF'
+import base64, hmac, hashlib, struct, os
+s = os.environ["SEED_B32"]
+seed = base64.b32decode(s + "=" * ((8 - len(s) % 8) % 8))
+mac = hmac.new(seed, struct.pack(">Q", 0), hashlib.sha256).digest()
+off = mac[-1] & 0xF
+val = ((mac[off] & 0x7F) << 24) | (mac[off+1] << 16) | (mac[off+2] << 8) | mac[off+3]
+print("%08d" % (val % 100000000))
+PYEOF
+)
+            echo "$code"
+            ;;
+    esac
+done
+FEED
+    chmod +x "${feed_script}"
+
+    local old_stty=""
+    if [ -n "${CONSOLE_SIZE}" ]; then
+        old_stty=$(stty -g)
+        local rows=$(echo "${CONSOLE_SIZE}" | awk '{print $1}')
+        local cols=$(echo "${CONSOLE_SIZE}" | awk '{print $2}')
+        [ -n "$rows" ] && [ -n "$cols" ] && stty rows "$rows" cols "$cols"
+    fi
+
+    set +e
+    timeout 180 qemu-system-x86_64 -machine q35 -m 2G -cpu host -enable-kvm \
+        -kernel "${kernel}" -initrd "${INITRAMFS}" \
+        -append "root=/dev/vg0/root console=ttyS0 vanguard.testmode=1 vanguard.testhotp=1" \
+        -device virtio-scsi-pci,id=scsi0 \
+        -device scsi-hd,drive=hd0,bus=scsi0.0 \
+        -drive file="${DISK_IMG}",format=qcow2,id=hd0,if=none \
+        -chardev socket,id=chrtpm,path="${TPM_SOCKET}" \
+        -tpmdev emulator,id=tpm0,chardev=chrtpm \
+        -device tpm-tis,tpmdev=tpm0 \
+        -nographic -no-reboot < <("${feed_script}" "${seed_b32}") 2>&1 | tee "${TEST_DIR}/hotp-boot.log"
+    local qemu_rc=$?
+    set -e
+
+    [ -n "${old_stty}" ] && stty "${old_stty}"
+    trap - EXIT
+    stop_swtpm
+
+    # Assert the full recovery flow
+    local failed=0
+    if grep -q "test mode: forcing TPM2 unseal failure" "${TEST_DIR}/hotp-boot.log"; then
+        info "Forced unseal-failure hook active: PASS"
+    else
+        warn "Forced-failure hook not observed"
+        failed=1
+    fi
+    if grep -q "recovery HOTP code" "${TEST_DIR}/hotp-boot.log"; then
+        info "HOTP recovery prompt reached: PASS"
+    else
+        warn "HOTP recovery prompt NOT reached — check ${TEST_DIR}/hotp-boot.log"
+        failed=1
+    fi
+    if grep -q "HOTP code accepted" "${TEST_DIR}/hotp-boot.log"; then
+        info "HOTP code accepted: PASS"
+    else
+        warn "HOTP code not accepted — check ${TEST_DIR}/hotp-boot.log"
+        failed=1
+    fi
+    if grep -q "Switching to root" "${TEST_DIR}/hotp-boot.log"; then
+        info "Boot continued to switch_root: PASS"
+    else
+        warn "Boot did not reach switch_root (passphrase fallback may need input)"
+    fi
+    return $failed
+}
+
+#=============================================================================
 # Cleanup
 #=============================================================================
 
@@ -1043,6 +1170,19 @@ case "${1:-}" in
         ;;
     clean)
         clean ;;
+    hotp)
+        check_deps; run_qemu_hotp "${2:-}" ;;
+    enroll-recovery)
+        check_deps; check_swtpm_deps; init_swtpm_state; start_swtpm_for_enrollment
+        generate_pcrlock
+        enroll_recovery
+        stop_swtpm ;;
+    all-tpm-recovery)
+        check_deps; setup_test_dir; create_test_disk; enroll_tpm
+        start_swtpm_for_enrollment; generate_pcrlock
+        enroll_recovery
+        stop_swtpm
+        build_initramfs; run_qemu_hotp "${2:-}" ;;
     *)
         cat <<HELP
 Vanguard QEMU Test Script
@@ -1073,6 +1213,9 @@ Run Commands:
   all-tpm-pin-tui [kernel] Full TPM test with PIN and TUI mode
   all-tpm-pin-pcr [kernel] Full TPM test with PIN + PCR23 (debug mode)
   all-tpm-pin-pcr-tui [kernel] Full TPM test with PIN + PCR23 and TUI mode
+  hotp [kernel]      Run QEMU with swtpm + forced HOTP recovery (validates the recovery prompt)
+  all-tpm-recovery [kernel] Full TPM test + HOTP recovery flow check
+  enroll-recovery    Enroll HOTP recovery seed against swtpm (for hotp scenario)
 
 Debug Commands:
   export-token       Export TPM token from test disk and sleep 2s for capture

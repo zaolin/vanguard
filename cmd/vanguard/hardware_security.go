@@ -319,7 +319,7 @@ func checkHardwareWarnings(info *hardwareSecurityInfo) []string {
 
 	// TPM Bus Encryption
 	if info.TPMBusEncryption != "active" {
-		warnings = append(warnings, "WARNING: TPM bus encryption inactive — LUKS key and TOTP seed may be readable via bus sniffing. Enable CONFIG_TCG_TPM2_HMAC in kernel config.")
+		warnings = append(warnings, "WARNING: TPM bus encryption inactive — LUKS key and HOTP seed may be readable via bus sniffing. Enable CONFIG_TCG_TPM2_HMAC in kernel config.")
 	}
 
 	// IOMMU + Thunderbolt

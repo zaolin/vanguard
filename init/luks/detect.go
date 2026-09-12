@@ -2,13 +2,13 @@ package luks
 
 import (
 	"encoding/base64"
-	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"os"
 
 	"github.com/zaolin/vanguard/init/buildtags"
+	"github.com/zaolin/vanguard/internal/pcrlock"
 	intpm "github.com/zaolin/vanguard/internal/tpm"
 )
 
@@ -105,18 +105,12 @@ func DetectTPM2TokenStrategy(devicePath string) (*TokenDetectionResult, error) {
 }
 
 func findSystemdTPM2TokenInHeader(devicePath string) (map[string]interface{}, error) {
-	// First read the binary header to get the header length
-	headerData, err := readDeviceRange(devicePath, 0, 32)
+	// Validate magic, version, and hdr_len bounds via the shared reader —
+	// a hostile hdr_len must never reach make([]byte, size) below.
+	hdrLen, err := readValidatedHeaderLen(devicePath)
 	if err != nil {
 		return nil, err
 	}
-
-	// LUKS2 header format:
-	//   Offset 0-5: "LUKS\xba\xbe" (6 bytes magic)
-	//   Offset 6-7: version (big-endian uint16)
-	//   Offset 8-15: hdr_len (big-endian uint64) - total header length including JSON area
-	//   JSON area starts at offset 0x1000
-	hdrLen := binary.BigEndian.Uint64(headerData[8:16])
 	jsonSize := hdrLen - 0x1000
 
 	buildtags.Debug("luks: LUKS2 header length: %d, JSON size: %d\n", hdrLen, jsonSize)
@@ -224,33 +218,17 @@ func parseTokenJSON(tokenJSON map[string]interface{}) (*TPM2Token, error) {
 	}
 
 	// Parse the tpm2_pcrlock_nv field. This field contains the base64-encoded
-	// TPM2B_NV_PUBLIC structure from systemd v255+. The NV index is a uint32
-	// buried at a variable offset depending on the authPolicy size.
-	//
-	// TPM2B_NV_PUBLIC layout (TPM 2.0 Spec Part 2, §13.6):
-	//   [0:2]   TPM2B size (uint16, total size of NVPublic content)
-	//   [2:4]   nameAlg (uint16, e.g. 0x000B = SHA256)
-	//   [4:8]   attributes (uint32)
-	//   [8:10]  authPolicy size (uint16)
-	//   [10:10+aps]  authPolicy data (variable)
-	//   [10+aps:10+aps+4]  nvIndex (uint32)
-	//
-	// We try multiple strategies because real-world systemd versions have
-	// used different offsets for the NV index within this blob.
+	// TPM2B_NV_PUBLIC structure from systemd v255+. The shared validated
+	// parser (pcrlock.ParseNVIndexFromBlob) handles both the spec-compliant
+	// offset-2 layout and the legacy offset-0 layout, with a pcrlock range
+	// check — identical to the unseal path in token.go.
 	if pcrlockNVData, ok := tokenJSON["tpm2_pcrlock_nv"].(string); ok {
 		if token.PCRLockNV == 0 && pcrlockNVData != "" {
-			nvData, err := base64.StdEncoding.DecodeString(pcrlockNVData)
-			if err == nil && len(nvData) >= 4 {
-				debugLen := 16
-				if debugLen > len(nvData) {
-					debugLen = len(nvData)
-				}
-				buildtags.Debug("luks: NV data hex (first %d bytes): %x\n", debugLen, nvData[:debugLen])
-
-				token.PCRLockNV = parseNVIndexFromPublic(nvData)
-				if token.PCRLockNV != 0 {
-					buildtags.Debug("luks: parsed PCRLockNV: 0x%x\n", token.PCRLockNV)
-				}
+			if idx, err := pcrlock.ParseNVIndexFromBlob(pcrlockNVData); err == nil {
+				token.PCRLockNV = idx
+				buildtags.Debug("luks: parsed PCRLockNV: 0x%x\n", token.PCRLockNV)
+			} else {
+				buildtags.Debug("luks: NV index parse failed: %v\n", err)
 			}
 		}
 	}
@@ -302,55 +280,4 @@ func parseHexUint32(s string) (uint32, error) {
 		return 0, fmt.Errorf("invalid hex length")
 	}
 	return uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3]), nil
-}
-
-// parseNVIndexFromPublic extracts the NV index from a raw TPM2B_NV_PUBLIC blob.
-//
-// TPMS_NV_PUBLIC layout (TPM 2.0 Spec Part 2, §13.6):
-//
-//	[0:2]   TPM2B size (uint16, total size of TPMS_NV_PUBLIC)
-//	[2:6]   NVIndex (TPMI_RH_NV_INDEX, uint32)
-//	[6:8]   nameAlg (TPMI_ALG_HASH, uint16)
-//	[8:12]  attributes (TPMA_NV, uint32)
-//	[12:14] authPolicy size (uint16)
-//	[14:14+aps] authPolicy data (variable)
-//	[14+aps:14+aps+2] dataSize (uint16)
-//
-// The NV index is at offset 2 (right after the TPM2B size prefix) in a
-// spec-compliant blob. We also try offset 0 as a fallback for older systemd
-// versions that omitted the TPM2B wrapping.
-//
-// Each candidate is validated against the owner hierarchy range
-// (0x01000000-0x01FFFFFF) to avoid false positives from unrelated data.
-// Returns 0 if no valid NV index was found.
-func parseNVIndexFromPublic(data []byte) uint32 {
-	if len(data) < 4 {
-		return 0
-	}
-
-	// Strategy 1: Spec-compliant — NVIndex at offset 2 (after TPM2B size)
-	if len(data) >= 6 {
-		nvIndex := uint32(data[2])<<24 | uint32(data[3])<<16 |
-			uint32(data[4])<<8 | uint32(data[5])
-		if isValidNVIndex(nvIndex) {
-			buildtags.Debug("luks: NV index at offset 2: 0x%x\n", nvIndex)
-			return nvIndex
-		}
-	}
-
-	// Strategy 2: NV index at offset 0 (no TPM2B wrapping, older format)
-	nvIndex := uint32(data[0])<<24 | uint32(data[1])<<16 | uint32(data[2])<<8 | uint32(data[3])
-	if isValidNVIndex(nvIndex) {
-		buildtags.Debug("luks: NV index at offset 0: 0x%x\n", nvIndex)
-		return nvIndex
-	}
-
-	return 0
-}
-
-// isValidNVIndex checks whether a uint32 looks like a valid TPM NV index in
-// the owner or platform hierarchy range. pcrlock indexes are in the owner
-// hierarchy range (0x01000000-0x01FFFFFF).
-func isValidNVIndex(idx uint32) bool {
-	return idx&0xFF000000 == 0x01000000
 }

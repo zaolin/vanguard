@@ -135,10 +135,39 @@ func GetRootDevice() (string, string, error) {
 // getRootDevice determines the root device from kernel command line or fstab
 // Returns device path, filesystem type (may be empty), and error
 // Kernel cmdline root= parameter takes precedence over fstab
+// resolveDeviceRef resolves a UUID= or PARTUUID= device reference through
+// the /dev/disk/by-* symlinks (created by 60-vanguard-persistent-disk.rules,
+// populated by udev). Mirrors the resume path's resolver in init/resume.
+// Returns the input unchanged when the reference is not a UUID form.
+// When resolution fails, the raw ref is returned and a debug line is logged
+// so the subsequent mount failure is explainable.
+func resolveDeviceRef(ref string) string {
+	switch {
+	case strings.HasPrefix(ref, "UUID="):
+		uuid := strings.TrimPrefix(ref, "UUID=")
+		link := filepath.Join("/dev/disk/by-uuid", uuid)
+		if target, err := os.Readlink(link); err == nil {
+			return filepath.Join("/dev/disk/by-uuid", target)
+		}
+		console.DebugPrint("vanguard: root=UUID=%s: no /dev/disk/by-uuid link (persistent-disk udev rule may not have run yet)\n", uuid)
+	case strings.HasPrefix(ref, "PARTUUID="):
+		partuuid := strings.ToLower(strings.TrimPrefix(ref, "PARTUUID="))
+		link := filepath.Join("/dev/disk/by-partuuid", partuuid)
+		if target, err := os.Readlink(link); err == nil {
+			return filepath.Join("/dev/disk/by-partuuid", target)
+		}
+		console.DebugPrint("vanguard: root=PARTUUID=%s: no /dev/disk/by-partuuid link (persistent-disk udev rule may not have run yet)\n", partuuid)
+	}
+	return ref
+}
+
 func getRootDevice() (string, string, error) {
 	// Try kernel command line first (takes precedence)
 	device, err := getRootFromCmdline()
 	if err == nil && device != "" {
+		// Resolve UUID=/PARTUUID= references to real device paths via the
+		// /dev/disk/by-* symlinks (requires udev to have settled).
+		device = resolveDeviceRef(device)
 		console.DebugPrint("vanguard: found root in kernel cmdline: %s\n", device)
 		// Try to get filesystem type from fstab for this device
 		fstype := getFstabFSType(device)
@@ -149,6 +178,7 @@ func getRootDevice() (string, string, error) {
 	console.DebugPrint("vanguard: root= not in cmdline, checking /etc/fstab\n")
 	device, fstype, err := fstab.FindRoot("/etc/fstab")
 	if err == nil && device != "" {
+		device = resolveDeviceRef(device)
 		console.DebugPrint("vanguard: found root in /etc/fstab: %s (type: %s)\n", device, fstype)
 		return device, fstype, nil
 	}

@@ -67,7 +67,7 @@ PART="${LOOP}p2"; [ -e "${PART}" ] || PART="${LOOP}p1"
 
 echo -n "${LUKS_PASS}" | systemd-cryptenroll \
     --tpm2-device="swtpm:path=${TPM_SOCKET}" \
-    --wipe-slot=tpm2 --wipe-slot=tpm2 \
+    --wipe-slot=tpm2 \
     --unlock-key-file=/dev/stdin "${PART}"
 
 echo "[INFO] Generating pcrlock policy..."

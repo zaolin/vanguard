@@ -1,23 +1,33 @@
 package recovery
 
-import "testing"
+import (
+	"testing"
+)
 
-func TestAbs(t *testing.T) {
-	tests := []struct {
-		input int64
-		want  int64
-	}{
-		{0, 0},
-		{5, 5},
-		{-5, 5},
-		{100, 100},
-		{-100, 100},
-		{1, 1},
-		{-1, 1},
+// TestAttemptConstants validates the recovery attempt/fail bounds.
+func TestAttemptConstants(t *testing.T) {
+	if MaxHOTPAttempts < 1 {
+		t.Error("MaxHOTPAttempts must be >= 1")
 	}
-	for _, tt := range tests {
-		if got := abs(tt.input); got != tt.want {
-			t.Errorf("abs(%d) = %d, want %d", tt.input, got, tt.want)
-		}
+	if MaxFailCount <= MaxHOTPAttempts {
+		t.Error("MaxFailCount should exceed a single boot's attempt budget")
+	}
+}
+
+// TestFailCountLockBoundary documents the lock threshold: failCount values at
+// or above MaxFailCount must gate recovery.
+func TestFailCountLockBoundary(t *testing.T) {
+	locked := func(failCount uint32) bool { return failCount >= MaxFailCount }
+	if !locked(MaxFailCount) {
+		t.Error("failCount == MaxFailCount must be locked")
+	}
+	if !locked(MaxFailCount + 1) {
+		t.Error("failCount > MaxFailCount must be locked")
+	}
+	if locked(MaxFailCount - 1) {
+		t.Error("failCount just below MaxFailCount must not be locked")
+	}
+	if locked(0) {
+		t.Error("failCount 0 must not be locked")
 	}
 }

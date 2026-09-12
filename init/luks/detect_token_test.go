@@ -3,6 +3,8 @@ package luks
 import (
 	"encoding/base64"
 	"testing"
+
+	"github.com/zaolin/vanguard/internal/pcrlock"
 )
 
 // --- Tests for parseTokenJSON ---
@@ -176,18 +178,17 @@ func TestParseTokenJSON_MissingBlob(t *testing.T) {
 	}
 }
 
-// --- Tests for parseNVIndexFromPublic (already in detect_test.go, but add edge cases) ---
+// --- Tests for the shared blob parser (pcrlock.ParseNVIndexFromBlob) edge cases ---
 
-func TestParseNVIndexFromPublic_BothStrategiesFail(t *testing.T) {
+func TestParseNVIndexFromBlob_BothStrategiesFail(t *testing.T) {
 	// Data that doesn't look like a valid NV index at any offset
 	data := []byte{0x00, 0x00, 0x00, 0x00, 0x00, 0x00}
-	got := parseNVIndexFromPublic(data)
-	if got != 0 {
-		t.Errorf("expected 0 for all-zeros data, got 0x%x", got)
+	if _, err := pcrlock.ParseNVIndexFromBlob(b64Blob(data)); err == nil {
+		t.Error("expected error for all-zeros data")
 	}
 }
 
-func TestParseNVIndexFromPublic_PreferSpecCompliant(t *testing.T) {
+func TestParseNVIndexFromBlob_PreferSpecCompliant(t *testing.T) {
 	// When offset 2 has a valid NV index, it should be preferred over offset 0
 	// even if offset 0 also looks valid
 	data := make([]byte, 8)
@@ -196,7 +197,10 @@ func TestParseNVIndexFromPublic_PreferSpecCompliant(t *testing.T) {
 	// Offset 2: 0x01800002 (valid, different)
 	data[2], data[3], data[4], data[5] = 0x01, 0x80, 0x00, 0x02
 
-	got := parseNVIndexFromPublic(data)
+	got, err := pcrlock.ParseNVIndexFromBlob(b64Blob(data))
+	if err != nil {
+		t.Fatalf("ParseNVIndexFromBlob: %v", err)
+	}
 	if got != 0x01800002 {
 		t.Errorf("expected 0x01800002 (offset 2, spec-compliant), got 0x%x", got)
 	}

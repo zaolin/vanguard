@@ -17,6 +17,66 @@ type LUKSTPMToken struct {
 	HasPCRLock bool   `json:"tpm2_pcrlock,omitempty"`
 }
 
+// minNVIndex/maxNVIndex bound the pcrlock owner-hierarchy NV index range
+// (0x01800000–0x01BFFFFF), plus the legacy default 0x01C20000.
+const (
+	minPcrlockNVIndex = 0x01800000
+	maxPcrlockNVIndex = 0x01BFFFFF
+	legacyPcrlockNV   = 0x01C20000
+)
+
+// IsPcrlockNVIndex reports whether idx falls in the pcrlock owner NV index
+// range (0x01800000–0x01BFFFFF) or the legacy default 0x01C20000. This is
+// the single validator for all pcrlock NV index parsing; vanguard's own
+// recovery indexes (0x01C3000x) are deliberately excluded.
+func IsPcrlockNVIndex(idx uint32) bool {
+	return (idx >= minPcrlockNVIndex && idx <= maxPcrlockNVIndex) || idx == legacyPcrlockNV
+}
+
+// ParseNVIndexFromBlob extracts the NV index from a base64-encoded
+// TPM2B_NV_PUBLIC blob (the tpm2_pcrlock_nv token field, systemd v255+).
+//
+// Layout (TPM 2.0 Spec Part 2, §13.6):
+//
+//	[0:2]   TPM2B size (uint16)
+//	[2:6]   NVIndex (uint32)
+//	[6:8]   nameAlg
+//	[8:12]  attributes
+//	[12:14] authPolicy size
+//	...
+//
+// Real-world systemd versions have used different offsets, so two strategies
+// are tried in order, each validated against the pcrlock NV index range:
+//
+//  1. Spec-compliant: NVIndex at offset 2 (after the TPM2B size prefix)
+//  2. Legacy: NVIndex at offset 0 (older systemd omitted the TPM2B wrapper)
+//
+// Returns 0 and an error when no in-range index can be found. Never returns
+// an unvalidated value — callers rely on this for TPM NV cleanup decisions.
+func ParseNVIndexFromBlob(b64 string) (uint32, error) {
+	data, err := base64.StdEncoding.DecodeString(b64)
+	if err != nil {
+		return 0, fmt.Errorf("failed to decode base64: %w", err)
+	}
+	if len(data) < 4 {
+		return 0, fmt.Errorf("blob too short: %d bytes", len(data))
+	}
+
+	// Strategy 1: spec-compliant TPM2B_NV_PUBLIC — NVIndex at offset 2.
+	if len(data) >= 6 {
+		if idx := binary.BigEndian.Uint32(data[2:6]); IsPcrlockNVIndex(idx) {
+			return idx, nil
+		}
+	}
+
+	// Strategy 2: legacy unwrapped layout — NVIndex at offset 0.
+	if idx := binary.BigEndian.Uint32(data[0:4]); IsPcrlockNVIndex(idx) {
+		return idx, nil
+	}
+
+	return 0, fmt.Errorf("no valid pcrlock NV index found in blob (%d bytes)", len(data))
+}
+
 // GetLUKSTPMToken retrieves the TPM2 token information from a LUKS device
 func GetLUKSTPMToken(devicePath string) (*LUKSTPMToken, error) {
 	cmd := exec.Command("cryptsetup", "luksDump", "--dump-json-metadata", devicePath)
@@ -35,11 +95,14 @@ func GetLUKSTPMToken(devicePath string) (*LUKSTPMToken, error) {
 	// Find systemd-tpm2 token
 	for _, tokenData := range dump.Tokens {
 		var token struct {
-			Type       string `json:"type"`
-			PCRs       []int  `json:"tpm2-pcrs,omitempty"`
-			HasPIN     bool   `json:"tpm2-pin,omitempty"`
-			HasPCRLock bool   `json:"tpm2_pcrlock,omitempty"`
-			PCRLockNV  string `json:"tpm2_pcrlock_nv,omitempty"`
+			Type   string `json:"type"`
+			PCRs   []int  `json:"tpm2-pcrs,omitempty"`
+			HasPIN bool   `json:"tpm2-pin,omitempty"`
+			// systemd uses both hyphen and underscore spellings across
+			// versions — accept both (matches init/luks/token.go).
+			HasPCRLock    bool   `json:"tpm2-pcrlock,omitempty"`
+			HasPCRLockAlt bool   `json:"tpm2_pcrlock,omitempty"`
+			PCRLockNV     string `json:"tpm2_pcrlock_nv,omitempty"`
 		}
 		if err := json.Unmarshal(tokenData, &token); err != nil {
 			continue
@@ -49,7 +112,7 @@ func GetLUKSTPMToken(devicePath string) (*LUKSTPMToken, error) {
 				Type:       token.Type,
 				PCRs:       token.PCRs,
 				HasPIN:     token.HasPIN,
-				HasPCRLock: token.HasPCRLock,
+				HasPCRLock: token.HasPCRLock || token.HasPCRLockAlt,
 			}
 
 			// Extract NV index from tpm2_pcrlock_nv blob if present
@@ -67,23 +130,12 @@ func GetLUKSTPMToken(devicePath string) (*LUKSTPMToken, error) {
 	return nil, fmt.Errorf("no systemd-tpm2 token found on device")
 }
 
-// extractNVIndexFromBlob extracts the NV index from a base64-encoded TPM2B_NV_PUBLIC blob
-// The NV index is stored as a 4-byte big-endian value at the start of the blob
+// extractNVIndexFromBlob extracts the NV index from a base64-encoded
+// TPM2B_NV_PUBLIC blob using the shared validated parser.
 func extractNVIndexFromBlob(b64 string) (int, error) {
-	data, err := base64.StdEncoding.DecodeString(b64)
+	idx, err := ParseNVIndexFromBlob(b64)
 	if err != nil {
-		return 0, fmt.Errorf("failed to decode base64: %w", err)
+		return 0, err
 	}
-
-	// The blob starts with a 2-byte size, then the TPMS_NV_PUBLIC structure
-	// TPMS_NV_PUBLIC starts with TPMI_RH_NV_INDEX (4 bytes, the NV index)
-	// However, systemd stores it slightly differently - the NV index appears
-	// to be at offset 0 as a 4-byte big-endian value
-	if len(data) < 4 {
-		return 0, fmt.Errorf("blob too short")
-	}
-
-	// Read as big-endian 4-byte value
-	nvIndex := binary.BigEndian.Uint32(data[0:4])
-	return int(nvIndex), nil
+	return int(idx), nil
 }

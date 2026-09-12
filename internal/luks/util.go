@@ -25,6 +25,11 @@ import (
 // default sector size
 const storageSectorSize = 512
 
+// maxLuks1HoleOffset bounds the computed luksmeta hole offset (after all
+// keyslot material) read from a LUKS1 header. Real devices place it within
+// a few MiB; anything beyond 1 GiB indicates a corrupt header.
+const maxLuks1HoleOffset = 1 << 24 // 16 MiB
+
 // default number of anti-forensic stripes
 const stripesNum = 4000
 

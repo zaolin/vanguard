@@ -1,0 +1,33 @@
+# Vanguard initramfs: /dev/disk/by-uuid and /dev/disk/by-partuuid symlinks
+# for physical partitions.
+#
+# The standard rule that creates these (60-persistent-storage.rules) is not
+# shipped in the initramfs because it calls external programs (ata_id,
+# scsi_id) that vanguard does not include. This rule uses only the blkid
+# BUILTIN (present in systemd-udevd, no external binary) to import the
+# filesystem/partition identifiers and create the symlinks — matching the
+# symlink lines of 13-dm-disk.rules, which are also builtin-only.
+#
+# Scope: block-device partitions (sd*/nvme*/vd*/mmcblk*) and whole disks
+# with a filesystem (common for ESPs). Device-mapper devices are handled by
+# 13-dm-disk.rules and skipped here.
+
+SUBSYSTEM!="block", GOTO="vg_by_uuid_end"
+KERNEL=="dm-*|loop*|ram*|sr*|fd*|zram*", GOTO="vg_by_uuid_end"
+
+# Import filesystem type/UUID and GPT partition entry via the builtin probe.
+ENV{DEVTYPE}=="partition", \
+  IMPORT{builtin}="blkid"
+
+ENV{DEVTYPE}=="disk", ENV{ID_FS_USAGE}!="", \
+  IMPORT{builtin}="blkid"
+
+# Filesystem UUID symlinks (root=UUID=..., fstab, resume=UUID=...)
+ENV{ID_FS_USAGE}=="filesystem|other|crypto", ENV{ID_FS_UUID_ENC}=="?*", \
+  SYMLINK+="disk/by-uuid/$env{ID_FS_UUID_ENC}"
+
+# GPT partition UUID symlinks (root=PARTUUID=...)
+ENV{ID_PART_ENTRY_UUID}=="?*", \
+  SYMLINK+="disk/by-partuuid/$env{ID_PART_ENTRY_UUID}"
+
+LABEL="vg_by_uuid_end"

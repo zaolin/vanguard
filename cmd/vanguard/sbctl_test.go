@@ -79,61 +79,6 @@ func TestParseSbctlFilesDB(t *testing.T) {
 	}
 }
 
-func TestParseSbctlEnrolledKeysJSON(t *testing.T) {
-	// Simplified sbctl list-enrolled-keys --json structure
-	raw := `{
-		"PK": [{"Subject": {"CommonName": "Platform Key"}, "NotBefore": "2025-07-16T20:01:00Z", "NotAfter": "2030-07-16T20:01:00Z"}],
-		"KEK": [{"Subject": {"CommonName": "Key Exchange Key"}, "NotBefore": "2025-07-16T20:01:01Z", "NotAfter": "2030-07-16T20:01:01Z"}],
-		"DB": [{"Subject": {"CommonName": "Database Key"}, "NotBefore": "2025-07-16T20:01:01Z", "NotAfter": "2030-07-16T20:01:01Z"}]
-	}`
-
-	var raw2 map[string][]map[string]interface{}
-	if err := json.Unmarshal([]byte(raw), &raw2); err != nil {
-		t.Fatalf("unmarshal: %v", err)
-	}
-
-	pk := parseEnrolledKeyList(raw2["PK"])
-	if len(pk) != 1 {
-		t.Fatalf("PK: expected 1 cert, got %d", len(pk))
-	}
-	if pk[0].CommonName != "Platform Key" {
-		t.Errorf("PK CN: got %s", pk[0].CommonName)
-	}
-	if pk[0].NotBefore != "2025-07-16T20:01:00Z" {
-		t.Errorf("PK NotBefore: got %s", pk[0].NotBefore)
-	}
-
-	kek := parseEnrolledKeyList(raw2["KEK"])
-	if len(kek) != 1 || kek[0].CommonName != "Key Exchange Key" {
-		t.Errorf("KEK parsing failed")
-	}
-
-	db := parseEnrolledKeyList(raw2["DB"])
-	if len(db) != 1 || db[0].CommonName != "Database Key" {
-		t.Errorf("DB parsing failed")
-	}
-}
-
-func TestParseEnrolledKeyList_Empty(t *testing.T) {
-	result := parseEnrolledKeyList(nil)
-	if len(result) != 0 {
-		t.Errorf("expected 0 keys for nil input, got %d", len(result))
-	}
-}
-
-func TestParseEnrolledKeyList_MissingCommonName(t *testing.T) {
-	certs := []map[string]interface{}{
-		{"NotBefore": "2025-01-01T00:00:00Z", "NotAfter": "2030-01-01T00:00:00Z"},
-	}
-	result := parseEnrolledKeyList(certs)
-	if len(result) != 1 {
-		t.Fatalf("expected 1 key, got %d", len(result))
-	}
-	if result[0].CommonName != "" {
-		t.Errorf("expected empty CommonName, got %s", result[0].CommonName)
-	}
-}
-
 func TestGetString(t *testing.T) {
 	m := map[string]interface{}{"key": "value", "num": 42}
 	if getString(m, "key") != "value" {

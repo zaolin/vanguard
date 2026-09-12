@@ -125,19 +125,21 @@ func TestParseTokenDetailWithPCRLockNV(t *testing.T) {
 
 func TestParseTokenDetailWithPCRLockNVAlt(t *testing.T) {
 	// Test with base64-encoded NV public (alternative key format)
-	// Build a minimal TPM2B_NV_PUBLIC: size(2) + NVIndex(4) at offset 2
+	// Build a minimal TPM2B_NV_PUBLIC: size(2) + NVIndex(4) at offset 2.
+	// Uses a real pcrlock-range index — recovery indexes (0x01C3000x) are
+	// deliberately rejected by the shared parser.
 	nvBytes := make([]byte, 6)
 	nvBytes[0] = 0x00 // TPM2B size high byte (will be set by actual size)
 	nvBytes[1] = 0x00
-	nvBytes[2] = 0x01 // NV index: 0x01C30010
-	nvBytes[3] = 0xC3
-	nvBytes[4] = 0x00
+	nvBytes[2] = 0x01 // NV index: 0x0193CC10 (pcrlock owner range)
+	nvBytes[3] = 0x93
+	nvBytes[4] = 0xCC
 	nvBytes[5] = 0x10
 	b64 := base64.StdEncoding.EncodeToString(nvBytes)
 	payload := `{"tpm2_pcrlock_nv": "` + b64 + `"}`
 	td := parseTokenDetail([]byte(payload))
-	if td.NVIndex != 0x01C30010 {
-		t.Errorf("NVIndex from alt: got 0x%x, want 0x01C30010", td.NVIndex)
+	if td.NVIndex != 0x0193CC10 {
+		t.Errorf("NVIndex from alt: got 0x%x, want 0x0193CC10", td.NVIndex)
 	}
 }
 
@@ -270,10 +272,10 @@ func TestExtractSeedFromURI(t *testing.T) {
 		uri  string
 		want string
 	}{
-		{"otpauth://totp/Vanguard:recovery?secret=JBSWY3DPEHPK3PXP&issuer=Vanguard", "JBSWY3DPEHPK3PXP"},
-		{"otpauth://totp/Test:test?secret=ABCDEF&issuer=Test", "ABCDEF"},
-		{"otpauth://totp/Test:test?issuer=Test&secret=GHIJKL", "GHIJKL"},
-		{"otpauth://totp/Test:test?secret=", ""},
+		{"otpauth://hotp/Vanguard:recovery?secret=JBSWY3DPEHPK3PXP&issuer=Vanguard", "JBSWY3DPEHPK3PXP"},
+		{"otpauth://hotp/Test:test?secret=ABCDEF&issuer=Test", "ABCDEF"},
+		{"otpauth://hotp/Test:test?issuer=Test&secret=GHIJKL", "GHIJKL"},
+		{"otpauth://hotp/Test:test?secret=", ""},
 		{"no secret here", ""},
 		{"", ""},
 	}

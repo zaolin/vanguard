@@ -100,7 +100,7 @@ flowchart TD
     D --> E{Found?}
     E -->|Yes| F[Use that partition]
     E -->|No| G[/boot not mounted]
-    C --> H[Mount as VFAT rw]
+    C --> H[Mount as VFAT read-only]
     F --> H
 ```
 
@@ -118,7 +118,7 @@ sequenceDiagram
     participant TPM
 
     Init->>udevd: Start daemon with --resolve-names=never
-    Init->>udevd: Write db_persist rule (09-dm-persist.rules)
+    Note over Init,udevd: db_persist rule (09-dm-persist.rules) is baked into the initramfs at generation time
     Init->>Kernel: Load modules from /lib/modules
     Init->>udevd: Trigger events
     udevd->>Kernel: Request firmware
@@ -176,8 +176,8 @@ flowchart TD
     A[pvscan --cache] --> B[vgscan]
     B --> C[vgchange -ay]
     C --> D[vgmknodes]
-    D --> E[dmsetup mknodes]
-    E --> F[Create /dev/vg/lv symlinks from lvs output]
+    D --> E[Create /dev/vg/lv symlinks from lvs output]
+    E --> F[dmsetup mknodes]
     F --> G[Wait for device nodes with retry]
     G --> H[Verify volume accessibility]
 ```
@@ -313,20 +313,31 @@ flowchart TD
         D[LUKS unlock fails after 3 passphrase attempts]
         E[Root device not found]
         F[Root mount fails]
-        G[No init found on root]
+        G[No init on root → rescue shell, then HALT]
+        H[PCR 7 all-zeros with pcrlock active → refuse unseal, HALT]
     end
     
     subgraph warn["Warnings → Continue"]
-        H[/boot mount fails]
-        I[LVM activation fails]
-        J[fsck fails]
-        K[Vconsole config fails]
-        L[Resume fails]
-        M[PCRLock setup fails]
-        N[Non-root FS mount fails]
-        O[LVM symlink creation fails]
+        I[/boot mount fails]
+        J[LVM activation fails]
+        K[fsck fails]
+        L[Vconsole config fails]
+        M[Resume fails]
+        N[PCRLock setup fails]
+        O[Non-root FS mount fails]
+        P[LVM symlink creation fails]
     end
 ```
+
+**Step 10a hard stop:** when the pcrlock policy is active and the TPM reports
+PCR 7 as all zeros (or the PCR 7 read fails), init refuses to attempt unseal
+and halts. PCR 7 all-zeros means Secure Boot state is not measured — the
+enforced boot chain cannot be verified, and an unseal attempt would leak PIN
+attempts against an unverifiable platform state.
+
+**No init found:** if none of the candidate init paths exist on the mounted
+root, init drops to a rescue shell (`/bin/sh` on the root filesystem) for
+manual repair; exiting the shell halts.
 
 ## Boot Logging
 
@@ -357,7 +368,7 @@ Vanguard produces 2 init binaries via Go build tags from the same source:
 
 | Build Tags | Binary | Output | Passphrase Fallback |
 |------------|--------|--------|:---:|
-| (none) | `init` | Minimal | TOTP only |
-| `debug` | `init-debug` | Verbose | TOTP only |
+| (none) | `init` | Minimal | HOTP only |
+| `debug` | `init-debug` | Verbose | HOTP only |
 
-Strict mode is always-on. Passphrase fallback requires TOTP recovery (no `-s` flag needed).
+Strict mode is always-on. Passphrase fallback requires HOTP recovery (no `-s` flag needed).

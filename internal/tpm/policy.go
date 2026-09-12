@@ -450,10 +450,10 @@ func ParsePCRLockJSON(data []byte) (*PCRLockPolicy, error) {
 	return policy, nil
 }
 
-// --- TOTP Recovery Seed Policy ---
+// --- HOTP Recovery Seed Policy ---
 
 // SeedReadPolicyPCRs defines the PCR sets for each branch of the PolicyOR
-// that protects the TOTP recovery seed. All branches require PCR 7 (Secure
+// that protects the HOTP recovery seed. All branches require PCR 7 (Secure
 // Boot state) — without Secure Boot, the initrd cannot be trusted and the
 // seed is never released.
 //
@@ -472,7 +472,7 @@ var SeedReadPolicyPCRs = [][]int{
 	{7}, // Single branch: Secure Boot state
 }
 
-// computeSeedReadPolicy computes the authPolicy for the TOTP recovery seed
+// computeSeedReadPolicy computes the authPolicy for the HOTP recovery seed
 // NV index. With the single-branch policy (PCR 7 only), the authPolicy is
 // just the PolicyPCR digest — no PolicyOR is needed (the TPM requires at
 // least 2 branches for PolicyOR).

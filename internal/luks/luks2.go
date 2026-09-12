@@ -60,20 +60,24 @@ func initV2Device(path string, f *os.File) (*deviceV2, error) {
 	var hdr headerV2
 
 	if _, err := f.Seek(0, 0); err != nil {
+		f.Close()
 		return nil, err
 	}
 	if err := binary.Read(f, binary.BigEndian, &hdr); err != nil {
+		f.Close()
 		return nil, err
 	}
 
 	hdrSize := hdr.HeaderSize // size of header + JSON metadata
 	if !isPowerOfTwo(uint(hdrSize)) || hdrSize < 16384 || hdrSize > 4194304 {
+		f.Close()
 		return nil, fmt.Errorf("Invalid size of LUKS header: %v", hdrSize)
 	}
 
 	// read the whole header
 	data := make([]byte, hdrSize)
 	if _, err := f.ReadAt(data, 0); err != nil {
+		f.Close()
 		return nil, err
 	}
 
@@ -89,6 +93,7 @@ func initV2Device(path string, f *os.File) (*deviceV2, error) {
 	case "sha256":
 		h = sha256.New()
 	default:
+		f.Close()
 		return nil, fmt.Errorf("Unknown header checksum algorithm: %v", algo)
 	}
 
@@ -97,6 +102,7 @@ func initV2Device(path string, f *os.File) (*deviceV2, error) {
 	checksum := h.Sum(make([]byte, 0))
 	expectedChecksum := hdr.Checksum[:h.Size()]
 	if !bytes.Equal(checksum, expectedChecksum) {
+		f.Close()
 		return nil, fmt.Errorf("Invalid header checksum")
 	}
 
@@ -106,11 +112,13 @@ func initV2Device(path string, f *os.File) (*deviceV2, error) {
 	// If no NUL is found, the header is malformed — reject rather than panic.
 	nulIdx := bytes.IndexByte(jsonData, 0)
 	if nulIdx < 0 {
+		f.Close()
 		return nil, fmt.Errorf("LUKS2 JSON region has no NUL terminator — malformed header")
 	}
 	jsonData = jsonData[:nulIdx]
 
 	if err := json.Unmarshal(jsonData, &meta); err != nil {
+		f.Close()
 		return nil, err
 	}
 
@@ -241,6 +249,15 @@ func (d *deviceV2) UnsealVolume(keyslotIdx int, passphrase []byte) (*Volume, err
 		keyslot.Kdf.Salt, keyslot.Area.KeySize, keyslot.Area.Encryption,
 		keyslot.Area.Offset, keyslot.Af.Hash)
 
+	// Validate the AF key size before deriving: Area.KeySize comes straight
+	// from the JSON header and feeds argon2's keyLen — an unvalidated value
+	// (e.g. key_size=4000000000 from a corrupt header) allocates gigabytes
+	// before any passphrase check. LUKS2 master keys are 32/64/128 bytes.
+	const maxAreaKeySize = 128
+	if keyslot.Area.KeySize == 0 || keyslot.Area.KeySize > maxAreaKeySize {
+		return nil, fmt.Errorf("keyslot %d: invalid key area key_size %d (max %d) — header may be corrupt", keyslotIdx, keyslot.Area.KeySize, maxAreaKeySize)
+	}
+
 	afKey, err := deriveLuks2AfKey(keyslot.Kdf, keyslotIdx, passphrase, keyslot.Area.KeySize)
 	if err != nil {
 		return nil, err
@@ -291,6 +308,14 @@ func (d *deviceV2) UnsealVolume(keyslotIdx int, passphrase []byte) (*Volume, err
 	}
 
 	storageSegment := d.meta.Segments[int(seg)]
+	// Validate sector_size before the Volume reaches SetupMapper: a missing
+	// or out-of-range value passes through as 0 and StorageSize % 0 panics
+	// PID 1 at boot. LUKS2 mandates 512 or 4096.
+	switch storageSegment.SectorSize {
+	case 512, 4096:
+	default:
+		return nil, fmt.Errorf("LUKS2 segment %d: invalid sector_size %d (must be 512 or 4096) — header may be corrupt", seg, storageSegment.SectorSize)
+	}
 	offset, err := storageSegment.Offset.Int64()
 	if err != nil {
 		return nil, err

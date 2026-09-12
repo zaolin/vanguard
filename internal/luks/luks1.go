@@ -148,7 +148,10 @@ func (d *deviceV1) UnsealVolume(keyslotIdx int, passphrase []byte) (*Volume, err
 		return nil, fmt.Errorf("Unknown hash spec algorithm: %v", algo)
 	}
 
-	afKey := deriveLuks1AfKey(passphrase, slot, int(d.hdr.KeyBytes), h)
+	afKey, err := deriveLuks1AfKey(passphrase, slot, int(d.hdr.KeyBytes), h)
+	if err != nil {
+		return nil, fmt.Errorf("keyslot %d: %w", keyslotIdx, err)
+	}
 	defer clearSlice(afKey)
 
 	finalKey, err := d.decryptLuks1VolumeKey(keyslotIdx, slot, afKey, h)
@@ -271,17 +274,23 @@ func (d *deviceV1) Tokens() ([]Token, error) {
 	var hdr luksMetaHeader
 	data := make([]byte, unsafe.Sizeof(hdr))
 
-	var holeOffset int
-	length := int(d.hdr.KeyBytes * stripesNum)
+	// Compute the luksmeta "hole" offset after the keyslot material. All
+	// arithmetic in 64-bit: KeyMaterialOffset is a raw uint32 from disk and
+	// *512 overflows uint32 for crafted values.
+	var holeOffset int64
+	length := int64(d.hdr.KeyBytes) * int64(stripesNum)
 	for _, s := range d.hdr.KeySlots {
-		offset := int(s.KeyMaterialOffset * storageSectorSize)
+		offset := int64(s.KeyMaterialOffset) * int64(storageSectorSize)
 		if holeOffset < offset+length {
 			holeOffset = offset + length
 		}
 	}
-	holeOffset = roundUp(holeOffset, 4096)
+	if holeOffset < 0 || holeOffset > maxLuks1HoleOffset {
+		return nil, fmt.Errorf("LUKS1 luksmeta hole offset out of range (%d) — header may be corrupt", holeOffset)
+	}
+	holeOffset = int64(roundUp(int(holeOffset), 4096))
 
-	if _, err := d.f.ReadAt(data, int64(holeOffset)); err != nil {
+	if _, err := d.f.ReadAt(data, holeOffset); err != nil {
 		return nil, err
 	}
 	if err := binary.Read(bytes.NewReader(data), binary.BigEndian, &hdr); err != nil {
@@ -305,8 +314,15 @@ func (d *deviceV1) Tokens() ([]Token, error) {
 
 	for i, s := range hdr.Slots {
 		if !bytes.Equal(s.UUID[:], luksMetaNullUUID) {
+			// Bound the token payload: s.Length is a raw uint32 from the
+			// (unauthenticated) luksmeta header — an unbounded make would
+			// allow a 4GiB OOM from a corrupt header.
+			const maxTokenPayload = 1 << 20 // 1 MiB
+			if s.Length == 0 || s.Length > maxTokenPayload {
+				return nil, fmt.Errorf("Luks Meta token #%d: invalid payload length %d", i, s.Length)
+			}
 			payload := make([]byte, s.Length)
-			if _, err := d.f.ReadAt(payload, int64(holeOffset)+int64(s.Offset)); err != nil {
+			if _, err := d.f.ReadAt(payload, holeOffset+int64(s.Offset)); err != nil {
 				return nil, err
 			}
 			tokenChecksum := crc32.New(crc32.MakeTable(crc32.Castagnoli))
@@ -340,12 +356,17 @@ func luksMetaTokenType(uuid []byte) string {
 	return ""
 }
 
-func deriveLuks1AfKey(passphrase []byte, slot keySlot, keySize int, h func() hash.Hash) []byte {
-	// Bound iterations to prevent CPU DoS from a crafted header
-	const maxIterations = 10_000_000 // 10M (cryptsetup default is ~1000-10000)
+func deriveLuks1AfKey(passphrase []byte, slot keySlot, keySize int, h func() hash.Hash) ([]byte, error) {
+	// Refuse absurd iteration counts instead of capping: capping changes the
+	// KDF output, which guarantees the master-key digest check fails — the
+	// user would type a correct passphrase and see "wrong passphrase" on
+	// every attempt (fail-closed boot failure that looks like data loss).
+	// 10M PBKDF2-SHA1 iterations is ~2x cryptsetup's historical maximum;
+	// real headers stay orders of magnitude below.
+	const maxIterations = 10_000_000
 	iterations := int(slot.Iterations)
-	if iterations > maxIterations {
-		iterations = maxIterations // cap rather than refuse — the boot should proceed
+	if iterations <= 0 || iterations > maxIterations {
+		return nil, fmt.Errorf("LUKS1 keyslot iteration count out of range (%d, max %d) — header may be corrupt", slot.Iterations, maxIterations)
 	}
-	return pbkdf2.Key(passphrase, slot.Salt[:], iterations, keySize, h)
+	return pbkdf2.Key(passphrase, slot.Salt[:], iterations, keySize, h), nil
 }

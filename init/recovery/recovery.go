@@ -1,73 +1,59 @@
-// Package recovery implements TOTP-based boot recovery for Vanguard.
+// Package recovery implements HOTP-based boot recovery for Vanguard.
 // When the TPM2 unseal fails in strict mode, the user can enter a
-// TOTP code from their authenticator app to authorize passphrase
-// fallback for this boot only.
+// counter-based one-time code from their authenticator app to authorize
+// passphrase fallback for this boot only.
+//
+// HOTP (RFC 4226) is used instead of TOTP (RFC 6238) because the initramfs
+// has no trustworthy clock: the RTC may be reset (dead CMOS battery,
+// firmware update) and there is no network for NTP. HOTP validates against
+// a counter persisted in TPM NVRAM, so it is immune to clock drift.
 package recovery
 
 import (
 	"fmt"
-	"time"
 
 	"github.com/zaolin/vanguard/init/buildtags"
 	"github.com/zaolin/vanguard/init/console"
-	"github.com/zaolin/vanguard/internal/totp"
+	"github.com/zaolin/vanguard/internal/hotp"
 	intpm "github.com/zaolin/vanguard/internal/tpm"
 )
 
-// MaxTOTPAttempts is the maximum number of TOTP code attempts before halting.
-const MaxTOTPAttempts = 3
+// MaxHOTPAttempts is the maximum number of HOTP code attempts per boot.
+const MaxHOTPAttempts = 3
 
-// RTCDriftThreshold is the maximum allowed difference between the RTC
-// and the reference timestamp before we switch to drift-tolerant skew.
-// 300 seconds = 5 minutes.
-const RTCDriftThreshold = 300
+// MaxFailCount caps the lifetime number of failed HOTP attempts. Once the
+// persisted fail counter reaches this value, recovery refuses further codes
+// (even a correct one) until the counter is reset by a successful disk
+// unlock. This bounds cross-boot online guessing: without it, an attacker
+// could reboot indefinitely and get MaxHOTPAttempts fresh guesses each boot.
+const MaxFailCount = 10
 
 // LogFunc is a callback for boot logging, set by the caller.
 var LogFunc func(event string, kvPairs ...string) = func(event string, kvPairs ...string) {}
 
-// TryTOTP attempts TOTP-based recovery when TPM unseal fails in strict mode.
-// It reads the TOTP seed from TPM NVRAM, prompts the user for a 6-digit code,
-// and validates it. If successful, the caller should enable passphrase fallback.
+// TryHOTP attempts HOTP-based recovery when TPM unseal fails in strict mode.
+// It reads the HOTP seed and counter from TPM NVRAM, prompts the user for a
+// 8-digit code, validates it against the counter lookahead window, and on
+// success advances the stored counter past the matched position so the code
+// can never be reused.
 //
-// Returns true if recovery succeeded (passphrase fallback should be enabled),
-// false if recovery is not configured or all attempts failed.
-func TryTOTP(tpmClient *intpm.Client, devicePath string) bool {
-	// 1. Check if recovery NV index exists
+// Returns true if recovery succeeded (passphrase fallback should be enabled).
+func TryHOTP(tpmClient *intpm.Client, devicePath string) bool {
+	// 1. Check if recovery is provisioned (seed index exists).
 	if !tpmClient.RecoveryNVExists(intpm.DefaultRecoverySeedNVIndex) {
-		buildtags.Debug("recovery: no TOTP recovery configured (NV index not found)\n")
+		buildtags.Debug("recovery: no HOTP recovery configured (seed NV index not found)\n")
 		return false
 	}
 
-	// 2. Read seed + reference timestamp + enrollment branch digest
-	// The seed is read via a policy session that requires the current PCR 7
-	// value to match the anti-evil-maid policy (Secure Boot state). If the
-	// system was booted from a live USB or the initrd was tampered with,
-	// the PCR 7 value won't match and the read will fail.
+	// 2. Read the seed (PCR 7-bound) and the counter/fail state (owner auth).
 	var seed []byte
-	var refTimestamp int64
-	seed, refTimestamp, _, err := tpmClient.ReadRecoveryData(intpm.DefaultRecoverySeedNVIndex)
+	var counter uint64
+	var failCount uint32
+	seed, counter, failCount, err := tpmClient.ReadRecoveryData(intpm.DefaultRecoverySeedNVIndex)
 	if err != nil {
-		// ReadRecoveryData failed. Check if it's because the timestamp NV
-		// index is missing (e.g., from a previous failed auto-reseed).
-		// If so, try reading the seed without the timestamp.
-		if !tpmClient.TimestampNVExists() {
-			buildtags.Debug("recovery: timestamp NV index missing, trying seed-only read\n")
-			seed, err = tpmClient.ReadSeedOnly(intpm.DefaultRecoverySeedNVIndex)
-			if err != nil {
-				console.Print("recovery: failed to read TOTP seed from TPM: %v\n", err)
-				LogFunc("RECOVERY_READ_FAIL", "device", devicePath, "error", err.Error())
-				return false
-			}
-			// No reference timestamp available — use current time as reference
-			// with wide skew. This is safe because the TOTP seed is TPM-protected.
-			refTimestamp = time.Now().Unix()
-			console.Print("recovery: WARNING: timestamp NV index missing, using current time as reference\n")
-			LogFunc("RECOVERY_TIMESTAMP_MISSING", "device", devicePath)
-		} else {
-			console.Print("recovery: failed to read TOTP seed from TPM: %v\n", err)
-			LogFunc("RECOVERY_READ_FAIL", "device", devicePath, "error", err.Error())
-			return false
-		}
+		console.Print("recovery: failed to read HOTP recovery data from TPM: %v\n", err)
+		LogFunc("RECOVERY_READ_FAIL", "device", devicePath, "error", err.Error())
+		return false
 	}
 	// Zero the seed after use to reduce cold-boot extraction window
 	defer func() {
@@ -76,71 +62,84 @@ func TryTOTP(tpmClient *intpm.Client, devicePath string) bool {
 		}
 	}()
 
-	// 3. Check RTC sanity
-	now := time.Now()
-	refTime := time.Unix(refTimestamp, 0)
-	rtcDrifted := abs(now.Unix()-refTimestamp) > RTCDriftThreshold
-	if rtcDrifted {
-		console.Print("recovery: WARNING: clock may be wrong (ref=%d, rtc=%d)\n",
-			refTimestamp, now.Unix())
-		console.Print("recovery: Enter the current TOTP code from your authenticator app.\n")
-		console.Print("recovery: If your code is rejected, the system clock may need resetting after boot.\n")
-		LogFunc("RECOVERY_RTC_DRIFT", "device", devicePath,
-			"ref", fmt.Sprintf("%d", refTimestamp), "rtc", fmt.Sprintf("%d", now.Unix()))
+	// 3. Refuse if the persistent fail cap is reached. A successful disk
+	// unlock resets the counter; until then, offline attackers cannot gain
+	// fresh guesses by rebooting.
+	if failCount >= MaxFailCount {
+		console.Print("recovery: recovery is locked after %d failed attempts\n", failCount)
+		console.Print("recovery: the failure counter resets automatically after a successful\n")
+		console.Print("recovery: disk unlock; otherwise boot a live USB to unlock with your passphrase\n")
+		LogFunc("RECOVERY_LOCKED", "device", devicePath, "fail_count", fmt.Sprintf("%d", failCount))
+		return false
 	}
 
-	// 4. Prompt for TOTP code (up to MaxTOTPAttempts)
-	for attempt := 1; attempt <= MaxTOTPAttempts; attempt++ {
+	// 4. Prompt for the code (up to MaxHOTPAttempts this boot).
+	for attempt := 1; attempt <= MaxHOTPAttempts; attempt++ {
 		console.Print("\n")
-		console.Print("vanguard: TPM unlock failed. Enter recovery TOTP code (attempt %d of %d):\n",
-			attempt, MaxTOTPAttempts)
+		console.Print("vanguard: TPM unlock failed. Enter recovery HOTP code (attempt %d of %d):\n",
+			attempt, MaxHOTPAttempts)
 
-		// Read the code from console (echo disabled for security)
 		code, err := console.ReadPassword("Recovery code: ")
 		if err != nil {
 			console.Print("recovery: failed to read code: %v\n", err)
 			return false
 		}
 
-		// 5. Validate TOTP
-		// When RTC is correct, use normal skew (±90s).
-		// When RTC has drifted, also try the reference timestamp with
-		// wide skew (±24h) — the user's authenticator app uses real
-		// current time, which should be within ±24h of the last boot.
-		var valid bool
-		if rtcDrifted {
-			valid = totp.ValidateWithDrift(code, seed, now, uint(totp.DriftSkew), refTime)
-		} else {
-			valid = totp.Validate(code, seed, now, uint(totp.DefaultSkew))
-		}
-
-		if valid {
-			console.Print("recovery: TOTP code accepted — passphrase fallback enabled for this boot\n")
-			LogFunc("RECOVERY_TOTP", "device", devicePath, "status", "ok")
-
-			// 6. Update reference timestamp for next boot
-			if err := tpmClient.UpdateRecoveryTimestamp(now.Unix()); err != nil {
-				buildtags.Debug("recovery: warning: failed to update reference timestamp: %v\n", err)
+		matched, ok := hotp.Validate(code, seed, counter, hotp.Lookahead)
+		console.ZeroString(&code)
+		if ok {
+			// Advance the counter past the matched position so this code
+			// (and every earlier one) is consumed, then clear the fail
+			// count.
+			if err := tpmClient.WriteRecoveryState(matched+1, 0); err != nil {
+				// The code was valid; failing to persist the counter means
+				// the same code could be replayed next boot, but recovery
+				// itself should still proceed.
+				buildtags.Debug("recovery: warning: failed to persist counter: %v\n", err)
+				LogFunc("RECOVERY_COUNTER_PERSIST_FAIL", "device", devicePath, "error", err.Error())
 			}
-
+			console.Print("recovery: HOTP code accepted — passphrase fallback enabled for this boot\n")
+			LogFunc("RECOVERY_HOTP", "device", devicePath, "status", "ok")
 			return true
 		}
 
-		console.Print("recovery: invalid TOTP code\n")
-		LogFunc("RECOVERY_TOTP_FAIL", "device", devicePath,
-			"attempt", fmt.Sprintf("%d", attempt))
+		failCount++
+		// Persist the incremented fail count (best effort — never block recovery).
+		if werr := tpmClient.WriteRecoveryState(counter, failCount); werr != nil {
+			buildtags.Debug("recovery: warning: failed to persist fail count: %v\n", werr)
+		}
+		console.Print("recovery: invalid HOTP code\n")
+		LogFunc("RECOVERY_HOTP_FAIL", "device", devicePath,
+			"attempt", fmt.Sprintf("%d", attempt), "fail_count", fmt.Sprintf("%d", failCount))
+
+		if failCount >= MaxFailCount {
+			console.Print("recovery: failure cap reached (%d) — recovery is now locked until a successful unlock\n", MaxFailCount)
+			LogFunc("RECOVERY_LOCKED", "device", devicePath, "fail_count", fmt.Sprintf("%d", failCount))
+			return false
+		}
 	}
 
-	console.Print("recovery: too many failed TOTP attempts\n")
-	console.Print("recovery: if your system clock is wrong, boot a live USB and run:\n")
-	console.Print("recovery:   sudo timedatectl set-ntp true\n")
-	console.Print("recovery:   sudo hwclock --systohc\n")
+	console.Print("recovery: too many failed HOTP attempts this boot\n")
 	return false
 }
 
-func abs(x int64) int64 {
-	if x < 0 {
-		return -x
+// ResetFailCount clears the persisted failure counter. Called after a
+// successful disk unlock so a legitimate user's earlier typos do not count
+// against future recovery attempts. Best-effort.
+func ResetFailCount(tpmClient *intpm.Client) {
+	if !tpmClient.StateNVExists() {
+		return
 	}
-	return x
+	counter, failCount, err := tpmClient.ReadRecoveryState()
+	if err != nil {
+		return
+	}
+	if failCount == 0 {
+		return
+	}
+	if err := tpmClient.WriteRecoveryState(counter, 0); err != nil {
+		buildtags.Debug("recovery: warning: failed to reset fail count: %v\n", err)
+		return
+	}
+	LogFunc("RECOVERY_FAILCOUNT_RESET", "status", "ok")
 }

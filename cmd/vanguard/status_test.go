@@ -546,80 +546,6 @@ func TestBuildBruteForceVector_TokenNoPin(t *testing.T) {
 	}
 }
 
-func TestCollapseDetail_EvilMaid(t *testing.T) {
-	v := &threatVector{
-		Name: "Evil Maid (initrd/UKI replacement)",
-		Mitigations: []mitigation{
-			{Name: "Secure Boot", Status: "ok", Detail: "enabled, custom keys"},
-			{Name: "PCRLock PCR 7", Status: "ok", Detail: "bound"},
-		},
-	}
-	detail := collapseDetail(v)
-	if detail != "Secure Boot + PCR 7" {
-		t.Errorf("collapseDetail: got %q, want %q", detail, "Secure Boot + PCR 7")
-	}
-}
-
-func TestCollapseDetail_BootChainTampering(t *testing.T) {
-	v := &threatVector{
-		Name: "Boot Chain Tampering (firmware/UKI change)",
-		Mitigations: []mitigation{
-			{Name: "PCRLock PCR binding", Status: "ok", Detail: "6 PCRs bound, all match"},
-		},
-	}
-	detail := collapseDetail(v)
-	if detail != "6 PCRs bound, all match" {
-		t.Errorf("collapseDetail: got %q, want %q", detail, "6 PCRs bound, all match")
-	}
-}
-
-func TestCollapseDetail_TPMKeyExtraction(t *testing.T) {
-	v := &threatVector{
-		Name: "TPM Key Extraction (bus sniffing)",
-		Mitigations: []mitigation{
-			{Name: "TPM bus encryption", Status: "ok"},
-			{Name: "Dictionary attack lockout", Status: "ok"},
-		},
-	}
-	detail := collapseDetail(v)
-	if detail != "bus encryption + DA lockout ok" {
-		t.Errorf("collapseDetail: got %q, want %q", detail, "bus encryption + DA lockout ok")
-	}
-}
-
-func TestCollapseDetail_BruteForce(t *testing.T) {
-	v := &threatVector{
-		Name: "Brute-Force / Key Theft (LUKS)",
-		Mitigations: []mitigation{
-			{Name: "TPM2 token", Status: "ok"},
-			{Name: "PIN", Status: "ok"},
-			{Name: "TOTP fallback", Status: "ok"},
-		},
-	}
-	detail := collapseDetail(v)
-	if detail != "TPM2 token + PIN + TOTP" {
-		t.Errorf("collapseDetail: got %q, want %q", detail, "TPM2 token + PIN + TOTP fallback")
-	}
-}
-
-func TestCollapseDetail_ColdBoot_Empty(t *testing.T) {
-	v := &threatVector{
-		Name: "Cold Boot Attack (RAM dump)",
-	}
-	detail := collapseDetail(v)
-	if detail != "" {
-		t.Errorf("Cold Boot collapseDetail should be empty, got %q", detail)
-	}
-}
-
-func TestCollapseDetail_UnknownVector(t *testing.T) {
-	v := &threatVector{Name: "Unknown Attack"}
-	detail := collapseDetail(v)
-	if detail != "" {
-		t.Errorf("unknown vector collapseDetail should be empty, got %q", detail)
-	}
-}
-
 func TestComputeTier_SbctlUnsignedBootCapsWarning(t *testing.T) {
 	unsigned := false
 	data := &statusData{
@@ -645,6 +571,7 @@ func TestComputeTier_SbctlUnsignedBootCapsWarning(t *testing.T) {
 			ModuleSigs:       "enforced",
 		},
 	}
+	data.ThreatModel = buildThreatModel(data)
 	computeTier(data)
 	if data.Tier != "CRITICAL" {
 		t.Errorf("unsigned booted UKI → should be CRITICAL (evil maid vector), got %s", data.Tier)
@@ -677,6 +604,7 @@ func TestComputeTier_SbctlSignedBootNoCap(t *testing.T) {
 		},
 		Recovery: &recoveryInfo{Enabled: true},
 	}
+	data.ThreatModel = buildThreatModel(data)
 	computeTier(data)
 	// Without fwupd, physical vectors have info mitigations → HIGH (not PHYSICAL)
 	if data.Tier != "HIGH" {
@@ -710,6 +638,7 @@ func TestComputeTier_SbctlUnknownNoCap(t *testing.T) {
 		},
 		Recovery: &recoveryInfo{Enabled: true},
 	}
+	data.ThreatModel = buildThreatModel(data)
 	computeTier(data)
 	// Without fwupd, physical vectors have info mitigations → HIGH (not PHYSICAL)
 	if data.Tier != "HIGH" {
@@ -757,6 +686,7 @@ func TestComputeTier_PhysicalWithFwupd(t *testing.T) {
 		},
 		Recovery: &recoveryInfo{Enabled: true},
 	}
+	data.ThreatModel = buildThreatModel(data)
 	computeTier(data)
 	if data.Tier != "PHYSICAL" {
 		t.Errorf("all physical checks pass with fwupd → should be PHYSICAL, got %s", data.Tier)
@@ -803,6 +733,7 @@ func TestComputeTier_PhysicalToHighWhenPSBNotEnabled(t *testing.T) {
 		},
 		Recovery: &recoveryInfo{Enabled: true},
 	}
+	data.ThreatModel = buildThreatModel(data)
 	computeTier(data)
 	if data.Tier != "HIGH" {
 		t.Errorf("PSB not-enabled → should downgrade PHYSICAL to HIGH, got %s", data.Tier)
@@ -838,6 +769,7 @@ func TestComputeTier_CriticalWhenDebugNotLocked(t *testing.T) {
 			},
 		},
 	}
+	data.ThreatModel = buildThreatModel(data)
 	computeTier(data)
 	if data.Tier != "CRITICAL" {
 		t.Errorf("debug not locked → should be CRITICAL, got %s", data.Tier)
@@ -1053,80 +985,7 @@ func TestBuildEvilMaidVector_PlatformNotFused(t *testing.T) {
 	}
 }
 
-func TestCollapseDetail_PhysicalDebug(t *testing.T) {
-	v := &threatVector{
-		Name: "Physical Debug Attack (JTAG/DCI)",
-		Mitigations: []mitigation{
-			{Name: "Debug interface locked", Status: "ok"},
-			{Name: "Fused part", Status: "ok"},
-		},
-	}
-	detail := collapseDetail(v)
-	if detail != "debug locked + fused" {
-		t.Errorf("collapseDetail: got %q, want %q", detail, "debug locked + fused")
-	}
-}
-
-func TestCollapseDetail_FirmwareTampering(t *testing.T) {
-	v := &threatVector{
-		Name: "Firmware Tampering (SPI flash/replay/downgrade)",
-		Mitigations: []mitigation{
-			{Name: "SPI Write Protection", Status: "ok"},
-			{Name: "SPI Replay Protection", Status: "ok"},
-			{Name: "Anti-Rollback Protection", Status: "ok"},
-		},
-	}
-	detail := collapseDetail(v)
-	if detail != "SPI write + SPI replay + rollback" {
-		t.Errorf("collapseDetail: got %q, want %q", detail, "SPI write + SPI replay + rollback")
-	}
-}
-
-func TestCollapseDetail_SMMAttack(t *testing.T) {
-	v := &threatVector{
-		Name: "SMM Attack (ring -2 rootkit)",
-		Mitigations: []mitigation{
-			{Name: "SMM Locked", Status: "ok"},
-		},
-	}
-	detail := collapseDetail(v)
-	if detail != "locked" {
-		t.Errorf("collapseDetail: got %q, want %q", detail, "locked")
-	}
-}
-
-func TestCollapseDetail_DMAWithPreboot(t *testing.T) {
-	v := &threatVector{
-		Name: "DMA Attack (Thunderbolt/PCIe)",
-		Mitigations: []mitigation{
-			{Name: "IOMMU/DMA", Status: "ok", Detail: "29 groups, pt"},
-			{Name: "Pre-boot DMA protection", Status: "ok"},
-		},
-	}
-	detail := collapseDetail(v)
-	if detail != "IOMMU + pre-boot DMA" {
-		t.Errorf("collapseDetail: got %q, want %q", detail, "IOMMU + pre-boot DMA")
-	}
-}
-
-func TestCollapseDetail_KernelRuntimeWithCETSMAP(t *testing.T) {
-	v := &threatVector{
-		Name: "Kernel Runtime Attack (module/rootkit)",
-		Mitigations: []mitigation{
-			{Name: "Kernel lockdown", Status: "ok", Detail: "confidentiality (strictest)"},
-			{Name: "Module signatures", Status: "ok"},
-			{Name: "CET Shadow Stack", Status: "ok"},
-			{Name: "SMAP", Status: "ok"},
-		},
-	}
-	detail := collapseDetail(v)
-	// Should include lockdown, module sigs, CET, SMAP
-	if detail == "" {
-		t.Error("collapseDetail should not be empty")
-	}
-}
-
-func TestCollapseDetail_TPMWithFtpm(t *testing.T) {
+func TestVectorStatus_TPMWithFtpm(t *testing.T) {
 	v := &threatVector{
 		Name: "TPM Key Extraction (bus sniffing)",
 		Mitigations: []mitigation{
@@ -1135,8 +994,10 @@ func TestCollapseDetail_TPMWithFtpm(t *testing.T) {
 			{Name: "Dictionary attack lockout", Status: "ok"},
 		},
 	}
-	detail := collapseDetail(v)
-	if detail != "fTPM + bus encryption + DA lockout ok" {
-		t.Errorf("collapseDetail: got %q, want %q", detail, "fTPM + bus encryption + DA lockout ok")
+	if status := vectorStatus(v); status != "ok" {
+		t.Errorf("vectorStatus: got %q, want ok", status)
+	}
+	if !vectorIsCollapsed(v) {
+		t.Error("vectorIsCollapsed should be true when all mitigations are ok")
 	}
 }
