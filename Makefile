@@ -14,11 +14,11 @@ build: embed
 embed: cmd/vanguard/embed/init cmd/vanguard/embed/init-debug
 
 # Release init binary (minimal output, strict mode)
-cmd/vanguard/embed/init: $(wildcard init/*.go) $(wildcard init/**/*.go) $(wildcard internal/luks/*.go) $(wildcard internal/tpm/*.go)
+cmd/vanguard/embed/init: $(wildcard init/*.go) $(wildcard init/**/*.go) $(wildcard internal/luks/*.go) $(wildcard internal/tpm/*.go) $(wildcard internal/hotp/*.go) $(wildcard internal/pcrlock/*.go) $(wildcard internal/pcrlock/**/*.go)
 	CGO_ENABLED=0 go build -ldflags "-s -w" -o $@ ./init/
 
 # Debug init binary (verbose output, strict mode)
-cmd/vanguard/embed/init-debug: $(wildcard init/*.go) $(wildcard init/**/*.go) $(wildcard internal/luks/*.go) $(wildcard internal/tpm/*.go)
+cmd/vanguard/embed/init-debug: $(wildcard init/*.go) $(wildcard init/**/*.go) $(wildcard internal/luks/*.go) $(wildcard internal/tpm/*.go) $(wildcard internal/hotp/*.go) $(wildcard internal/pcrlock/*.go) $(wildcard internal/pcrlock/**/*.go)
 	CGO_ENABLED=0 go build -tags debug -ldflags "-s -w" -o $@ ./init/
 
 # CI target: run all fast checks

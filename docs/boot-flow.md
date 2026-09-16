@@ -154,8 +154,13 @@ flowchart TD
     J -->|Yes| L[Native Go dm-crypt setup via ioctl]
     J -->|No| M[Log PCR values for debug]
     M --> StrictCheck{Strict mode?}
-    StrictCheck -->|Yes| P[HALT]
+    StrictCheck -->|Yes| R{HOTP recovery<br/>3 attempts/boot,<br/>fail cap 10}
     StrictCheck -->|No| K[TUI passphrase prompt]
+
+    R -->|Code accepted| S[Consume code:<br/>advance counter past matched]
+    S --> K
+    R -->|Locked<br/>fail cap reached| P
+    R -->|All attempts fail| P
 
     K --> N[Try each keyslot]
     N --> O{Correct?}
@@ -311,6 +316,7 @@ flowchart TD
         B[Essential mount fails]
         C[No LUKS devices found]
         D[LUKS unlock fails after 3 passphrase attempts]
+        D2[HOTP recovery fails or is locked<br/>(fail cap 10 reached) → strict mode HALT]
         E[Root device not found]
         F[Root mount fails]
         G[No init on root → rescue shell, then HALT]

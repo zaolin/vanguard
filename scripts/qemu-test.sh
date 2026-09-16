@@ -611,10 +611,17 @@ enroll_recovery() {
 
 # run_qemu_hotp runs QEMU with testmode + forced HOTP recovery. The boot
 # fails token unseal (vanguard.testhotp=1), enters HOTP recovery, and the
-# current HOTP code — computed from the enrolled seed at the stored counter —
-# is written to the VM's console at the recovery prompt. Validates the full
-# TryHOTP flow end-to-end: forced failure -> prompt -> code accepted ->
-# passphrase fallback -> unlock -> switch_root.
+# HOTP code — computed from the enrolled seed at the stored counter — is
+# written to the VM's console at the recovery prompt; the LUKS test
+# passphrase (vanguard.testpass=) is then auto-entered for the fallback
+# unlock. Validates the full TryHOTP flow end-to-end: forced failure ->
+# prompt -> code accepted -> passphrase fallback -> unlock -> switch_root.
+#
+# Feed plumbing: QEMU's serial output is tee'd to the log file, and a
+# feeder loop `tail -f`s that log, pattern-matching the prompts and writing
+# the responses into a FIFO that feeds QEMU's stdin. (A direct
+# `qemu < <(feeder)` cannot work — the feeder would need to see QEMU's
+# output, which only exists after the pipe.)
 run_qemu_hotp() {
     local kernel
     kernel=$(find_kernel "${1:-}") || error "Kernel not found"
@@ -628,21 +635,27 @@ run_qemu_hotp() {
 
     info "Starting QEMU with forced HOTP recovery (testmode)..."
 
-    # Feed the HOTP code when the recovery prompt appears. A fresh enrollment
-    # starts at counter 0, so the code is HOTP(seed, 0).
     local seed_b32
     seed_b32=$(cat "${TEST_DIR}/recovery-seed.b32")
+    local fifo="${TEST_DIR}/hotp-in.fifo"
+    rm -f "${fifo}"
+    mkfifo "${fifo}"
+
+    # Feeder: reads console lines (from the boot log) and emits responses —
+    # the HOTP code at the recovery prompt, the test passphrase at the LUKS
+    # passphrase prompt.
     local feed_script="${TEST_DIR}/hotp-feed.sh"
     cat > "${feed_script}" << 'FEED'
 #!/bin/bash
-# Wait for the recovery prompt on stdin, then emit the HOTP code for counter 0.
+# args: $1 = seed (base32); reads console lines on stdin, writes responses
+# on stdout.
 seed_b32="$1"
 while IFS= read -r line; do
-    echo "$line"
     case "$line" in
-        *"Recovery code:"*|*"recovery HOTP code"*)
-            # Compute HOTP(seed, 0) (HMAC-SHA256, 8 digits) with python3.
-            code=$(SEED_B32="$seed_b32" python3 - << 'PYEOF'
+        *"Enter recovery HOTP code"*)
+            # HOTP(seed, 0) (HMAC-SHA256, 8 digits). Enrollment writes
+            # counter=0 and the VM boots the same swtpm state.
+            SEED_B32="$seed_b32" python3 - << 'PYEOF'
 import base64, hmac, hashlib, struct, os
 s = os.environ["SEED_B32"]
 seed = base64.b32decode(s + "=" * ((8 - len(s) % 8) % 8))
@@ -651,13 +664,16 @@ off = mac[-1] & 0xF
 val = ((mac[off] & 0x7F) << 24) | (mac[off+1] << 16) | (mac[off+2] << 8) | mac[off+3]
 print("%08d" % (val % 100000000))
 PYEOF
-)
-            echo "$code"
+            ;;
+        *"Enter passphrase for"*)
+            echo "${VANGUARD_TEST_LUKS_PASS}"
             ;;
     esac
 done
 FEED
     chmod +x "${feed_script}"
+
+    rm -f "${TEST_DIR}/hotp-boot.log"
 
     local old_stty=""
     if [ -n "${CONSOLE_SIZE}" ]; then
@@ -667,23 +683,42 @@ FEED
         [ -n "$rows" ] && [ -n "$cols" ] && stty rows "$rows" cols "$cols"
     fi
 
+    # QEMU reads responses from the FIFO; its output goes through tee into
+    # the log; the feeder tails the log and writes responses into the FIFO.
     set +e
-    timeout 180 qemu-system-x86_64 -machine q35 -m 2G -cpu host -enable-kvm \
+    qemu-system-x86_64 -machine q35 -m 2G -cpu host -enable-kvm \
         -kernel "${kernel}" -initrd "${INITRAMFS}" \
-        -append "root=/dev/vg0/root console=ttyS0 vanguard.testmode=1 vanguard.testhotp=1" \
+        -append "root=/dev/vg0/root console=ttyS0 vanguard.testmode=1 vanguard.testhotp=1 vanguard.testpass=${LUKS_PASS}" \
         -device virtio-scsi-pci,id=scsi0 \
         -device scsi-hd,drive=hd0,bus=scsi0.0 \
         -drive file="${DISK_IMG}",format=qcow2,id=hd0,if=none \
         -chardev socket,id=chrtpm,path="${TPM_SOCKET}" \
         -tpmdev emulator,id=tpm0,chardev=chrtpm \
         -device tpm-tis,tpmdev=tpm0 \
-        -nographic -no-reboot < <("${feed_script}" "${seed_b32}") 2>&1 | tee "${TEST_DIR}/hotp-boot.log"
-    local qemu_rc=$?
+        -nographic -no-reboot < "${fifo}" > >(tee "${TEST_DIR}/hotp-boot.log") 2>&1 &
+    local qemu_pid=$!
+
+    # Feed loop: tail the log, pattern-match, respond into the FIFO. The
+    # tail dies with QEMU (--pid) so nothing leaks after the run.
+    ( VANGUARD_TEST_LUKS_PASS="${LUKS_PASS}" "${feed_script}" "${seed_b32}" > "${fifo}" \
+        < <(tail -n +1 -f --pid="${qemu_pid}" "${TEST_DIR}/hotp-boot.log") ) &
+    local feeder_pid=$!
+
+    # Give the VM time to boot, recover, unlock and switch_root.
+    for _ in $(seq 1 180); do
+        kill -0 "${qemu_pid}" 2>/dev/null || break
+        sleep 1
+    done
+    kill "${qemu_pid}" 2>/dev/null
+    wait "${qemu_pid}" 2>/dev/null
+    kill "${feeder_pid}" 2>/dev/null
+    wait "${feeder_pid}" 2>/dev/null
     set -e
 
     [ -n "${old_stty}" ] && stty "${old_stty}"
     trap - EXIT
     stop_swtpm
+    rm -f "${fifo}"
 
     # Assert the full recovery flow
     local failed=0
@@ -708,7 +743,8 @@ FEED
     if grep -q "Switching to root" "${TEST_DIR}/hotp-boot.log"; then
         info "Boot continued to switch_root: PASS"
     else
-        warn "Boot did not reach switch_root (passphrase fallback may need input)"
+        warn "Boot did NOT reach switch_root — check ${TEST_DIR}/hotp-boot.log"
+        failed=1
     fi
     return $failed
 }

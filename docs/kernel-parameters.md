@@ -202,6 +202,15 @@ vanguard.testpin=1234
 Auto-enters this PIN for TPM2 prompts instead of waiting for console input.
 Only meaningful together with `vanguard.testmode=1`.
 
+### vanguard.testpass=
+
+```
+vanguard.testpass=testpass
+```
+
+Auto-enters this LUKS passphrase for passphrase prompts instead of waiting
+for console input. Only meaningful together with `vanguard.testmode=1`.
+
 ### vanguard.testhotp=
 
 ```

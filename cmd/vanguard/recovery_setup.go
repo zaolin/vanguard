@@ -297,7 +297,16 @@ func (c *RecoveryCmd) runEnable(nvIndex uint32) error {
 			return nil
 		}
 
-		if _, ok := hotp.Validate(code, seed, 0, hotp.Lookahead); ok {
+		matched, ok := hotp.Validate(code, seed, 0, hotp.Lookahead)
+		if ok {
+			// Consume the verification code: advance the stored counter past
+			// it so the code just typed (it was echoed in plaintext to this
+			// terminal) can never authorize a recovery. The app must be
+			// advanced to matched+1 to stay in sync.
+			if err := client.WriteRecoveryState(matched+1, 0); err != nil {
+				fmt.Printf("  %s Warning: failed to persist counter: %v\n", warnStyle.Render("⚠"), err)
+				fmt.Println("  The verification code remains valid until first use.")
+			}
 			fmt.Println()
 			fmt.Printf("  %s Verification successful — HOTP recovery is enabled\n", okStyle.Render("✓"))
 			fmt.Println()
@@ -305,10 +314,15 @@ func (c *RecoveryCmd) runEnable(nvIndex uint32) error {
 				fmt.Sprintf("NV Index:    0x%x", nvIndex),
 				fmt.Sprintf("Algorithm:   HMAC-SHA256"),
 				fmt.Sprintf("Mode:        counter-based (no clock)"),
-				fmt.Sprintf("Digits:      6"),
+				fmt.Sprintf("Digits:      %d", hotp.Digits),
 				fmt.Sprintf("PCR binding: PCR 7 (Secure Boot)"),
+				fmt.Sprintf("Counter:     %d", matched+1),
 				fmt.Sprintf("Verified:    yes"),
 			}))
+			fmt.Println()
+			fmt.Printf("  %s Resync your authenticator app: press 'next'/refresh until the\n", warnStyle.Render("⚠"))
+			fmt.Printf("  app counter reaches %d (or re-scan the QR from 'vanguard recovery --show'),\n", matched+1)
+			fmt.Println("  otherwise the app's next code will be one behind the stored counter.")
 			fmt.Println()
 			fmt.Println("  If TPM unlock fails at boot, enter the 8-digit code")
 			fmt.Println("  from your authenticator app to enable passphrase fallback.")
@@ -318,7 +332,7 @@ func (c *RecoveryCmd) runEnable(nvIndex uint32) error {
 
 		fmt.Printf("  %s Invalid code\n", errStyle.Render("✗"))
 		if attempt < 3 {
-			fmt.Println("  Make sure your phone's clock is correct and try again.")
+			fmt.Printf("  Make sure your app's counter is at 0 (press 'next' to resync) and try again.\n")
 		}
 	}
 
@@ -396,7 +410,7 @@ func (c *RecoveryCmd) runShow(nvIndex uint32) error {
 				fmt.Sprintf("NV Index:      0x%x", nvIndex),
 				fmt.Sprintf("Algorithm:     HMAC-SHA256"),
 				fmt.Sprintf("Mode:          counter-based (no clock)"),
-				fmt.Sprintf("Digits:        6"),
+				fmt.Sprintf("Digits:        %d", hotp.Digits),
 				fmt.Sprintf("PCR binding:   PCR 7 (Secure Boot)"),
 				fmt.Sprintf("Seed (base32): %s", seedB32),
 				fmt.Sprintf("Status:        pending enrollment"),
@@ -475,7 +489,7 @@ func (c *RecoveryCmd) runShow(nvIndex uint32) error {
 		fmt.Sprintf("NV Index:      0x%x", nvIndex),
 		fmt.Sprintf("Algorithm:     HMAC-SHA256"),
 		fmt.Sprintf("Mode:          counter-based (no clock)"),
-		fmt.Sprintf("Digits:        6"),
+		fmt.Sprintf("Digits:        %d", hotp.Digits),
 		fmt.Sprintf("Counter:       %d", counter),
 		fmt.Sprintf("Fail count:    %d / %d", failCount, recoveryMaxFailCount),
 		fmt.Sprintf("PCR binding:   PCR 7 (Secure Boot)"),

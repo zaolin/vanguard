@@ -45,7 +45,19 @@ func TryHOTP(tpmClient *intpm.Client, devicePath string) bool {
 		return false
 	}
 
-	// 2. Read the seed (PCR 7-bound) and the counter/fail state (owner auth).
+	// 2. Distinguish a legacy TOTP enrollment (seed present, state index
+	// missing) BEFORE the generic read failure: ReadRecoveryData would fail
+	// on the missing state index and the user would see an opaque TPM error
+	// with no guidance.
+	if !tpmClient.StateNVExists() {
+		console.Print("recovery: HOTP recovery is NOT provisioned for this vanguard version\n")
+		console.Print("recovery: (legacy TOTP enrollment detected — seed present but state index missing)\n")
+		console.Print("recovery: boot the installed system and run: sudo vanguard recovery --enable\n")
+		LogFunc("RECOVERY_LEGACY_STATE_MISSING", "device", devicePath)
+		return false
+	}
+
+	// 3. Read the seed (PCR 7-bound) and the counter/fail state (policy auth).
 	var seed []byte
 	var counter uint64
 	var failCount uint32
@@ -62,7 +74,7 @@ func TryHOTP(tpmClient *intpm.Client, devicePath string) bool {
 		}
 	}()
 
-	// 3. Refuse if the persistent fail cap is reached. A successful disk
+	// 4. Refuse if the persistent fail cap is reached. A successful disk
 	// unlock resets the counter; until then, offline attackers cannot gain
 	// fresh guesses by rebooting.
 	if failCount >= MaxFailCount {
@@ -73,7 +85,7 @@ func TryHOTP(tpmClient *intpm.Client, devicePath string) bool {
 		return false
 	}
 
-	// 4. Prompt for the code (up to MaxHOTPAttempts this boot).
+	// 5. Prompt for the code (up to MaxHOTPAttempts this boot).
 	for attempt := 1; attempt <= MaxHOTPAttempts; attempt++ {
 		console.Print("\n")
 		console.Print("vanguard: TPM unlock failed. Enter recovery HOTP code (attempt %d of %d):\n",

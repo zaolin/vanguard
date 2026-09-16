@@ -97,7 +97,7 @@ func UnlockDevices() (bool, error) {
 		// A successful unlock proves the legitimate holder is present:
 		// clear the persisted HOTP failure counter so earlier typos do not
 		// count against future recovery attempts. Non-fatal; skipped in
-		// test mode (no TPM).
+		// test mode (coverage runs have no recovery state to reset).
 		if !isTestMode() && !recoveryStateCleared {
 			recoveryStateCleared = true
 			clearRecoveryFailCount()
@@ -539,7 +539,12 @@ func (d *Device) UnlockWithPassphrase() error {
 		var passphrase string
 		var err error
 
-		if tui.IsEnabled() {
+		// In test mode, auto-enter the passphrase from the kernel cmdline
+		// (vanguard.testpass=) — mirrors the vanguard.testpin= hook.
+		if testPass := getTestPass(); testPass != "" {
+			passphrase = testPass
+			Debug("luks: using test passphrase from cmdline\n")
+		} else if tui.IsEnabled() {
 			passphrase, err = tui.PromptPassword(d.Path)
 		} else {
 			passphrase, err = console.ReadPassword(fmt.Sprintf("Enter passphrase for %s: ", d.Path))
@@ -730,6 +735,25 @@ func getTestPin() string {
 	for _, param := range strings.Fields(string(data)) {
 		if strings.HasPrefix(param, "vanguard.testpin=") {
 			return strings.TrimPrefix(param, "vanguard.testpin=")
+		}
+	}
+	return ""
+}
+
+// getTestPass reads the test LUKS passphrase from the kernel cmdline
+// (vanguard.testpass=). Returns empty string if not set. Only honored in
+// test mode.
+func getTestPass() string {
+	if !isTestMode() {
+		return ""
+	}
+	data, err := os.ReadFile("/proc/cmdline")
+	if err != nil {
+		return ""
+	}
+	for _, param := range strings.Fields(string(data)) {
+		if strings.HasPrefix(param, "vanguard.testpass=") {
+			return strings.TrimPrefix(param, "vanguard.testpass=")
 		}
 	}
 	return ""
