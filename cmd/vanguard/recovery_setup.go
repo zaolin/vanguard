@@ -592,10 +592,11 @@ func (c *RecoveryCmd) runCheck(nvIndex uint32) error {
 	// seed/algorithm; this is the code the authenticator app should show at
 	// the stored counter).
 	code := hotp.GenerateCode(seed, counter)
-	if len(code) != 6 {
+	if len(code) != hotp.Digits {
 		fmt.Printf("  %s HOTP code generation failed\n", errStyle.Render("✗"))
 	} else {
-		fmt.Printf("  %s HOTP code generation works (code at counter %d: %s)\n", okStyle.Render("✓"), counter, code)
+		fmt.Printf("  %s HOTP code generation works (%d digits, code at counter %d: %s)\n",
+			okStyle.Render("✓"), hotp.Digits, counter, code)
 	}
 
 	fmt.Println()
