@@ -69,7 +69,6 @@ func main() {
 	console.DebugEnabled = buildtags.DebugEnabled
 
 	buildtags.Debug("vanguard: starting init\n")
-
 	// Pass debug function to packages
 	initluks.Debug = buildtags.Debug
 	initluks.StrictMode = buildtags.StrictMode
@@ -80,8 +79,7 @@ func main() {
 	// 2. Mount essential filesystems
 	buildtags.Debug("vanguard: mounting filesystems\n")
 	if err := mount.Essential(); err != nil {
-		console.Print("vanguard: failed to mount filesystems: %v\n", err)
-		halt()
+		cleanupAndHalt(fmt.Sprintf("vanguard: failed to mount filesystems: %v", err))
 	}
 
 	// Check for test mode (vanguard.testmode=1 in kernel cmdline)
@@ -202,10 +200,10 @@ func main() {
 				// PCR 7 read failed — possible TPM interference. Refuse to
 				// proceed: an attacker who can block PCR reads could bypass
 				// the all-zeros check and reach the pcrlock unseal path.
-				console.Print("vanguard: SECURITY: failed to read PCR 7: %v\n", err)
-				console.Print("vanguard: SECURITY: refusing to unseal — PCR 7 verification unavailable\n")
 				bootlog.Log(bootlog.EventDebug, "msg", fmt.Sprintf("PCR 7 read failed, refusing pcrlock unseal: %v", err))
-				cleanupAndHalt()
+				cleanupAndHalt(fmt.Sprintf(
+					"vanguard: SECURITY: failed to read PCR 7: %v\nvanguard: SECURITY: refusing to unseal — PCR 7 verification unavailable",
+					err))
 			}
 			allZeros := true
 			for _, b := range pcr7 {
@@ -215,10 +213,9 @@ func main() {
 				}
 			}
 			if allZeros {
-				console.Print("vanguard: SECURITY: PCR 7 is all-zeros — Secure Boot not measured\n")
-				console.Print("vanguard: SECURITY: refusing to unseal pcrlock token without Secure Boot\n")
 				bootlog.Log(bootlog.EventDebug, "msg", "PCR 7 all-zeros, refusing pcrlock unseal")
-				cleanupAndHalt()
+				cleanupAndHalt(
+					"vanguard: SECURITY: PCR 7 is all-zeros — Secure Boot not measured\nvanguard: SECURITY: refusing to unseal pcrlock token without Secure Boot")
 			}
 		}
 	}
@@ -230,14 +227,12 @@ func main() {
 	if err != nil {
 		tui.StageError(tui.StageLUKS, err)
 		bootlog.Log(bootlog.EventLUKSFail, "error", err.Error())
-		console.Print("vanguard: failed to unlock devices: %v\n", err)
-		cleanupAndHalt()
+		cleanupAndHalt(fmt.Sprintf("vanguard: failed to unlock devices: %v", err))
 	}
 	if !unlocked {
 		tui.StageError(tui.StageLUKS, fmt.Errorf("no LUKS devices found"))
 		bootlog.Log(bootlog.EventLUKSFail, "error", "no LUKS devices found")
-		console.Print("vanguard: no LUKS devices found\n")
-		cleanupAndHalt()
+		cleanupAndHalt("vanguard: no LUKS devices found")
 	}
 	tui.StageDone(tui.StageLUKS)
 	// Note: Per-device LUKS_UNLOCK events are logged by cryptsetup package
@@ -282,8 +277,7 @@ func main() {
 	}
 	if err != nil {
 		bootlog.Log(bootlog.EventRootMounted, "status", "error", "error", "no root device found")
-		console.Print("vanguard: failed to determine root device: %v\n", err)
-		cleanupAndHalt()
+		cleanupAndHalt(fmt.Sprintf("vanguard: failed to determine root device: %v", err))
 	}
 
 	// 15. Run fsck on root device before mounting
@@ -306,8 +300,7 @@ func main() {
 	if err := mount.RootWithDevice("/sysroot", rootDev, rootFSType); err != nil {
 		tui.StageError(tui.StageRoot, err)
 		bootlog.Log(bootlog.EventRootMounted, "status", "error", "error", err.Error())
-		console.Print("vanguard: failed to mount root: %v\n", err)
-		cleanupAndHalt()
+		cleanupAndHalt(fmt.Sprintf("vanguard: failed to mount root: %v", err))
 	}
 	tui.StageDone(tui.StageRoot)
 	bootlog.Log(bootlog.EventRootMounted, "target", "/sysroot", "device", rootDev, "status", "ok")
@@ -356,6 +349,12 @@ func main() {
 	if err := lvm.EnsureDevSymlinks(); err != nil {
 		buildtags.Debug("vanguard: warning: LVM dev symlinks: %v\n", err)
 	}
+
+	// Restore kernel console messages before handing over to the real
+	// init — the boot-time suppression (loglevel 0) must not persist into
+	// the running system, otherwise journald/kernel console users see a
+	// silent kernel.
+	console.RestoreKernelMessages()
 
 	// 18. Close boot log and unmount /boot before switchroot
 	bootlog.Log(bootlog.EventSwitchroot, "target", "/sysroot")
@@ -408,15 +407,15 @@ func main() {
 	// automatic when /bin/sh exists on the root filesystem.
 	rescueShell := "/bin/sh"
 	if _, err := os.Stat("/sysroot" + rescueShell); err == nil {
+		if tui.PromptAvailable() {
+			tui.Quit()
+			tui.ForceReset()
+		}
 		console.Print("vanguard: no init found — dropping to rescue shell (%s)\n", rescueShell)
 		console.Print("vanguard: type 'exit' to halt\n")
 		bootlog.Close()
 		if earlyBootMounted {
 			mount.UnmountBootEarly()
-		}
-		if tui.IsEnabled() {
-			tui.Quit()
-			tui.ForceReset()
 		}
 		if err := switchroot.SwitchRoot("/sysroot", rescueShell); err != nil {
 			console.Print("vanguard: rescue shell failed: %v\n", err)
@@ -424,7 +423,8 @@ func main() {
 	}
 
 	console.Print("vanguard: no init found on root filesystem\n")
-	cleanupAndHalt()
+	bootlog.Log(bootlog.EventDebug, "msg", "no init found on root filesystem")
+	cleanupAndHalt("vanguard: no init found on root filesystem")
 }
 
 // discoverModules scans /lib/modules for available kernel modules in the image
@@ -482,19 +482,34 @@ func halt() {
 }
 
 // cleanupAndHalt performs cleanup (close bootlog, unmount /boot, reset TUI)
-// before halting. This ensures diagnostics are flushed to disk and the
-// terminal is restored on every failure path, not just the success path.
-func cleanupAndHalt() {
+// before halting. Callers pass the failure reason instead of printing it
+// themselves: printing while the TUI is live loses the message (console
+// output is suppressed then), which is how "unlock stopped without any
+// reason" happened. The reason is printed AFTER the TUI teardown, and the
+// halt waits for Enter so the error stays on screen until it has been read.
+func cleanupAndHalt(reason string) {
 	bootlog.Close()
 	if earlyBootMounted {
 		if err := mount.UnmountBootEarly(); err != nil {
 			console.Print("vanguard: warning: failed to unmount /boot: %v\n", err)
 		}
 	}
-	if tui.IsEnabled() {
-		tui.Quit()
-		tui.ForceReset()
+	tui.Quit()
+	tui.ForceReset()
+	// Undo the boot-time console loglevel suppression; a halted boot must
+	// not carry console loglevel 0 into the rescue/reboot experience.
+	console.RestoreKernelMessages()
+	if isTestMode() {
+		// Coverage runs are non-interactive; flush and exit so .cov data
+		// lands on the cover disk. halt() handles the same mode after the
+		// interactive prompt below, but WaitEnter must be skipped here.
+		console.Print("vanguard: test mode — flushing coverage data\n")
+		unix.Sync()
+		os.Exit(0)
 	}
+	console.Print("%s\n", reason)
+	console.Print("vanguard: press Enter to continue\n")
+	console.WaitEnter()
 	halt()
 }
 

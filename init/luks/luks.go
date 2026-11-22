@@ -41,6 +41,11 @@ var StrictMode bool = true
 // Maximum PIN retry attempts.
 const maxPINAttempts = 3
 
+// errorMinDisplay is the minimum time a failure reason stays visible
+// before the flow continues (or the TUI is torn down for recovery).
+// Errors that vanish in under a second are unreadable.
+const errorMinDisplay = 2 * time.Second
+
 // recoveryStateCleared ensures the HOTP fail-count reset runs at most once
 // per boot, on the first successful unlock.
 var recoveryStateCleared bool
@@ -59,6 +64,60 @@ func clearRecoveryFailCount() {
 // ErrNoDevices indicates no LUKS devices were found.
 var ErrNoDevices = errors.New("no LUKS devices found")
 
+// promptForSecret reads a PIN/passphrase via the TUI when its Run loop is
+// actually alive, falling back to the plain console otherwise. IsEnabled()
+// is a build-tag constant — using it here instead of a runtime liveness
+// check once routed every post-recovery prompt into a dead TUI where
+// PromptPassword failed immediately, breaking passphrase fallback after a
+// successful HOTP code.
+//
+// promptForSecretImpl is a package variable (not a closure) so tests can
+// swap the routing logic; nil means use the default.
+func promptForSecret(tuiPrompt, consolePrompt string) (string, error) {
+	return promptForSecretImpl(tuiPrompt, consolePrompt)
+}
+
+// defaultPromptForSecret is the production routing.
+func defaultPromptForSecret(tuiPrompt, consolePrompt string) (string, error) {
+	if tuiPromptAvailable() {
+		secret, err := tuiPromptPassword(tuiPrompt)
+		if err == nil {
+			return secret, nil
+		}
+		if !errors.Is(err, tui.ErrPromptUnavailable) {
+			return "", err
+		}
+		// The TUI died between the liveness check and the prompt (e.g. the
+		// user quit it mid-prompt). The console is still usable, so fall
+		// back instead of failing the unlock.
+	}
+	return consoleReadSecret(consolePrompt)
+}
+
+// Low-level prompt seams: they let the routing itself be tested without a
+// TUI or a console.
+var (
+	tuiPromptAvailable = tui.PromptAvailable
+	tuiPromptPassword  = tui.PromptPassword
+	tuiPromptRetry     = tui.PasswordErrorWithRetry
+	consoleReadSecret  = console.ReadPassword
+)
+
+var promptForSecretImpl = defaultPromptForSecret
+
+// showAndDwellError displays a terminal TPM failure reason and keeps it on
+// screen for at least errorMinDisplay before continuing (recovery flow or
+// halt). In TUI mode the error renders in the TUI while it is still live;
+// otherwise it is printed to the console.
+func showAndDwellError(msg string) {
+	if tui.PromptAvailable() {
+		tui.ShowTPMError(msg)
+	} else {
+		console.Print("luks: %s\n", msg)
+	}
+	time.Sleep(errorMinDisplay)
+}
+
 // UnlockDevices discovers and unlocks all LUKS devices.
 // Returns true if at least one device was unlocked.
 func UnlockDevices() (bool, error) {
@@ -74,18 +133,31 @@ func UnlockDevices() (bool, error) {
 		return false, nil
 	}
 
+	// One PIN attempt budget for the whole TPM, shared across all
+	// devices: the TPM's dictionary-attack counter is per-TPM (typically 3
+	// tries), so a per-device budget would let a mistyped PIN on two
+	// volumes lock the TPM out.
+	attemptsLeft := maxPINAttempts
+
 	for _, dev := range devices {
 		// Measure the LUKS header into PCR 11 before unlocking.
 		// This binds the pcrlock policy to the on-disk LUKS header state.
+		//
+		// Only measure devices the policy actually covers — i.e. those
+		// with a pcrlock token. Extending PCR 11 for a device outside the
+		// policy (a passphrase-only data disk, an encrypted USB stick)
+		// shifts the PCR 11 hash chain for every device measured after it
+		// and makes the protected device's unseal fail.
+		//
 		// Skip in test mode (no TPM available in QEMU coverage tests).
-		if !isTestMode() {
+		if !isTestMode() && dev.HasPCRLockToken() {
 			if err := dev.MeasureHeader(); err != nil {
 				Debug("luks: header measurement failed for %s: %v (continuing)\n", dev.Path, err)
 			}
 		}
 
 		Debug("luks: unlocking %s\n", dev.Path)
-		if err := dev.Unlock(); err != nil {
+		if err := dev.Unlock(&attemptsLeft); err != nil {
 			// Close device on error before returning
 			dev.Close()
 			return false, fmt.Errorf("failed to unlock %s: %w", dev.Path, err)
@@ -214,7 +286,12 @@ func generateMappedName(path string) string {
 }
 
 // Unlock attempts to unlock the LUKS device.
-func (d *Device) Unlock() error {
+// Unlock attempts to unlock the LUKS device.
+//
+// attemptsLeft is the shared PIN attempt budget for the whole TPM (the
+// dictionary-attack counter is per-TPM, not per-device). A nil pointer
+// means "use a fresh budget" — only correct for a single-device unlock.
+func (d *Device) Unlock(attemptsLeft *int) error {
 	// Check if already unlocked
 	mappedPath := "/dev/mapper/" + d.Name
 	if _, err := os.Stat(mappedPath); err == nil {
@@ -225,7 +302,7 @@ func (d *Device) Unlock() error {
 	// Check for systemd-tpm2 tokens
 	if d.HasTPM2Token() {
 		console.DebugPrint("luks: found TPM2 token on %s, trying token unlock\n", d.Path)
-		err := d.UnlockWithTPM2()
+		err := d.UnlockWithTPM2(attemptsLeft)
 
 		if err == nil {
 			console.DebugPrint("luks: %s unlocked with TPM2 token\n", d.Path)
@@ -235,10 +312,15 @@ func (d *Device) Unlock() error {
 
 		console.DebugPrint("luks: TPM2 unlock failed: %v\n", err)
 
+		// Show the classified reason while the TUI is still up, and keep
+		// it on screen long enough to read. Without this, the TUI was
+		// torn down immediately and the reason never became visible.
+		showAndDwellError(formatTPMError(err))
+
 		// Strict mode: try HOTP recovery before halting
 		if StrictMode {
 			// Quit TUI so console prompts are visible for HOTP recovery
-			if tui.IsEnabled() {
+			if tui.PromptAvailable() {
 				tui.Quit()
 				tui.ForceReset()
 			}
@@ -257,15 +339,9 @@ func (d *Device) Unlock() error {
 			}
 		}
 
-		// Normal mode or HOTP recovery succeeded: fall back to passphrase
-		console.Print("luks: falling back to passphrase: %v\n", err)
-
-		// Show failure reason in TUI
-		if tui.IsEnabled() {
-			msg := formatTPMError(err)
-			tui.PasswordError(msg)
-		}
-
+		// Normal mode or HOTP recovery succeeded: fall back to passphrase.
+		// The TPM failure reason was already shown (and dwelled on) before
+		// the HOTP prompt; do not re-print the stale error here.
 		LogFunc("PASSPHRASE_FALLBACK", "device", d.Path, "reason", err.Error())
 	}
 
@@ -293,26 +369,85 @@ func (d *Device) HasTPM2Token() bool {
 	return false
 }
 
-// GetTPM2Token returns the first systemd-tpm2 token, if any.
-func (d *Device) GetTPM2Token() (*TPM2Token, error) {
+// HasPCRLockToken checks if the device has a systemd-tpm2 token that uses
+// the pcrlock policy.
+//
+// Only such devices are bound by the policy's PCR 11 (LUKS header)
+// prediction. Extending PCR 11 for a device the policy does not cover
+// (e.g. a passphrase-only data disk, or a USB stick that happens to be
+// LUKS-encrypted) shifts the PCR 11 hash chain and makes the booted
+// value differ from the predicted one — the protected device then fails
+// to unseal even though nothing about it changed.
+func (d *Device) HasPCRLockToken() bool {
+	tokens, err := d.dev.Tokens()
+	if err != nil {
+		return false
+	}
+
+	for _, token := range tokens {
+		if token.Type != "systemd-tpm2" {
+			continue
+		}
+		parsed, err := ParseTPM2Token(token)
+		if err != nil {
+			continue
+		}
+		if parsed.UsePCRLock {
+			return true
+		}
+	}
+	return false
+}
+
+// GetTPM2Tokens returns all systemd-tpm2 tokens in header order. Some
+// systems carry more than one (e.g. an old direct-PCR token plus a newer
+// pcrlock token); only trying the first silently breaks unlock even
+// though a valid token exists.
+func (d *Device) GetTPM2Tokens() ([]*TPM2Token, error) {
 	tokens, err := d.dev.Tokens()
 	if err != nil {
 		return nil, err
 	}
 
+	var result []*TPM2Token
+	var parseErr error
 	for _, token := range tokens {
-		if token.Type == "systemd-tpm2" {
-			return ParseTPM2Token(token)
+		if token.Type != "systemd-tpm2" {
+			continue
 		}
+		parsed, err := ParseTPM2Token(token)
+		if err != nil {
+			Debug("luks: skipping unparseable systemd-tpm2 token %d: %v\n", token.ID, err)
+			parseErr = fmt.Errorf("systemd-tpm2 token %d: %w", token.ID, err)
+			continue
+		}
+		result = append(result, parsed)
 	}
-	return nil, errors.New("no systemd-tpm2 token found")
+	if len(result) == 0 {
+		if parseErr != nil {
+			// A corrupt token is not "no token": report the corruption so
+			// the diagnostic (e.g. a malformed NV binding) is preserved.
+			return nil, parseErr
+		}
+		return nil, errors.New("no systemd-tpm2 token found")
+	}
+	return result, nil
 }
 
 // UnlockWithTPM2 attempts to unlock using the TPM2 token.
-func (d *Device) UnlockWithTPM2() error {
-	// Wait for TPM device
+//
+// attemptsLeft is the shared PIN attempt budget for the whole TPM; nil
+// means a fresh budget for this call.
+func (d *Device) UnlockWithTPM2(attemptsLeft *int) error {
+	if attemptsLeft == nil {
+		budget := maxPINAttempts
+		attemptsLeft = &budget
+	}
+	// Wait for TPM device. 10s budget: on cold boot some fTPMs (SPI/I2C
+	// bus) enumerate noticeably later than the disk; a 3s wait made the
+	// unlock "directly stop" with TPM unavailable on such hardware.
 	tpmClient := intpm.New()
-	if !tpmClient.WaitForDevice(3 * time.Second) {
+	if !tpmClient.WaitForDevice(10 * time.Second) {
 		return fmt.Errorf("%w", intpm.ErrTPMUnavailable)
 	}
 
@@ -329,7 +464,8 @@ func (d *Device) UnlockWithTPM2() error {
 		if status.LockoutRecovery > 0 {
 			hint = fmt.Sprintf("Wait %d seconds or reboot to clear lockout", status.LockoutRecovery)
 		}
-		if tui.IsEnabled() {
+		// Keep the lockout screen up long enough to read the hint.
+		if tui.PromptAvailable() {
 			tui.ShowTPMLockout(msg, hint)
 		} else {
 			console.Print("luks: %s\n", msg)
@@ -337,49 +473,28 @@ func (d *Device) UnlockWithTPM2() error {
 				console.Print("luks: %s\n", hint)
 			}
 		}
+		time.Sleep(errorMinDisplay)
 		LogFunc("TPM_LOCKOUT", "device", d.Path, "hint", hint)
 		return intpm.ErrTPMLockout
 	}
 
-	// Get TPM2 token
-	token, err := d.GetTPM2Token()
+	// Get all systemd-tpm2 tokens and try each in header order
+	tokens, err := d.GetTPM2Tokens()
 	if err != nil {
 		return err
 	}
 
 	// Test hook: force token-unseal failure to exercise the HOTP recovery
 	// path end-to-end in QEMU (vanguard.testmode=1 vanguard.testhotp=1).
-	// The strict-mode failure path continues into HOTP recovery instead of
-	// an immediate hard error.
+	// Returns a forced error so the normal strict-mode failure path in
+	// Unlock() continues into HOTP recovery.
 	if testForceHOTP() {
 		Debug("luks: test mode: forcing TPM2 unseal failure for HOTP recovery test\n")
 		LogFunc("TPM_TEST_FORCED_FAIL", "device", d.Path)
-		if StrictMode {
-			// Quit TUI so console prompts are visible for HOTP recovery
-			// (matches the normal strict-mode failure path).
-			if tui.IsEnabled() {
-				tui.Quit()
-				tui.ForceReset()
-			}
-			tpmClient := intpm.New()
-			if recovery.TryHOTP(tpmClient, d.Path) {
-				console.Print("luks: HOTP recovery accepted, passphrase fallback enabled\n")
-				LogFunc("RECOVERY_SUCCESS", "device", d.Path, "method", "hotp")
-				// Continue into passphrase fallback below with the test passphrase
-				console.Print("luks: falling back to passphrase\n")
-				if err := d.UnlockWithPassphrase(); err != nil {
-					LogFunc("LUKS_FAIL", "device", d.Path, "method", "passphrase", "error", err.Error())
-					return err
-				}
-				LogFunc("LUKS_UNLOCK", "device", d.Path, "method", "passphrase", "status", "ok")
-				return nil
-			}
-			LogFunc("LUKS_FAIL", "device", d.Path, "method", "hotp", "mode", "strict-test")
-			return fmt.Errorf("test-forced HOTP recovery failed")
-		}
+		return errForcedHOTP
 	}
 
-	// Detect TPM2 token strategy
+	// Detect TPM2 token strategy (pcrlock.json policy is shared across tokens)
 	detection, _ := DetectTPM2TokenStrategy(d.Path)
 	var pcrlockPolicy *intpm.PCRLockPolicy
 	if detection != nil {
@@ -387,12 +502,160 @@ func (d *Device) UnlockWithTPM2() error {
 		pcrlockPolicy = detection.PCRLockPolicy
 	}
 
-	if token.NeedsPIN {
-		return d.unlockWithTPM2PIN(tpmClient, token, pcrlockPolicy)
+	// Shared PIN attempt budget across all tokens AND devices: the TPM's
+	// dictionary-attack counter is per-TPM (typically 3 tries), so a
+	// per-token or per-device budget could lock the TPM out from a single
+	// typo on a multi-volume system.
+	return d.tryTokens(tpmClient, tokens, pcrlockPolicy, attemptsLeft)
+}
+
+// Token-unlock seams: they let the token loop be tested without a TPM or a
+// LUKS device. Production uses the real implementations.
+var (
+	nvReadPublic = func(tpmClient *intpm.Client, index uint32) error {
+		_, err := tpmClient.NVReadPublic(index)
+		return err
+	}
+	lockoutStatus = func(tpmClient *intpm.Client) (*intpm.LockoutStatus, error) {
+		return tpmClient.GetLockoutStatus()
+	}
+	unlockTokenPIN   = (*Device).unlockWithTPM2PIN
+	unlockTokenNoPIN = (*Device).unlockWithTPM2NoPIN
+)
+
+// errLockoutUnknown marks a failure to read the TPM's lockout state after a
+// failed PIN attempt. Safety-relevant: without it the user would only see a
+// wrong-PIN message while the real problem is that further attempts may lock
+// the TPM.
+var errLockoutUnknown = errors.New("the TPM lockout state could not be read")
+
+// tokenErrorPriority ranks token failures by how actionable they are. Only one
+// reason is shown to the user, and the most useful one must not be drowned out
+// by a later, less specific failure on another token.
+func tokenErrorPriority(err error) int {
+	switch {
+	case errors.Is(err, intpm.ErrTPMLockout):
+		return 4 // the TPM is locked out — recovery guidance, not a retry
+	case errors.Is(err, intpm.ErrTokenStaleNVIndex):
+		return 3 // re-enrollment required — the root cause
+	case errors.Is(err, errLockoutUnknown):
+		return 2 // the TPM state is unknown — safety-relevant
+	default:
+		return 1
+	}
+}
+
+// tryTokens attempts each systemd-tpm2 token in order until one unlocks the
+// device.
+//
+// attemptsLeft is the shared PIN attempt budget for the whole TPM, not a
+// per-token budget: the TPM's dictionary-attack counter is per-TPM.
+//
+// The most actionable failure is reported (see tokenErrorPriority); ties keep
+// the first error, which is the root cause rather than its consequences.
+func (d *Device) tryTokens(tpmClient *intpm.Client, tokens []*TPM2Token, pcrlockPolicy *intpm.PCRLockPolicy, attemptsLeft *int) error {
+	var lastErr error
+	recordFailure := func(err error) {
+		if err == nil {
+			return
+		}
+		if lastErr == nil || tokenErrorPriority(err) > tokenErrorPriority(lastErr) {
+			lastErr = err
+		}
 	}
 
-	return d.unlockWithTPM2NoPIN(tpmClient, token, pcrlockPolicy)
+	for _, token := range tokens {
+		Debug("luks: trying systemd-tpm2 token %d (pin=%v, pcrlock=%v)\n",
+			token.ID, token.NeedsPIN, token.UsePCRLock)
+
+		// A token whose pcrlock NV index is gone can never unseal: the
+		// sealed blob binds that index's NV name. Skip it BEFORE asking
+		// for a PIN (prompting would burn dictionary-attack slots for an
+		// attempt that cannot succeed) — but keep trying the other
+		// tokens: one stale token must not block a valid second token.
+		if token.UsePCRLock && token.PCRLockNV != 0 {
+			if err := nvReadPublic(tpmClient, token.PCRLockNV); err != nil {
+				if !intpm.IsNVIndexMissing(err) {
+					// A transient TPM error is not a missing index; let
+					// the unseal attempt report the real error.
+					Debug("luks: NVReadPublic(0x%x) failed: %v\n", token.PCRLockNV, err)
+				} else {
+					Debug("luks: token %d pins missing NV index 0x%x, skipping it\n", token.ID, token.PCRLockNV)
+					recordFailure(fmt.Errorf("%w: index 0x%x is missing from the TPM (the policy was regenerated at a different index) — re-enroll the token: vanguard enroll -u <uki> -l %s",
+						intpm.ErrTokenStaleNVIndex, token.PCRLockNV, d.Path))
+					continue
+				}
+			}
+		}
+
+		// The shared PIN budget gates PIN-bearing tokens only: a PIN-less
+		// token consumes no dictionary-attack attempt, so it must still
+		// be tried when the budget is spent.
+		if token.NeedsPIN && *attemptsLeft <= 0 {
+			Debug("luks: skipping PIN token %d — the shared PIN budget is spent\n", token.ID)
+			recordFailure(errPINBudgetExhausted)
+			continue
+		}
+
+		var err error
+		if token.NeedsPIN {
+			err = unlockTokenPIN(d, tpmClient, token, pcrlockPolicy, attemptsLeft)
+		} else {
+			err = unlockTokenNoPIN(d, tpmClient, token, pcrlockPolicy)
+		}
+		if err == nil {
+			return nil
+		}
+		recordFailure(err)
+		Debug("luks: token %d failed: %v\n", token.ID, err)
+		// A cancelled PIN prompt stops the whole token loop rather than
+		// re-prompting per token.
+		if errors.Is(err, errPINCancelled) {
+			return err
+		}
+		// A real lockout reported by the unseal itself also stops the loop:
+		// another token would only make it worse, and the user needs the
+		// lockout/recovery guidance, not a re-enroll hint.
+		if errors.Is(err, intpm.ErrTPMLockout) {
+			return err
+		}
+
+		// Re-check the TPM's own dictionary-attack counter before the
+		// next PIN token: if the previous token's attempts brought the
+		// TPM close to its limit, the next attempt would lock it out.
+		if token.NeedsPIN {
+			status, err := lockoutStatus(tpmClient)
+			if err != nil {
+				// The lockout state is unknown: issuing another PIN
+				// authorization could drive the TPM into lockout. Stop
+				// PIN attempts; PIN-less tokens are still tried.
+				*attemptsLeft = 0
+				recordFailure(fmt.Errorf("%w after a failed PIN attempt: %v", errLockoutUnknown, err))
+				continue
+			}
+			if status.InLockout {
+				Debug("luks: TPM entered lockout after previous token attempt\n")
+				return intpm.ErrTPMLockout
+			}
+		}
+	}
+	return lastErr
 }
+
+// errForcedHOTP is returned by the vanguard.testhotp=1 test hook so the
+// normal strict-mode failure path exercises HOTP recovery end-to-end.
+var errForcedHOTP = errors.New("test-forced token unseal failure")
+
+// errPINCancelled is returned when the user cancelled the TUI PIN prompt
+// (ctrl+c). Distinct sentinel so the multi-token loop can stop instead of
+// re-prompting for every remaining token.
+var errPINCancelled = errors.New("PIN entry cancelled")
+
+// errPINBudgetExhausted is returned when the shared PIN attempt budget is
+// spent. It names the TPM dictionary-attack limit so the user understands
+// why no further prompt appears (and that waiting is the remedy, not another
+// retry).
+var errPINBudgetExhausted = errors.New("PIN attempt budget exhausted — the TPM dictionary-attack limit would be exceeded")
 
 // unlockWithTPM2NoPIN attempts TPM2 unlock without PIN.
 func (d *Device) unlockWithTPM2NoPIN(tpmClient *intpm.Client, token *TPM2Token, pcrlockPolicy *intpm.PCRLockPolicy) error {
@@ -405,8 +668,27 @@ func (d *Device) unlockWithTPM2NoPIN(tpmClient *intpm.Client, token *TPM2Token, 
 	return d.unlockWithKeyForToken(password, token)
 }
 
+// unsealWithPIN performs the TPM unseal with the given PIN. It is a
+// package variable so the PIN attempt budget can be tested without a TPM.
+var unsealWithPIN = func(token *TPM2Token, tpmClient *intpm.Client, pin []byte, pcrlockPolicy *intpm.PCRLockPolicy) ([]byte, error) {
+	return token.Unseal(tpmClient, pin, pcrlockPolicy)
+}
+
 // unlockWithTPM2PIN attempts TPM2 unlock with PIN and retry logic.
-func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, pcrlockPolicy *intpm.PCRLockPolicy) error {
+//
+// attemptsLeft is a SHARED budget across all tokens AND devices: the TPM
+// dictionary-attack counter is per-TPM, not per-token, and typical TPMs
+// allow only 3 failed auth attempts (TPM2B_DEFAULT maxTries=3) before
+// locking out for a long recovery period. A per-token budget of 3 would
+// allow 3*N attempts (6 with two tokens) and lock the TPM from a single
+// mistyped PIN. The budget is decremented by every real unseal attempt.
+// A nil budget means "use a fresh budget for this call".
+func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, pcrlockPolicy *intpm.PCRLockPolicy, attemptsLeft *int) error {
+	if attemptsLeft == nil {
+		budget := maxPINAttempts
+		attemptsLeft = &budget
+	}
+
 	var lastError error
 	var pin string
 	var err error
@@ -417,7 +699,17 @@ func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, pc
 	// Still better than leaving it in heap indefinitely.
 	defer console.ZeroString(&pin)
 
+	// Prompt for PIN
+	promptForPIN := func() (string, error) {
+		return promptForSecret(d.Path+" (TPM PIN)", fmt.Sprintf("Enter TPM2 PIN for %s: ", d.Path))
+	}
+
 	for attempt := 1; attempt <= maxPINAttempts; attempt++ {
+		if *attemptsLeft <= 0 {
+			// Shared budget exhausted (another token or device used it
+			// up) — stop prompting rather than risking a TPM lockout.
+			return errPINBudgetExhausted
+		}
 		// Prompt for PIN
 		if attempt == 1 {
 			// In test mode, auto-enter PIN from kernel cmdline (vanguard.testpin=)
@@ -425,27 +717,33 @@ func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, pc
 			if testPin != "" {
 				pin = testPin
 				Debug("luks: using test PIN from cmdline\n")
-			} else if tui.IsEnabled() {
-				pin, err = tui.PromptPassword(d.Path + " (TPM PIN)")
 			} else {
-				pin, err = console.ReadPassword(fmt.Sprintf("Enter TPM2 PIN for %s: ", d.Path))
+				pin, err = promptForPIN()
 			}
 		}
 
 		if err != nil {
-			if tui.IsEnabled() {
-				tui.PasswordPromptDone()
-			}
+			tui.PasswordPromptDone()
 			return fmt.Errorf("failed to read PIN: %w", err)
 		}
 
-		// Unseal with PIN using native TPM implementation
-		password, unsealErr := token.Unseal(tpmClient, []byte(pin), pcrlockPolicy)
+		// An empty PIN from the TUI is a user cancel (ctrl+c sends ""),
+		// not a real attempt. Unsealing with an empty auth value would
+		// burn a dictionary-attack counter slot for nothing.
+		if pin == "" {
+			tui.PasswordPromptDone()
+			LogFunc("TPM_PIN_CANCELLED", "device", d.Path, "attempt", fmt.Sprintf("%d", attempt))
+			return fmt.Errorf("%w", errPINCancelled)
+		}
+
+		// Unseal with PIN using native TPM implementation. This is a real
+		// authentication attempt — consume one unit of the shared
+		// dictionary-attack budget before trying.
+		*attemptsLeft--
+		password, unsealErr := unsealWithPIN(token, tpmClient, []byte(pin), pcrlockPolicy)
 		if unsealErr == nil {
 			// Success - unlock with password
-			if tui.IsEnabled() {
-				tui.PasswordPromptDone()
-			}
+			tui.PasswordPromptDone()
 			return d.unlockWithKeyForToken(password, token)
 		}
 
@@ -456,25 +754,34 @@ func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, pc
 		// Check if retryable
 		// For pcrlock tokens, ErrPolicyFailed collapses both wrong-PIN and
 		// wrong-PCR into one error — retry anyway since the user might just
-		// have a wrong PIN.
-		if (errors.Is(unsealErr, intpm.ErrWrongPIN) || errors.Is(unsealErr, intpm.ErrPolicyFailed)) && attempt < maxPINAttempts {
+		// have a wrong PIN. The shared budget (and the TPM's own DA
+		// counter) still caps the total number of attempts.
+		if (errors.Is(unsealErr, intpm.ErrWrongPIN) || errors.Is(unsealErr, intpm.ErrPolicyFailed)) &&
+			attempt < maxPINAttempts && *attemptsLeft > 0 {
 			LogFunc("TPM_PIN_FAIL", "device", d.Path, "attempt", fmt.Sprintf("%d", attempt))
 			if errors.Is(unsealErr, intpm.ErrPolicyFailed) {
 				userMsg = fmt.Sprintf("TPM unlock failed (attempt %d of %d)", attempt, maxPINAttempts)
 			} else {
 				userMsg = fmt.Sprintf("Incorrect PIN (attempt %d of %d)", attempt, maxPINAttempts)
 			}
-			if tui.IsEnabled() {
-				pin, err = tui.PasswordErrorWithRetry(userMsg)
+			if tuiPromptAvailable() {
+				pin, err = tuiPromptRetry(userMsg)
+				if errors.Is(err, tui.ErrPromptUnavailable) {
+					// The TUI exited while waiting after a wrong PIN:
+					// fall back to the console instead of aborting the
+					// unlock with a prompt error.
+					console.Print("luks: %s\n", userMsg)
+					pin, err = promptForPIN()
+				}
 			} else {
 				console.Print("luks: %s\n", userMsg)
-				pin, err = console.ReadPassword(fmt.Sprintf("Enter TPM2 PIN for %s: ", d.Path))
+				pin, err = promptForPIN()
 			}
 			continue
 		}
 
 		// Non-retryable or last attempt
-		if tui.IsEnabled() {
+		if tui.PromptAvailable() {
 			if errors.Is(unsealErr, intpm.ErrTPMLockout) {
 				status, _ := tpmClient.GetLockoutStatus()
 				hint := ""
@@ -489,6 +796,9 @@ func (d *Device) unlockWithTPM2PIN(tpmClient *intpm.Client, token *TPM2Token, pc
 				tui.PasswordError(userMsg)
 				tui.PasswordPromptDone()
 			}
+			// Keep the reason on screen before the caller tears the TUI
+			// down for recovery — sub-second errors are unreadable.
+			time.Sleep(errorMinDisplay)
 		} else {
 			console.Print("luks: %s\n", userMsg)
 		}
@@ -544,10 +854,8 @@ func (d *Device) UnlockWithPassphrase() error {
 		if testPass := getTestPass(); testPass != "" {
 			passphrase = testPass
 			Debug("luks: using test passphrase from cmdline\n")
-		} else if tui.IsEnabled() {
-			passphrase, err = tui.PromptPassword(d.Path)
 		} else {
-			passphrase, err = console.ReadPassword(fmt.Sprintf("Enter passphrase for %s: ", d.Path))
+			passphrase, err = promptForSecret(d.Path, fmt.Sprintf("Enter passphrase for %s: ", d.Path))
 		}
 		if err != nil {
 			return err
@@ -568,8 +876,11 @@ func (d *Device) UnlockWithPassphrase() error {
 
 			// Setup dm-crypt
 			if err := d.setupDMCrypt(volume); err != nil {
-				if tui.IsEnabled() {
-					tui.PasswordError(fmt.Sprintf("dm-crypt setup failed: %v", err))
+				msg := fmt.Sprintf("dm-crypt setup failed: %v", err)
+				if tui.PromptAvailable() {
+					tui.PasswordError(msg)
+				} else {
+					console.Print("luks: %s\n", msg)
 				}
 				continue
 			}
@@ -577,7 +888,7 @@ func (d *Device) UnlockWithPassphrase() error {
 		}
 
 		// Wrong passphrase
-		if tui.IsEnabled() {
+		if tui.PromptAvailable() {
 			tui.PasswordError("Incorrect passphrase, try again")
 		} else {
 			console.Print("luks: incorrect passphrase, try again\n")
@@ -664,7 +975,15 @@ func (d *Device) logPCRDebug(token *TPM2Token) {
 }
 
 // formatTPMError converts TPM errors to user-friendly messages.
+//
+// The stale-NV-index error carries actionable remediation (re-enroll the
+// token) and must NOT be collapsed into the generic "TPM unlock failed"
+// message — otherwise the user gets no explanation for a boot that
+// suddenly requires HOTP recovery.
 func formatTPMError(err error) string {
+	if errors.Is(err, intpm.ErrTokenStaleNVIndex) {
+		return err.Error()
+	}
 	if errors.Is(err, intpm.ErrPolicyFailed) {
 		return "TPM unlock failed"
 	}

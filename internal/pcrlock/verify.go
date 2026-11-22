@@ -14,8 +14,12 @@ import (
 
 // Policy represents the structure of the pcrlock.json policy file
 type Policy struct {
-	NVIndex   int        `json:"nvIndex"`
-	NVPublic  string     `json:"nvPublic"`
+	NVIndex  int    `json:"nvIndex"`
+	NVPublic string `json:"nvPublic"`
+	// NVHandle is the serialized ESYS_TR of the pcrlock NV index. It is
+	// the same artifact the LUKS token carries in its tpm2_pcrlock_nv
+	// field, which is how a token is matched to its policy.
+	NVHandle  string     `json:"nvHandle"`
 	PCRValues []PCRValue `json:"pcrValues"`
 }
 

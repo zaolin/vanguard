@@ -40,16 +40,9 @@ func (c *EnrollCmd) Run() error {
 	fmt.Println("  " + headerSty.Render("STEP 1: Generate PCRLock Policy"))
 	fmt.Println()
 
-	policyPath := c.UKIPath
-	if len(policyPath) > 4 && policyPath[len(policyPath)-4:] == ".efi" {
-		policyPath = policyPath[:len(policyPath)-4]
-	} else if len(policyPath) > 4 {
-		lower := policyPath[len(policyPath)-4:]
-		if lower == ".EFI" {
-			policyPath = policyPath[:len(policyPath)-4]
-		}
-	}
-	policyPath += ".pcrlock.json"
+	// Shared derivation: enroll, update and status must agree on the policy
+	// file name, including case-insensitive .efi stripping.
+	policyPath := policyPathForUKI(c.UKIPath)
 
 	updateArgs := []string{"vanguard", "update", "-u", c.UKIPath, "-l", c.LUKSDevice, "-p", policyPath}
 	if c.Verbose {

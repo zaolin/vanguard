@@ -17,30 +17,6 @@ var libraryPaths = []string{
 	"/usr/local/lib",
 }
 
-// DlopenLibraries contains libraries loaded via dlopen that won't show in ldd
-// These must be explicitly included
-var DlopenLibraries = []string{
-	"/usr/lib64/cryptsetup/libcryptsetup-token-systemd-tpm2.so",
-	// libgcc_s is dlopened by glibc for pthread_exit/pthread_cancel
-	"/usr/lib/gcc/x86_64-pc-linux-gnu/15/libgcc_s.so.1",
-	"/usr/lib/gcc/x86_64-pc-linux-gnu/14/libgcc_s.so.1",
-	"/lib64/libgcc_s.so.1",
-	"/usr/lib64/libgcc_s.so.1",
-	// TPM2 libraries dlopened by systemd/plugin
-	"/usr/lib64/libtss2-tctildr.so.0",
-	"/usr/lib64/libtss2-tcti-device.so.0",
-	"/usr/lib64/libtss2-mu.so.0",
-	"/usr/lib64/libtss2-esys.so.0",
-	"/usr/lib64/libtss2-rc.so.0",
-	// libcryptsetup-token-systemd-tpm2 depends on this non-standard path lib
-	"/usr/lib64/systemd/libsystemd-shared-259.so",
-	// udevd may dlopen these for device management
-	"/usr/lib64/libudev.so.1",
-	"/usr/lib64/libkmod.so.2",
-	"/lib64/libudev.so.1",
-	"/lib64/libkmod.so.2",
-}
-
 // LibraryFile represents a library to include in the initramfs
 type LibraryFile struct {
 	SrcPath string // Absolute path on host
@@ -51,6 +27,17 @@ type LibraryFile struct {
 func ResolveDependencies(binaryPath string) ([]LibraryFile, error) {
 	seen := make(map[string]bool)
 	var result []LibraryFile
+
+	// Search paths for the transitive dependencies. The binary's own
+	// RPATH/RUNPATH comes first — systemd's udevd, for example, needs
+	// libsystemd-shared-*.so which lives in /usr/lib64/systemd and is
+	// ONLY reachable through the binary's RUNPATH. Without this, the
+	// library was silently omitted from the initramfs and udevd failed
+	// to start at boot.
+	searchPaths := libraryPaths
+	if rpaths := runPathsOf(binaryPath); len(rpaths) > 0 {
+		searchPaths = append(append([]string{}, rpaths...), libraryPaths...)
+	}
 
 	var resolve func(path string) error
 	resolve = func(path string) error {
@@ -71,7 +58,7 @@ func ResolveDependencies(binaryPath string) ([]LibraryFile, error) {
 		}
 
 		for _, lib := range libs {
-			libPath := findLibrary(lib)
+			libPath := findLibraryIn(lib, searchPaths)
 			if libPath != "" && !seen[libPath] {
 				// Preserve the original directory structure
 				// e.g., /lib64/foo.so -> /lib64/foo.so, /usr/lib/bar.so -> /usr/lib/bar.so
@@ -95,8 +82,36 @@ func ResolveDependencies(binaryPath string) ([]LibraryFile, error) {
 	return result, nil
 }
 
-// findLibrary searches for a library in standard paths
+// runPathsOf returns the RPATH/RUNPATH entries of an ELF binary. Used to
+// locate libraries that are not in the standard library directories (e.g.
+// systemd's libsystemd-shared-*.so in /usr/lib64/systemd).
+func runPathsOf(binaryPath string) []string {
+	f, err := elf.Open(binaryPath)
+	if err != nil {
+		return nil
+	}
+	defer f.Close()
+
+	// DT_RUNPATH (2) and DT_RPATH (15)
+	var paths []string
+	if entries, err := f.DynString(elf.DT_RUNPATH); err == nil {
+		paths = append(paths, entries...)
+	}
+	if entries, err := f.DynString(elf.DT_RPATH); err == nil {
+		paths = append(paths, entries...)
+	}
+	return paths
+}
+
+// findLibrary searches for a library in the standard paths
 func findLibrary(name string) string {
+	return findLibraryIn(name, libraryPaths)
+}
+
+// findLibraryIn searches for a library in the given directories. Callers
+// pass the standard library paths, optionally prefixed with the binary's
+// RUNPATH.
+func findLibraryIn(name string, searchPaths []string) string {
 	// Handle absolute paths
 	if strings.HasPrefix(name, "/") {
 		if _, err := os.Stat(name); err == nil {
@@ -105,8 +120,8 @@ func findLibrary(name string) string {
 		return ""
 	}
 
-	// Search in standard library paths
-	for _, dir := range libraryPaths {
+	// Search in the given paths (may include the binary's RUNPATH)
+	for _, dir := range searchPaths {
 		path := filepath.Join(dir, name)
 		if _, err := os.Stat(path); err == nil {
 			return path
@@ -114,52 +129,4 @@ func findLibrary(name string) string {
 	}
 
 	return ""
-}
-
-// ResolveDlopenDependencies resolves dependencies of libraries loaded via dlopen
-func ResolveDlopenDependencies() ([]LibraryFile, error) {
-	var result []LibraryFile
-	seen := make(map[string]bool)
-
-	for _, lib := range DlopenLibraries {
-		if _, err := os.Stat(lib); err != nil {
-			// Skip if library doesn't exist
-			continue
-		}
-
-		if !seen[lib] {
-			seen[lib] = true
-
-			// Determine destination path
-			dstPath := lib
-			basename := filepath.Base(lib)
-			// Special case: libgcc_s needs to be in /lib64 for runtime linker
-			if strings.Contains(basename, "libgcc_s") {
-				dstPath = "/lib64/" + basename
-			}
-			// Special case: libsystemd-shared is in /usr/lib64/systemd on host, but we want it in /usr/lib64
-			if strings.Contains(basename, "libsystemd-shared") {
-				dstPath = "/usr/lib64/" + basename
-			}
-
-			result = append(result, LibraryFile{
-				SrcPath: lib,
-				DstPath: dstPath,
-			})
-
-			// Resolve dependencies of the dlopen library
-			deps, err := ResolveDependencies(lib)
-			if err != nil {
-				continue
-			}
-			for _, dep := range deps {
-				if !seen[dep.SrcPath] {
-					seen[dep.SrcPath] = true
-					result = append(result, dep)
-				}
-			}
-		}
-	}
-
-	return result, nil
 }

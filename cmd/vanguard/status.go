@@ -1,8 +1,10 @@
 package main
 
 import (
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -11,6 +13,7 @@ import (
 	"time"
 
 	"github.com/charmbracelet/lipgloss"
+	"github.com/zaolin/vanguard/internal/fstab"
 	"github.com/zaolin/vanguard/internal/luks"
 	"github.com/zaolin/vanguard/internal/pcrlock"
 	"github.com/zaolin/vanguard/internal/tpm"
@@ -57,6 +60,35 @@ type tpmStatus struct {
 	LockoutCounter uint64 `json:"lockoutCounter"`
 	MaxAuthFail    uint64 `json:"maxAuthFail"`
 	LockoutError   string `json:"lockoutError,omitempty"`
+
+	// Identity and functional health, filled when the TPM responds.
+	Identity       *tpmIdentityInfo `json:"identity,omitempty"`
+	IdentityError  string           `json:"identityError,omitempty"`
+	Banks          []string         `json:"banks,omitempty"`
+	BanksError     string           `json:"banksError,omitempty"`
+	RandomOK       *bool            `json:"randomOk,omitempty"`
+	RandomError    string           `json:"randomError,omitempty"`
+	RoundtripOK    *bool            `json:"roundtripOk,omitempty"`
+	RoundtripError string           `json:"roundtripError,omitempty"`
+	// RoundtripSkipped is set when no roundtrip was attempted because the
+	// lockout state is unknown, the TPM is locked out, or an owner/lockout
+	// auth is configured.
+	RoundtripSkipped string `json:"roundtripSkipped,omitempty"`
+	// AuthBlocked explains why no new authorizations may be attempted with an
+	// empty auth value ("" = they are safe).
+	AuthBlocked string `json:"authBlocked,omitempty"`
+	// RoundtripClass distinguishes "could not verify" (authorization or
+	// transport problem) from a genuine seal/unseal failure.
+	RoundtripClass string `json:"roundtripClass,omitempty"`
+}
+
+// tpmIdentityInfo is the TPM vendor/firmware identification shown in status.
+type tpmIdentityInfo struct {
+	Manufacturer string `json:"manufacturer"`
+	VendorString string `json:"vendorString"`
+	Firmware     string `json:"firmware"`
+	Family       string `json:"family"`
+	FirmwareTPM  bool   `json:"firmwareTpm"`
 }
 
 type luksDeviceInfo struct {
@@ -74,6 +106,7 @@ type tokenDetail struct {
 	HasSalt    bool   `json:"hasSalt"`
 	PCRBank    string `json:"pcrBank,omitempty"`
 	NVIndex    uint32 `json:"nvIndex,omitempty"`
+	PrimaryAlg string `json:"primaryAlg,omitempty"`
 }
 
 type recoveryInfo struct {
@@ -100,23 +133,28 @@ type mitigation struct {
 }
 
 type pcrlockInfo struct {
-	PolicyPath    string      `json:"policyPath"`
-	PolicyNVIndex uint32      `json:"policyNvIndex"`
-	TokenNVIndex  uint32      `json:"tokenNvIndex"`
-	NVOnTPM       bool        `json:"nvOnTpm"`
-	NVIndex       uint32      `json:"nvIndex"`
-	PCRResults    []pcrStatus `json:"pcrResults"`
-	EnforcedPCRs  []int       `json:"enforcedPcrs"`
-	UnboundPCRs   []int       `json:"unboundPcrs"`
-	PCR7Current   string      `json:"pcr7Current,omitempty"`
-	PCR7InPolicy  bool        `json:"pcr7InPolicy"`
-	SecureBoot    string      `json:"secureBoot"`
+	PolicyPath    string `json:"policyPath"`
+	PolicyNVIndex uint32 `json:"policyNvIndex"`
+	TokenNVIndex  uint32 `json:"tokenNvIndex"`
+	NVOnTPM       bool   `json:"nvOnTpm"`
+	// NVOnTPMUnknown is set when the NV state could not be read at all.
+	NVOnTPMUnknown bool        `json:"nvOnTpmUnknown,omitempty"`
+	NVIndex        uint32      `json:"nvIndex"`
+	PCRResults     []pcrStatus `json:"pcrResults"`
+	EnforcedPCRs   []int       `json:"enforcedPcrs"`
+	UnboundPCRs    []int       `json:"unboundPcrs"`
+	PCR7Current    string      `json:"pcr7Current,omitempty"`
+	PCR7InPolicy   bool        `json:"pcr7InPolicy"`
+	SecureBoot     string      `json:"secureBoot"`
 }
 
 type pcrStatus struct {
-	PCR        int    `json:"pcr"`
-	Name       string `json:"name"`
-	Match      bool   `json:"match"`
+	PCR   int    `json:"pcr"`
+	Name  string `json:"name"`
+	Match bool   `json:"match"`
+	// Unknown marks a PCR whose live value could not be read. It must not be
+	// rendered or counted as a mismatch.
+	Unknown    bool   `json:"unknown,omitempty"`
 	IsEnforced bool   `json:"isEnforced"`
 	Current    string `json:"current,omitempty"`
 }
@@ -126,6 +164,7 @@ type tokenPayloadJSON struct {
 	PCRLock      bool   `json:"tpm2-pcrlock"`
 	PCRLockAlt   bool   `json:"tpm2_pcrlock"`
 	PCRBank      string `json:"tpm2-pcr-bank"`
+	PrimaryAlg   string `json:"tpm2-primary-alg"`
 	PCRLockNV    uint32 `json:"tpm2-pcrlock-nv"`
 	PCRLockNVAlt string `json:"tpm2_pcrlock_nv"`
 	Salt         string `json:"tpm2-salt"`
@@ -214,6 +253,16 @@ func collectTPMStatus(data *statusData) {
 		}
 	}
 	if !data.TPM.Present {
+		// A configured swtpm/UDS socket is also a TPM: checking only the
+		// device nodes would report a healthy simulator as absent.
+		if sock := os.Getenv("VANGUARD_TPM_SOCKET"); sock != "" {
+			if _, err := os.Stat(sock); err == nil {
+				data.TPM.Present = true
+				data.TPM.Device = sock
+			}
+		}
+	}
+	if !data.TPM.Present {
 		return
 	}
 
@@ -225,6 +274,110 @@ func collectTPMStatus(data *statusData) {
 		data.TPM.InLockout = status.InLockout
 		data.TPM.LockoutCounter = status.LockoutCounter
 		data.TPM.MaxAuthFail = status.MaxAuthFail
+	}
+
+	// Vendor/firmware identification and functional health. Each check is
+	// independent: a failure is reported, never fatal to the status run.
+	if id, err := client.ReadIdentity(); err != nil {
+		data.TPM.IdentityError = err.Error()
+	} else {
+		data.TPM.Identity = &tpmIdentityInfo{
+			Manufacturer: id.ManufacturerName,
+			VendorString: id.VendorString,
+			Firmware:     id.FirmwareVersionString(),
+			Family:       string(id.Family()),
+			FirmwareTPM:  id.IsFirmwareTPM(),
+		}
+	}
+
+	if banks, err := client.PCRBanks(); err != nil {
+		data.TPM.BanksError = err.Error()
+	} else {
+		data.TPM.Banks = banks
+	}
+
+	if err := client.GetRandomSmoke(); err != nil {
+		data.TPM.RandomError = err.Error()
+		if errors.Is(err, tpm.ErrRandomIdentical) {
+			data.TPM.RandomOK = boolPtr(false)
+		}
+		// Any other error means the check could not run at all: leave
+		// RandomOK nil so the report says "unverified", not "broken".
+	} else {
+		data.TPM.RandomOK = boolPtr(true)
+	}
+
+	// Decide whether new authorizations with an empty auth value are safe.
+	// Owner/lockout auth is read from TPM_PT_PERMANENT — a read-only query,
+	// so no failed authorization is needed to learn it. Probing it would
+	// risk consuming a dictionary-attack attempt on a healthy TPM.
+	var flagsErr error
+	var flags tpm.PermanentFlags
+	if data.TPM.LockoutError == "" && !data.TPM.InLockout {
+		flags, flagsErr = client.ReadPermanentFlags()
+	}
+	data.TPM.AuthBlocked = authBlockReason(data.TPM.LockoutError, data.TPM.InLockout, flags, flagsErr)
+	data.TPM.RoundtripSkipped = data.TPM.AuthBlocked
+
+	if data.TPM.AuthBlocked == "" {
+		if err := sealRoundtrip(client); err != nil {
+			data.TPM.RoundtripOK = boolPtr(false)
+			data.TPM.RoundtripError = err.Error()
+			data.TPM.RoundtripClass = roundtripClassFor(err)
+		} else {
+			data.TPM.RoundtripOK = boolPtr(true)
+		}
+	}
+}
+
+// sealRoundtrip performs the seal/unseal health check. It is a package
+// variable so the production classification of its result can be tested with
+// an injected failure instead of only through the helper in isolation.
+var sealRoundtrip = func(client *tpm.Client) error {
+	return client.SealUnsealRoundtrip()
+}
+
+// boolPtr returns a pointer to b, used for tri-state health results
+// (nil = the check was not attempted).
+func boolPtr(b bool) *bool { return &b }
+
+// roundtripClassFor classifies a seal/unseal roundtrip error: "failed" for a
+// genuine failure (a data mismatch or a TPM error response), "unverified" for
+// an authorization requirement or a transport problem, where the check could
+// not run at all and nothing about the TPM is proven.
+func roundtripClassFor(err error) string {
+	if errors.Is(err, tpm.ErrRoundtripMismatch) {
+		// A data mismatch is a genuine seal/unseal failure even though it is
+		// detected locally rather than by the TPM.
+		return "failed"
+	}
+	if tpm.IsAuthorizationFailure(err) {
+		return "unverified"
+	}
+	if !tpm.IsTPMResponseError(err) {
+		return "unverified"
+	}
+	return "failed"
+}
+
+// authBlockReason decides whether new TPM operations with an empty auth value
+// may be attempted. It fails SAFE: any state in which an authorization could
+// fail (unknown lockout, active lockout, configured owner/lockout auth, or an
+// unreadable permanent-flags property) blocks the operation. Otherwise a
+// routine status run could consume a dictionary-attack attempt on a healthy
+// TPM and eventually lock it out.
+func authBlockReason(lockoutErr string, inLockout bool, flags tpm.PermanentFlags, flagsErr error) string {
+	switch {
+	case lockoutErr != "":
+		return "the lockout state could not be read"
+	case inLockout:
+		return "the TPM is in dictionary-attack lockout"
+	case flagsErr != nil:
+		return "TPM_PT_PERMANENT could not be read — authorization requirements are unknown"
+	case flags&tpm.PermanentOwnerAuthSet != 0 || flags&tpm.PermanentLockoutAuthSet != 0:
+		return "owner/lockout auth is set — no empty-auth operations are attempted"
+	default:
+		return ""
 	}
 }
 
@@ -296,25 +449,204 @@ func parseTokenDetail(payload []byte) tokenDetail {
 	if td.PCRBank == "" {
 		td.PCRBank = "sha256"
 	}
+	td.PrimaryAlg = raw.PrimaryAlg
 
 	return td
 }
 
-func findPCRLockPolicy() string {
-	matches, _ := filepath.Glob("/boot/EFI/*/*.pcrlock.json")
-	if len(matches) > 0 {
-		return matches[0]
+// bootedUKIPathFn and policyMatchingTokenNVFn are package variables so
+// the policy-selection logic can be tested without a real EFI/boot setup.
+var (
+	bootedUKIPathFn         = bootedUKIPath
+	policyMatchingTokenNVFn = policyMatchingTokenNV
+)
+
+// installedPolicies returns the pcrlock policies installed below the EFI
+// System Partition, sorted for stable results.
+//
+// The ESP is not necessarily mounted at /boot (some systems use /efi), so
+// the mount point is looked up rather than hardcoded. It is a variable so
+// tests can point the lookup at a temporary directory.
+var installedPolicies = func() []string {
+	matches, err := filepath.Glob(filepath.Join(espMountPoint(), "EFI", "*", "*.pcrlock.json"))
+	if err != nil {
+		return nil
 	}
-	for _, p := range []string{
+	sort.Strings(matches)
+	return matches
+}
+
+// standardPolicyPaths lists the system locations a pcrlock policy may live
+// in, in preference order. It is a variable so tests can point the lookup at
+// a temporary directory.
+var standardPolicyPaths = func() []string {
+	return []string{
 		"/var/lib/systemd/pcrlock.json",
-		"/boot/pcrlock.json",
+		filepath.Join(espMountPoint(), "pcrlock.json"),
 		"/run/systemd/pcrlock.json",
-	} {
+	}
+}
+
+// policyPathForUKI derives the pcrlock policy path for a UKI: the UKI
+// path without its .efi suffix plus ".pcrlock.json".
+//
+// The .efi stripping is case-insensitive (kernel.efi, kernel.EFI,
+// BOOTX64.EFI), so the policy lookup and the policy generation always
+// agree on the file name.
+func policyPathForUKI(ukiPath string) string {
+	base := ukiPath
+	if strings.HasSuffix(strings.ToLower(base), ".efi") {
+		base = base[:len(base)-4]
+	}
+	return base + ".pcrlock.json"
+}
+
+// findPCRLockPolicy locates the pcrlock policy that actually applies to
+// this system.
+//
+// Picking the first glob match is wrong when several UKIs exist (an old
+// and a new kernel.efi, for example): the status output would then report
+// the NV index of a policy that is not in use, showing a bogus "Token NV
+// mismatch". The policy is therefore selected by:
+//
+//  1. The booted UKI (LoaderImageIdentifier) — the same source the initrd
+//     uses to find the policy at boot.
+//  2. The policy whose NV index matches the LUKS device's token.
+//  3. The standard system locations.
+//  4. Otherwise, a single unambiguous glob match.
+func findPCRLockPolicy() string {
+	// 1. The booted UKI's policy.
+	if uki := bootedUKIPathFn(); uki != "" {
+		candidate := policyPathForUKI(uki)
+		if _, err := os.Stat(candidate); err == nil {
+			return candidate
+		}
+	}
+
+	// 2. The policy matching the token's NV index.
+	if policy := policyMatchingTokenNVFn(); policy != "" {
+		// Only accept a policy that actually exists — a stale match would
+		// make the status output describe a policy that is not in force.
+		if _, err := os.Stat(policy); err == nil {
+			return policy
+		}
+	}
+
+	// 3. Standard system locations.
+	for _, p := range standardPolicyPaths() {
 		if _, err := os.Stat(p); err == nil {
 			return p
 		}
 	}
-	return ""
+
+	// 4. A single unambiguous policy installed below the ESP.
+	//
+	// With several candidates the active one is unknown: picking the first
+	// would report (and NV-verify against) a policy that may not be in
+	// force, producing a false "NV was rewritten" diagnosis. Report no
+	// policy instead of guessing.
+	matches := installedPolicies()
+	if len(matches) != 1 {
+		return ""
+	}
+	return matches[0]
+}
+
+// bootedUKIPath returns the path of the UKI that was booted, as recorded in
+// the LoaderImageIdentifier EFI variable. Empty when unavailable (e.g. a
+// BIOS boot or a container).
+func bootedUKIPath() string {
+	efiVarPath := "/sys/firmware/efi/efivars/LoaderImageIdentifier-4a67b082-0a4c-41cf-b6c7-440b29bb8c4f"
+	data, err := os.ReadFile(efiVarPath)
+	if err != nil {
+		return ""
+	}
+	return decodeLoaderImageIdentifier(data)
+}
+
+// decodeLoaderImageIdentifier decodes the LoaderImageIdentifier EFI
+// variable: a 4-byte attribute header followed by a UTF-16LE string. The
+// result is the absolute path of the booted UKI (e.g.
+// /boot/EFI/Gentoo/kernel.efi).
+func decodeLoaderImageIdentifier(data []byte) string {
+	if len(data) < 6 {
+		return ""
+	}
+	// 4-byte attribute header, then a UTF-16LE string.
+	runes := make([]rune, 0, 32)
+	for i := 4; i+1 < len(data); i += 2 {
+		r := rune(binary.LittleEndian.Uint16(data[i : i+2]))
+		if r == 0 {
+			break
+		}
+		runes = append(runes, r)
+	}
+	path := strings.ReplaceAll(string(runes), "\\", "/")
+	if path == "" {
+		return ""
+	}
+	if !strings.HasPrefix(path, "/") {
+		path = "/" + path
+	}
+	return espMountPoint() + path
+}
+
+// espMountPoint returns the mount point of the EFI System Partition. The
+// ESP is not always mounted at /boot (some systems use /efi), so the
+// mount point is read from /etc/fstab; /boot is the fallback.
+func espMountPoint() string {
+	entries, err := fstab.Parse("/etc/fstab")
+	if err != nil {
+		return "/boot"
+	}
+	for _, e := range entries {
+		if e.FSType == "vfat" && strings.Contains(e.Options, "boot=esp") {
+			if e.Mountpoint != "" {
+				return e.Mountpoint
+			}
+		}
+	}
+	return "/boot"
+}
+
+// policyMatchingTokenNV returns the policy file whose nvIndex equals the
+// NV index pinned by the LUKS device's systemd-tpm2 token — i.e. the
+// policy that is actually in force for the encrypted volume.
+func policyMatchingTokenNV() string {
+	devices, err := luks.Detect()
+	if err != nil {
+		return ""
+	}
+	var tokenNV int
+	for _, dev := range devices {
+		tok, err := pcrlock.GetLUKSTPMToken(dev.Path)
+		if err != nil || tok.NVIndex == 0 {
+			continue
+		}
+		tokenNV = tok.NVIndex
+		break
+	}
+	if tokenNV == 0 {
+		return ""
+	}
+
+	var match string
+	for _, m := range installedPolicies() {
+		policy, err := pcrlock.ParsePolicy(m)
+		if err != nil {
+			continue
+		}
+		if policy.NVIndex != tokenNV {
+			continue
+		}
+		if match != "" {
+			// Several policies share the token's NV index: the active one
+			// is unknown, so do not pick one arbitrarily.
+			return ""
+		}
+		match = m
+	}
+	return match
 }
 
 func collectPCRLockStatus(data *statusData) {
@@ -354,7 +686,9 @@ func collectPCRLockStatus(data *statusData) {
 	data.HeaderBinding = collectHeaderBinding(data.LUKSDevices)
 
 	if info.NVIndex != 0 {
-		info.NVOnTPM = tpmNVExists(info.NVIndex)
+		exists, known := tpmNVExists(info.NVIndex)
+		info.NVOnTPM = exists
+		info.NVOnTPMUnknown = !known
 	}
 
 	var allPCRs []int
@@ -394,6 +728,7 @@ func collectPCRLockStatus(data *statusData) {
 		}
 
 		match := !isEnforced
+		unknown := false
 		if current, ok := currentPCRs[pcr]; ok {
 			for _, a := range allowed {
 				if bytesEqual(current, a) {
@@ -402,7 +737,13 @@ func collectPCRLockStatus(data *statusData) {
 				}
 			}
 		} else if isEnforced {
-			match = false
+			if currentPCRs == nil {
+				// The TPM could not be read at all: the PCR state is
+				// unknown, not a mismatch.
+				unknown = true
+			} else {
+				match = false
+			}
 		}
 
 		var currentHex string
@@ -414,6 +755,7 @@ func collectPCRLockStatus(data *statusData) {
 			PCR:        pcr,
 			Name:       name,
 			Match:      match,
+			Unknown:    unknown,
 			IsEnforced: isEnforced,
 			Current:    currentHex,
 		})
@@ -437,14 +779,19 @@ func collectPCRLockStatus(data *statusData) {
 	}
 }
 
-func tpmNVExists(index uint32) bool {
+// tpmNVExists reports whether the index is defined, and whether the NV state
+// could be read at all. A failed read is unknown, not "missing".
+func tpmNVExists(index uint32) (exists, known bool) {
 	client := tpm.New()
-	indexes, err := client.ListNVIndexes()
-	if err != nil {
-		return false
+	// Probe the index directly: a list-based check would silently treat an
+	// omitted index (a per-index read failure) as "not present".
+	if _, err := client.NVReadPublic(index); err != nil {
+		if tpm.IsNVIndexMissing(err) {
+			return false, true // definitively not defined
+		}
+		return false, false // transient or other failure: unknown
 	}
-	_, ok := indexes[index]
-	return ok
+	return true, true
 }
 
 func readSecureBootState() string {
@@ -486,6 +833,11 @@ func readPCRsFromTPM() map[int][]byte {
 				result[pcr] = v
 			}
 		}
+	}
+	// No bank produced a value: the TPM state is unavailable, not "all PCRs
+	// mismatch". Report nil so callers can tell it apart from valid data.
+	if len(result) == 0 {
+		return nil
 	}
 	return result
 }
@@ -627,13 +979,17 @@ func buildThreatModel(data *statusData) []threatVector {
 	vectors = append(vectors, buildEvilMaidVector(data))
 	vectors = append(vectors, buildBootChainTamperingVector(data))
 	vectors = append(vectors, buildTPMKeyExtractionVector(data))
+	vectors = append(vectors, buildTPMVulnerabilityVector(data))
+	vectors = append(vectors, buildTPMHealthVector(data))
 	vectors = append(vectors, buildDMAAttackVector(data))
 	vectors = append(vectors, buildKernelRuntimeVector(data))
 	vectors = append(vectors, buildColdBootVector(data))
+	vectors = append(vectors, buildPlatformExposureVector(data))
 	vectors = append(vectors, buildBruteForceVector(data))
 	vectors = append(vectors, buildPhysicalDebugVector(data))
 	vectors = append(vectors, buildFirmwareTamperingVector(data))
 	vectors = append(vectors, buildSMMAttackVector(data))
+	vectors = append(vectors, buildBootParamVector(data))
 
 	for i := range vectors {
 		vectors[i].Status = vectorStatus(&vectors[i])
@@ -645,7 +1001,10 @@ func buildThreatModel(data *statusData) []threatVector {
 
 func vectorIsCollapsed(v *threatVector) bool {
 	for _, m := range v.Mitigations {
-		if m.Status != "ok" && m.Status != "info" {
+		// "advisory" is context (a vendor CVE, a simulator note), not a
+		// verified defect — like "info" it must not mark the vector as
+		// problematic or drag the overall protection tier down.
+		if m.Status != "ok" && m.Status != "info" && m.Status != "advisory" {
 			return false
 		}
 	}
@@ -709,27 +1068,37 @@ func buildEvilMaidVector(data *statusData) threatVector {
 	if data.PCRLock != nil {
 		pcr7Bound := false
 		pcr7Match := false
+		pcr7Unknown := false
 		for _, r := range data.PCRLock.PCRResults {
 			if r.PCR == 7 {
 				pcr7Bound = r.IsEnforced
 				pcr7Match = r.Match
+				pcr7Unknown = r.Unknown
 				break
 			}
 		}
-		if !pcr7Bound {
+		switch {
+		case !pcr7Bound:
 			v.Mitigations = append(v.Mitigations, mitigation{
 				Name:   "PCRLock PCR 7",
 				Status: "warning",
 				Detail: "not in policy — Secure Boot state not measured",
 				Fix:    "Run: vanguard update -u <uki> -l <luks-dev>",
 			})
-		} else if !pcr7Match {
+		case pcr7Unknown:
+			// An unreadable PCR is not a Secure Boot change.
+			v.Mitigations = append(v.Mitigations, mitigation{
+				Name:   "PCRLock PCR 7",
+				Status: "info",
+				Detail: "could not be read — Secure Boot state unverified",
+			})
+		case !pcr7Match:
 			v.Mitigations = append(v.Mitigations, mitigation{
 				Name:   "PCRLock PCR 7",
 				Status: "critical",
 				Detail: "MISMATCH — Secure Boot state changed since enrollment",
 			})
-		} else {
+		default:
 			v.Mitigations = append(v.Mitigations, mitigation{
 				Name:   "PCRLock PCR 7",
 				Status: "ok",
@@ -844,6 +1213,7 @@ func buildBootChainTamperingVector(data *statusData) threatVector {
 	enforcedCount := 0
 	matchCount := 0
 	mismatchPCRs := []string{}
+	unknownPCRs := []string{}
 	// PCR 11's live value legitimately diverges from the policy in a booted
 	// system: the policy predicts the at-unseal-time value (sd-stub + LUKS
 	// header), and systemd extends PCR 11 further after unlock. The header
@@ -851,6 +1221,13 @@ func buildBootChainTamperingVector(data *statusData) threatVector {
 	// exclude PCR 11 from the live-match critical trigger.
 	for _, r := range data.PCRLock.PCRResults {
 		if !r.IsEnforced {
+			continue
+		}
+		if r.Unknown {
+			// An unreadable PCR — including PCR 11 — counts as enforced but
+			// is reported as unknown, never as a live mismatch.
+			enforcedCount++
+			unknownPCRs = append(unknownPCRs, fmt.Sprintf("PCR %d (%s)", r.PCR, r.Name))
 			continue
 		}
 		if r.PCR == PCR11ForStatus && data.HeaderBinding != nil {
@@ -868,7 +1245,7 @@ func buildBootChainTamperingVector(data *statusData) threatVector {
 	// (older policy on disk, non-LUKS device, or check errored).
 	if data.HeaderBinding == nil {
 		for _, r := range data.PCRLock.PCRResults {
-			if r.IsEnforced && r.PCR == PCR11ForStatus {
+			if r.IsEnforced && r.PCR == PCR11ForStatus && !r.Unknown {
 				enforcedCount++
 				if r.Match {
 					matchCount++
@@ -893,7 +1270,8 @@ func buildBootChainTamperingVector(data *statusData) threatVector {
 			Detail: fmt.Sprintf("mismatch: %s", strings.Join(mismatchPCRs, ", ")),
 			Fix:    "Run: vanguard update -u <uki> -l <luks-dev>",
 		})
-	} else {
+	} else if len(unknownPCRs) == 0 {
+		// "All match" is only claimed when nothing was unreadable.
 		v.Mitigations = append(v.Mitigations, mitigation{
 			Name:   "PCRLock PCR binding",
 			Status: "ok",
@@ -901,9 +1279,23 @@ func buildBootChainTamperingVector(data *statusData) threatVector {
 		})
 	}
 
+	if len(unknownPCRs) > 0 {
+		v.Mitigations = append(v.Mitigations, mitigation{
+			Name:   "PCRLock PCR binding",
+			Status: "info",
+			Detail: fmt.Sprintf("%d PCR(s) could not be read: %s", len(unknownPCRs), strings.Join(unknownPCRs, ", ")),
+		})
+	}
+
 	// NV index on TPM
 	if data.PCRLock.NVIndex != 0 {
-		if data.PCRLock.NVOnTPM {
+		if data.PCRLock.NVOnTPMUnknown {
+			v.Mitigations = append(v.Mitigations, mitigation{
+				Name:   "PCRLock NV index",
+				Status: "info",
+				Detail: fmt.Sprintf("0x%x could not be verified (TPM read failed)", data.PCRLock.NVIndex),
+			})
+		} else if data.PCRLock.NVOnTPM {
 			v.Mitigations = append(v.Mitigations, mitigation{
 				Name:   "PCRLock NV index",
 				Status: "ok",
@@ -1066,7 +1458,13 @@ func buildTPMKeyExtractionVector(data *statusData) threatVector {
 	}
 
 	// DA lockout
-	if data.TPM.InLockout {
+	if data.TPM.LockoutError != "" {
+		v.Mitigations = append(v.Mitigations, mitigation{
+			Name:   "Dictionary attack lockout",
+			Status: "info",
+			Detail: "could not be read: " + data.TPM.LockoutError,
+		})
+	} else if data.TPM.InLockout {
 		v.Mitigations = append(v.Mitigations, mitigation{
 			Name:   "Dictionary attack lockout",
 			Status: "critical",
@@ -1721,9 +2119,12 @@ func renderVerbosePCRs(data *statusData) string {
 			label = "unbound"
 		}
 		var matchStr string
-		if r.Match {
+		switch {
+		case r.Unknown:
+			matchStr = warnStyle.Render("unknown")
+		case r.Match:
 			matchStr = okStyle.Render("match")
-		} else {
+		default:
 			matchStr = errStyle.Render("MISMATCH")
 		}
 

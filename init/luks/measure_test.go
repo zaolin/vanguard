@@ -308,7 +308,7 @@ func TestBuildCELRecord_Format(t *testing.T) {
 		digest[i] = byte(i)
 	}
 
-	data, err := buildCELRecord(11, digest)
+	data, err := buildCELRecord(11, digest, "")
 	if err != nil {
 		t.Fatalf("buildCELRecord: %v", err)
 	}
@@ -420,7 +420,7 @@ func TestMeasureHeaderWithDeps_Success(t *testing.T) {
 
 	// Track event log write
 	var eventLogWritten bool
-	writeEventLog := func(pcr int, digest []byte) error {
+	writeEventLog := func(pcr int, digest []byte, devicePath string) error {
 		eventLogWritten = true
 		if pcr != PCRUsedForLUKSHeader {
 			t.Errorf("event log PCR: got %d, want %d", pcr, PCRUsedForLUKSHeader)
@@ -457,7 +457,10 @@ func TestMeasureHeaderWithDeps_HashFails(t *testing.T) {
 	err := measureHeaderWithDeps(
 		"/dev/nonexistent-device-12345",
 		func() *intpm.Client { t.Fatal("TPM client should not be created when hash fails"); return nil },
-		func(int, []byte) error { t.Fatal("event log should not be written when hash fails"); return nil },
+		func(int, []byte, string) error {
+			t.Fatal("event log should not be written when hash fails")
+			return nil
+		},
 	)
 	if err != nil {
 		t.Errorf("MeasureHeader should return nil on hash failure, got: %v", err)
@@ -477,7 +480,10 @@ func TestMeasureHeaderWithDeps_TPMNotAvailable(t *testing.T) {
 	err := measureHeaderWithDeps(
 		path,
 		intpm.New,
-		func(int, []byte) error { t.Fatal("event log should not be written when TPM unavailable"); return nil },
+		func(int, []byte, string) error {
+			t.Fatal("event log should not be written when TPM unavailable")
+			return nil
+		},
 	)
 	if err != nil {
 		t.Errorf("MeasureHeader should return nil when TPM unavailable, got: %v", err)
@@ -515,7 +521,7 @@ func TestMeasureHeaderWithDeps_ExtendFailsNonFatal(t *testing.T) {
 	err := measureHeaderWithDeps(
 		path,
 		func() *intpm.Client { return tpmClient },
-		func(int, []byte) error { eventLogWritten = true; return nil },
+		func(int, []byte, string) error { eventLogWritten = true; return nil },
 	)
 	if err != nil {
 		t.Errorf("MeasureHeader should return nil on extend failure, got: %v", err)
@@ -537,7 +543,7 @@ func TestMeasureHeaderWithDeps_EventLogWriteFailsNonFatal(t *testing.T) {
 	err := measureHeaderWithDeps(
 		path,
 		func() *intpm.Client { return tpmClient },
-		func(int, []byte) error { return errors.New("simulated event log write failure") },
+		func(int, []byte, string) error { return errors.New("simulated event log write failure") },
 	)
 	if err != nil {
 		t.Errorf("MeasureHeader should return nil even when event log write fails, got: %v", err)

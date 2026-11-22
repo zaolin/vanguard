@@ -20,8 +20,11 @@ import (
 
 const (
 	// socketWaitTimeout is how long to wait for the swtpm unix socket to
-	// appear after spawning the process.
-	socketWaitTimeout = 5 * time.Second
+	// appear after spawning the process. Under a parallel `go test ./...`
+	// the machine starts several swtpm instances at once; 5s proved to be
+	// too short there and produced spurious failures while the same tests
+	// passed in isolation.
+	socketWaitTimeout = 30 * time.Second
 
 	// readyProbeTimeout is how long to wait for swtpm to actually answer
 	// TPM commands after the socket exists. The socket file can be visible
@@ -29,7 +32,7 @@ const (
 	// machine, particularly under CI load — sending commands during that
 	// window either fails intermittently or hangs. We therefore issue a
 	// trivial GetCapability until it succeeds.
-	readyProbeTimeout = 5 * time.Second
+	readyProbeTimeout = 30 * time.Second
 
 	// probeInterval is how often to retry the readiness probe.
 	probeInterval = 50 * time.Millisecond
@@ -81,7 +84,11 @@ func startSwtpm(tmpDir string) (transport.TPMCloser, func(), error) {
 	}
 	if _, err := os.Stat(socketPath); err != nil {
 		killNow()
-		return nil, nil, fmt.Errorf("swtpm socket did not appear within %v: %w", socketWaitTimeout, err)
+		// Include swtpm's own log: "the socket did not appear" alone does
+		// not say whether the binary is missing a backend, crashed, or was
+		// simply too slow under parallel test load.
+		logData, _ := os.ReadFile(filepath.Join(tmpDir, "swtpm.log"))
+		return nil, nil, fmt.Errorf("swtpm socket did not appear within %v: %w\nswtpm log:\n%s", socketWaitTimeout, err, logData)
 	}
 
 	// Probe readiness: the socket can exist before swtpm is ready to
@@ -124,21 +131,65 @@ func startSwtpm(tmpDir string) (transport.TPMCloser, func(), error) {
 
 // Setup starts a swtpm instance and returns a transport connected to it,
 // along with a cleanup function that stops swtpm and removes the temp dir.
-// Tests are skipped if swtpm is not installed.
+//
+// A missing simulator is an environment limitation and skips the test. An
+// installed simulator that cannot be started is a harness problem and fails
+// loudly — otherwise a broken harness would silently skip the TPM suite.
 func Setup(t *testing.T) (transport.TPMCloser, func()) {
 	t.Helper()
 
-	// Check if swtpm is available
 	if _, err := exec.LookPath("swtpm"); err != nil {
-		t.Skip("swtpm not found - skipping TPM integration test")
+		t.Skip("swtpm not installed - skipping TPM integration test")
+	}
+	tpm, cleanup, _ := startSwtpmRetry(t)
+	return tpm, cleanup
+}
+
+// SetupEnvTransport starts an swtpm instance, points VANGUARD_TPM_SOCKET at it
+// and returns a transport connected to that same simulator.
+//
+// Use this for code under test that opens its TPM itself via tpm.New(); the
+// returned transport lets the test talk to the same simulator (e.g. to create
+// NV indexes). Callers that only need the environment may discard it — the
+// transport is closed by the registered cleanup.
+//
+// A missing simulator is an environment limitation and skips the test; an
+// installed one that cannot start fails loudly.
+func SetupEnvTransport(t *testing.T) transport.TPMCloser {
+	t.Helper()
+
+	if _, err := exec.LookPath("swtpm"); err != nil {
+		t.Skip("swtpm not installed - skipping TPM integration test")
 	}
 
-	tmpDir := t.TempDir()
-	tpm, cleanup, err := startSwtpm(tmpDir)
-	if err != nil {
-		t.Fatalf("swtpm setup: %v", err)
+	tpm, cleanup, socketPath := startSwtpmRetry(t)
+	t.Cleanup(cleanup)
+	t.Setenv("VANGUARD_TPM_SOCKET", socketPath)
+	return tpm
+}
+
+// startSwtpmRetry starts an swtpm instance in a fresh temp dir, retrying a
+// failed start once.
+//
+// Under a parallel `go test ./...` several test binaries start swtpm at the
+// same time and a start can be lost to that contention. A single retry
+// absorbs it; a genuinely broken simulator fails both attempts and is
+// reported loudly, so the harness cannot silently skip the TPM suite.
+func startSwtpmRetry(t *testing.T) (transport.TPMCloser, func(), string) {
+	t.Helper()
+
+	var lastErr error
+	for attempt := 1; attempt <= 2; attempt++ {
+		tmpDir := t.TempDir()
+		tpm, cleanup, err := startSwtpm(tmpDir)
+		if err == nil {
+			return tpm, cleanup, filepath.Join(tmpDir, "swtpm.sock")
+		}
+		lastErr = err
+		t.Logf("swtpm start attempt %d failed: %v", attempt, err)
 	}
-	return tpm, cleanup
+	t.Fatalf("swtpm could not be started: %v", lastErr)
+	return nil, nil, ""
 }
 
 // TrySetup is like Setup but returns an error instead of calling t.Fatal /

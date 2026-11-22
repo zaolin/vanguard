@@ -2,7 +2,13 @@
 
 package tui
 
+import "errors"
+
 // In debug mode, TUI is disabled - all functions are no-ops
+
+// ErrPromptUnavailable mirrors the release-build sentinel: in debug builds
+// every prompt routes to the console.
+var ErrPromptUnavailable = errors.New("TUI not available")
 
 // Boot stage names (same as in tui.go, needed for compilation)
 const (
@@ -38,6 +44,11 @@ func StageError(stage string, err error) {}
 // PromptPassword returns an error in debug mode - use console.ReadPassword instead
 func PromptPassword(device string) (string, error) {
 	return "", nil // Will fall back to console
+}
+
+// PromptAvailable is always false in debug mode - prompts go to the console
+func PromptAvailable() bool {
+	return false
 }
 
 // PasswordError is a no-op in debug mode

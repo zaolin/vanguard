@@ -308,73 +308,64 @@ func computePolicyAuthorizeNVHash(nvName []byte) ([]byte, error) {
 	return h.Sum(nil), nil
 }
 
-// computeNVName computes the TPM NV index name from a raw TPM2B_NV_PUBLIC blob.
-// The name is: nameAlg (2 bytes) || H(TPMS_NV_PUBLIC), where the hash is SHA256
-// for SHA256-nameAlg indexes (the only case vanguard supports).
+// ComputeNVNameFromPublic computes the TPM NV index name from a marshalled
+// TPMS_NV_PUBLIC (without the TPM2B size prefix).
 //
-// The TPM2B_NV_PUBLIC layout is:
+// The name is: nameAlg (2 bytes) || H(TPMS_NV_PUBLIC), where the hash is
+// SHA256 for SHA256-nameAlg indexes (the only case vanguard supports).
 //
-//	[0:2]   TPM2B size (uint16)
-//	[2:6]   NVIndex (uint32)
-//	[6:8]   nameAlg (uint16)
-//	[8:12]  attributes (uint32)
-//	[12:14] authPolicy size (uint16)
-//	[14:14+aps] authPolicy data
-//	[14+aps:14+aps+2] dataSize (uint16)
+// The TPMS_NV_PUBLIC layout is:
 //
-// The name covers the TPMS_NV_PUBLIC (starting at offset 2, after the TPM2B size).
-// If the blob doesn't start with a TPM2B size, we treat the entire blob as the
-// TPMS_NV_PUBLIC (offset 0).
+//	[0:4]   NVIndex (uint32)
+//	[4:6]   nameAlg (uint16)
+//	[6:10]  attributes (uint32)
+//	[10:12] authPolicy size (uint16)
+//	[12:12+aps] authPolicy data
+//	[12+aps:12+aps+2] dataSize (uint16)
 //
 // Volatile attribute bits (Written, ReadLocked, WriteLocked) are masked out
-// before hashing. These bits change at runtime (e.g. Written is set when
-// make-policy writes the digest) and are not part of the NV index identity.
-// Without masking, the name from the token's TPM2B_NV_PUBLIC (captured at
-// enrollment, before writing) would never match the TPM's current name (which
-// has Written=1 after make-policy runs).
+// before hashing. These bits change at runtime (Written is set by the first
+// write) and are not part of the NV index identity. Without masking, the
+// name of the index's public area as it was at definition time would never
+// match the name of the live index after the first write — proven on swtpm
+// by TestMaskedNVNameMatchesDefinitionAndSurvivesWrite.
+//
+// The caller must know the layout: guessing whether a blob starts with a
+// TPM2B size prefix is ambiguous, because the low bytes of the NV index
+// handle can look like a size.
 //
 // Returns the name (nameAlg || hash) or an error if the blob is too short.
-func computeNVName(nvPublicBlob []byte) ([]byte, error) {
-	if len(nvPublicBlob) < 8 {
-		return nil, fmt.Errorf("NV public blob too short: %d bytes", len(nvPublicBlob))
+func ComputeNVNameFromPublic(tpms []byte) ([]byte, error) {
+	if len(tpms) < 12 {
+		return nil, fmt.Errorf("TPMS_NV_PUBLIC too short: %d bytes", len(tpms))
 	}
 
-	// Determine where TPMS_NV_PUBLIC starts. If the first 2 bytes look like a
-	// TPM2B size that roughly matches the remaining data, skip it.
-	TPMSStart := 0
-	declaredSize := int(binary.BigEndian.Uint16(nvPublicBlob[0:2]))
-	if declaredSize > 0 && declaredSize <= len(nvPublicBlob)-2 && declaredSize >= 10 {
-		TPMSStart = 2
-	}
-
-	tpmsData := nvPublicBlob[TPMSStart:]
-	if len(tpmsData) < 12 {
-		return nil, fmt.Errorf("TPMS_NV_PUBLIC too short: %d bytes", len(tpmsData))
-	}
-
-	nameAlg := int(binary.BigEndian.Uint16(tpmsData[4:6]))
+	nameAlg := int(binary.BigEndian.Uint16(tpms[4:6]))
 	if nameAlg != int(tpm2.TPMAlgSHA256) {
 		return nil, fmt.Errorf("unsupported NV name algorithm: 0x%x (only SHA256 supported)", nameAlg)
 	}
 
-	// Mask volatile attribute bits before hashing. The attributes field is a
-	// 4-byte big-endian uint32 at offset 6 within TPMS_NV_PUBLIC (after
+	// Mask volatile attribute bits before hashing. The attributes field is
+	// a 4-byte big-endian uint32 at offset 6 within TPMS_NV_PUBLIC (after
 	// NVIndex[4] + nameAlg[2] = 6 bytes).
 	// Volatile bits: WriteLocked (bit 11), ReadLocked (bit 28), Written (bit 29).
 	const volatileMask = uint32(1<<11 | 1<<28 | 1<<29) // 0x30000800
 
-	// Copy tpmsData so we don't modify the caller's slice
-	hashData := make([]byte, len(tpmsData))
-	copy(hashData, tpmsData)
-
-	// Mask volatile bits in the attributes field (bytes 6-9 within TPMS_NV_PUBLIC)
+	hashData := make([]byte, len(tpms))
+	copy(hashData, tpms)
 	if len(hashData) >= 10 {
 		attrs := binary.BigEndian.Uint32(hashData[6:10])
 		attrs &^= volatileMask // clear volatile bits
 		binary.BigEndian.PutUint32(hashData[6:10], attrs)
 	}
 
-	hash := sha256.Sum256(hashData)
+	return nvNameFromPublic(hashData, nameAlg)
+}
+
+// nvNameFromPublic hashes the (already masked) TPMS_NV_PUBLIC and prefixes
+// it with the name algorithm.
+func nvNameFromPublic(maskedTPMS []byte, nameAlg int) ([]byte, error) {
+	hash := sha256.Sum256(maskedTPMS)
 
 	name := make([]byte, 2+sha256.Size)
 	binary.BigEndian.PutUint16(name[0:2], uint16(nameAlg))

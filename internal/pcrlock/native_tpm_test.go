@@ -11,14 +11,13 @@ import (
 // function works without shelling out to tpm2_getcap.
 func TestListNVIndices_NativeGoTPM(t *testing.T) {
 	// This test requires a TPM — skip if swtpm not available
-	if _, err := swtpmtest.Setup(t); err != nil {
-		t.Skip("swtpm not available")
-	}
+	swtpmtest.SetupEnvTransport(t)
 
 	indices, err := listNVIndices()
 	if err != nil {
-		// listNVIndices uses tpm.New() which opens /dev/tpmrm0 — may fail on CI
-		t.Skipf("listNVIndices requires TPM device: %v", err)
+		// SetupEnv provides a simulator, so a failure here is a real
+		// regression, not a missing environment.
+		t.Fatalf("listNVIndices failed against the simulator: %v", err)
 	}
 
 	// Just verify it returns a valid slice (may be empty on fresh swtpm)
@@ -50,20 +49,53 @@ func TestIsPCRLockNVIndex_FiltersOutOfRange(t *testing.T) {
 	}
 }
 
-// TestIsPCRLockNVIndex_AcceptsPcrlockRange verifies that indexes in the
-// pcrlock NV range pass the range check. The full attribute check requires
-// a TPM and will return false without one, but the range check should not
-// reject them (and should not hang or panic).
+// TestIsPCRLockNVIndex_AcceptsPcrlockRange verifies the pcrlock NV index
+// detection against a real (simulated) TPM: an index with the pcrlock shape
+// is accepted, an undefined index in the same range is not, and a recovery
+// index is rejected by range.
 func TestIsPCRLockNVIndex_AcceptsPcrlockRange(t *testing.T) {
-	// This test calls isPCRLockNVIndex which uses tpm.New() internally.
-	// On machines with a real TPM, this does real I/O (slow).
-	// On CI (no TPM), it fails fast. Skip if no TPM device.
-	if _, err := swtpmtest.Setup(t); err != nil {
-		t.Skip("swtpm not available")
-	}
+	tpmTransport := swtpmtest.SetupEnvTransport(t)
 
-	// Just verify it doesn't panic
-	_ = isPCRLockNVIndex(0x01800000)
+	const index = uint32(0x01800001)
+
+	// The shape systemd-pcrlock uses: ordinary NV index, 34 bytes
+	// (TPMT_HA), policywrite + ownerread, no platformcreate.
+	_, _ = tpm2.NVUndefineSpace{
+		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
+		NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(index)},
+	}.Execute(tpmTransport)
+	if _, err := (tpm2.NVDefineSpace{
+		AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
+		PublicInfo: tpm2.New2B(tpm2.TPMSNVPublic{
+			NVIndex: tpm2.TPMHandle(index),
+			NameAlg: tpm2.TPMAlgSHA256,
+			Attributes: tpm2.TPMANV{
+				PolicyWrite: true,
+				OwnerRead:   true,
+				WriteAll:    true,
+				NT:          tpm2.TPMNTOrdinary,
+			},
+			DataSize: 34,
+		}),
+	}).Execute(tpmTransport); err != nil {
+		t.Fatalf("NVDefineSpace: %v", err)
+	}
+	defer func() {
+		_, _ = tpm2.NVUndefineSpace{
+			AuthHandle: tpm2.AuthHandle{Handle: tpm2.TPMRHOwner, Auth: tpm2.PasswordAuth(nil)},
+			NVIndex:    tpm2.NamedHandle{Handle: tpm2.TPMHandle(index)},
+		}.Execute(tpmTransport)
+	}()
+
+	if !isPCRLockNVIndex(int(index)) {
+		t.Error("a pcrlock-shaped NV index was not detected")
+	}
+	if isPCRLockNVIndex(0x01800002) {
+		t.Error("an undefined index must not be reported as pcrlock")
+	}
+	if isPCRLockNVIndex(0x01C30001) {
+		t.Error("a recovery index must not be reported as pcrlock")
+	}
 }
 
 // TestRemoveNVIndex_NativeGoTPM verifies that removeNVIndex uses native

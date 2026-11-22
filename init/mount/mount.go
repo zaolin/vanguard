@@ -9,6 +9,7 @@ import (
 
 	"github.com/zaolin/vanguard/init/console"
 	"github.com/zaolin/vanguard/init/fstab"
+	"github.com/zaolin/vanguard/init/lvm"
 	"golang.org/x/sys/unix"
 )
 
@@ -353,8 +354,11 @@ func normalizeLVMPath(device string) string {
 		return device
 	}
 
-	// Construct the /dev/mapper/<vg>-<lv> path
-	mapperPath := filepath.Join("/dev/mapper", vg+"-"+lv)
+	// Construct the /dev/mapper/<vg>-<lv> path. Hyphens inside VG/LV names
+	// are escaped as "--" in device-mapper names (VG "a-b" LV "c" maps to
+	// "a--b-c"); using the shared escape helper keeps this consistent with
+	// init/resume and init/lvm.
+	mapperPath := filepath.Join("/dev/mapper", lvm.EscapeMapperName(vg)+"-"+lvm.EscapeMapperName(lv))
 
 	// Check if the mapper path exists
 	if _, err := os.Stat(mapperPath); err == nil {
@@ -538,13 +542,25 @@ func MountBootEarly() (bool, error) {
 		return false, nil // No boot partition found
 	}
 
-	// Mount as vfat (ESP is always FAT32) — read-only for security.
-	// The bootlog will remount RW transiently when it needs to write.
-	if err := unix.Mount(bootDev, "/boot", "vfat", unix.MS_RDONLY, ""); err != nil {
-		return false, fmt.Errorf("failed to mount boot partition %s: %w", bootDev, err)
+	// Mount read-only for security. Prefer the fstab-declared fstype:
+	// /boot is not always the ESP — ext4/xfs /boot partitions otherwise
+	// fail the vfat-only mount, the early pcrlock setup gets skipped, and
+	// the pcrlock token unseal fails on every boot. The bootlog will
+	// remount RW transiently when it needs to write.
+	fstype := getFstabFSType(bootDev)
+	if fstype == "" || isPseudoFS(fstype) {
+		fstype = ""
 	}
-	console.DebugPrint("vanguard: mounted early /boot (%s, vfat, ro)\n", bootDev)
-	return true, nil
+	for _, fs := range []string{fstype, "vfat", "ext4", "xfs"} {
+		if fs == "" {
+			continue
+		}
+		if err := unix.Mount(bootDev, "/boot", fs, unix.MS_RDONLY, ""); err == nil {
+			console.DebugPrint("vanguard: mounted early /boot (%s, %s, ro)\n", bootDev, fs)
+			return true, nil
+		}
+	}
+	return false, fmt.Errorf("failed to mount boot partition %s (tried fstab fstype, vfat, ext4, xfs)", bootDev)
 }
 
 // UnmountBootEarly unmounts /boot in initramfs.
@@ -732,16 +748,24 @@ func findBootPartition() string {
 		}
 	}
 
-	// Try each candidate - mount as vfat and check for pcrlock.json at derived path
+	// Try each candidate - mount (fstab fstype first, then fallbacks) and
+	// check for pcrlock.json at derived path
 	for _, dev := range candidates {
-		if err := unix.Mount(dev, "/boot", "vfat", unix.MS_RDONLY, ""); err == nil {
+		for _, fs := range []string{getFstabFSType(dev), "vfat", "ext4", "xfs"} {
+			if fs == "" || isPseudoFS(fs) {
+				continue
+			}
+			if err := unix.Mount(dev, "/boot", fs, unix.MS_RDONLY, ""); err != nil {
+				continue
+			}
 			// Check if pcrlock.json exists at the derived path
 			if _, err := os.Stat(pcrLockPath); err == nil {
-				console.DebugPrint("vanguard: found pcrlock on %s\n", dev)
+				console.DebugPrint("vanguard: found pcrlock on %s (%s)\n", dev, fs)
 				unix.Unmount("/boot", 0)
 				return dev
 			}
 			unix.Unmount("/boot", 0)
+			break
 		}
 	}
 

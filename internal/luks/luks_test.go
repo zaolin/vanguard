@@ -5,21 +5,22 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+	"github.com/zaolin/vanguard/internal/testutil"
 	"golang.org/x/crypto/xts"
 )
 
 func skipIfNoCryptsetup(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("cryptsetup"); err != nil {
-		t.Skip("cryptsetup not found on PATH")
-	}
+	testutil.RequireCryptsetup(t)
 }
 
 func prepareLuks2Disk(t *testing.T, password string, cryptsetupArgs ...string) *os.File {
@@ -173,12 +174,17 @@ func TestLuks2PassphrasePBKDF2(t *testing.T) {
 
 func TestLuks2MultipleKeyslots(t *testing.T) {
 	skipIfNoCryptsetup(t)
-	// This test is flaky on CI due to cryptsetup timing issues.
-	// Use t.Skip to skip on CI if it fails on first try.
-	if os.Getenv("CI") != "" {
-		t.Skip("skipping flaky TestLuks2MultipleKeyslots on CI")
-	}
 
+	// The scenario waits for the asynchronously written keyslot (see
+	// waitForKeyslots), so a single deterministic pass is enough — a
+	// retry loop or a CI skip would hide a real regression.
+	if err := runLuks2MultipleKeyslots(t); err != nil {
+		t.Fatalf("luks2 multiple keyslots: %v", err)
+	}
+}
+
+// runLuks2MultipleKeyslots performs one pass of the multi-keyslot scenario.
+func runLuks2MultipleKeyslots(t *testing.T) error {
 	password1 := "firstpass"
 	disk := prepareLuks2Disk(t, password1)
 	defer disk.Close()
@@ -191,24 +197,60 @@ func TestLuks2MultipleKeyslots(t *testing.T) {
 		addCmd.Stdout = os.Stdout
 		addCmd.Stderr = os.Stderr
 	}
-	require.NoError(t, addCmd.Run(), "luksAddKey failed")
+	if err := addCmd.Run(); err != nil {
+		return fmt.Errorf("luksAddKey failed: %w", err)
+	}
+
+	// luksAddKey writes the new keyslot into the header asynchronously.
+	// Reading the header before the write landed is the source of the
+	// historical flakiness here, so wait for the second keyslot to
+	// appear instead of retrying the whole scenario.
+	if err := waitForKeyslots(disk.Name(), 2); err != nil {
+		return err
+	}
 
 	dev, err := Open(disk.Name())
-	require.NoError(t, err)
+	if err != nil {
+		return fmt.Errorf("Open: %w", err)
+	}
 	defer dev.Close()
 
 	slots := dev.Slots()
-	require.Len(t, slots, 2, "expected 2 keyslots after adding a second one")
+	if len(slots) != 2 {
+		return fmt.Errorf("expected 2 keyslots after adding a second one, got %d", len(slots))
+	}
 
-	_, err = dev.UnsealVolume(slots[0], []byte(password1))
-	require.NoError(t, err, "slot 0 should unlock with first passphrase")
+	if _, err := dev.UnsealVolume(slots[0], []byte(password1)); err != nil {
+		return fmt.Errorf("slot 0 should unlock with first passphrase: %w", err)
+	}
 
-	_, err = dev.UnsealVolume(slots[1], []byte(password2))
-	require.NoError(t, err, "slot 1 should unlock with second passphrase")
+	if _, err := dev.UnsealVolume(slots[1], []byte(password2)); err != nil {
+		return fmt.Errorf("slot 1 should unlock with second passphrase: %w", err)
+	}
 
-	_, err = dev.UnsealVolume(slots[0], []byte(password2))
-	require.ErrorIs(t, err, ErrPassphraseDoesNotMatch,
-		"slot 0 should NOT unlock with second passphrase")
+	if _, err := dev.UnsealVolume(slots[0], []byte(password2)); !errors.Is(err, ErrPassphraseDoesNotMatch) {
+		return fmt.Errorf("slot 0 should NOT unlock with second passphrase, got %v", err)
+	}
+	return nil
+}
+
+// waitForKeyslots waits until the LUKS2 header of devicePath reports the
+// expected number of keyslots.
+func waitForKeyslots(devicePath string, want int) error {
+	deadline := time.Now().Add(10 * time.Second)
+	var last int
+	for time.Now().Before(deadline) {
+		dev, err := Open(devicePath)
+		if err == nil {
+			last = len(dev.Slots())
+			dev.Close()
+			if last == want {
+				return nil
+			}
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return fmt.Errorf("expected %d keyslots in %s, got %d", want, devicePath, last)
 }
 
 func TestLuks2Keysize256(t *testing.T) {

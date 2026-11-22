@@ -165,14 +165,53 @@ func CleanupDB() error {
 	return nil
 }
 
-// Stop terminates udevd daemon gracefully using SIGTERM.
-// This allows udevd to clean up properly before switch_root.
-func Stop() {
-	if udevdCmd != nil && udevdCmd.Process != nil {
-		console.DebugPrint("udev: stopping udevd gracefully\n")
+// findBinaryFn resolves a binary from a list of candidate paths, and
+// udevadmRunner executes udevadm. Both are package variables so the udev
+// stop path can be tested without udevadm installed.
+var (
+	findBinaryFn  = findBinary
+	udevadmRunner = func(binary string, args ...string) error {
+		return exec.Command(binary, args...).Run()
+	}
+)
 
-		// Send SIGTERM for graceful shutdown
-		udevdCmd.Process.Signal(os.Interrupt)
+// udevadmExitArgs returns the args used to stop a daemonized udevd,
+// selected so tests can pin the mechanism.
+func udevadmExitArgs() []string {
+	return []string{"control", "--exit"}
+}
+
+// Stop terminates the udevd daemon gracefully.
+//
+// Start() launches udevd with --daemon: it forks, and its immediate child
+// exits; udevdCmd.Process therefore refers to a dead pid. Signaling or
+// waiting on that pid can never stop the real daemon — the surviving
+// udevd would then compete with the system's own systemd-udevd.service
+// after switch_root. The reliable way to stop a daemonized udevd is
+// `udevadm control --exit`, which talks to the running daemon over its
+// control socket and waits for it to exit. The direct signal is kept only
+// as a fallback for a foreground start.
+func Stop() {
+	// Preferred: ask the running daemon to exit over the control socket.
+	udevadm := findBinaryFn(udevadmPaths)
+	if udevadm != "" {
+		if err := udevadmRunner(udevadm, udevadmExitArgs()...); err == nil {
+			console.DebugPrint("udev: udevd stopped via udevadm control --exit\n")
+			udevdCmd = nil
+			return
+		} else {
+			console.DebugPrint("udev: udevadm control --exit failed: %v\n", err)
+		}
+	}
+
+	// Fallback: signal the child we started (foreground daemon, or --exit
+	// unavailable). If the daemonized parent already exited, this is a
+	// no-op on a reaped/dead pid.
+	if udevdCmd != nil && udevdCmd.Process != nil {
+		console.DebugPrint("udev: stopping udevd via signal\n")
+
+		// Send SIGINT for graceful shutdown
+		_ = udevdCmd.Process.Signal(os.Interrupt)
 
 		// Wait with timeout for graceful shutdown
 		done := make(chan error, 1)
@@ -186,7 +225,7 @@ func Stop() {
 		case <-time.After(2 * time.Second):
 			// Timeout - force kill
 			console.DebugPrint("udev: graceful stop timed out, killing\n")
-			udevdCmd.Process.Kill()
+			_ = udevdCmd.Process.Kill()
 			<-done
 		}
 	}

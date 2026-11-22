@@ -105,11 +105,11 @@ func TestVectorStatus_Empty(t *testing.T) {
 	}
 }
 
-func TestBuildThreatModel_TenVectors(t *testing.T) {
+func TestBuildThreatModel_VectorCount(t *testing.T) {
 	data := &statusData{}
 	vectors := buildThreatModel(data)
-	if len(vectors) != 10 {
-		t.Errorf("expected 10 threat vectors, got %d", len(vectors))
+	if len(vectors) != 14 {
+		t.Errorf("expected 14 threat vectors, got %d", len(vectors))
 	}
 }
 
@@ -120,13 +120,17 @@ func TestBuildThreatModel_VectorNames(t *testing.T) {
 		"Evil Maid (initrd/UKI replacement)",
 		"Boot Chain Tampering (firmware/UKI change)",
 		"TPM Key Extraction (bus sniffing)",
+		"TPM Vulnerabilities (vendor/firmware)",
+		"TPM Functional Health",
 		"DMA Attack (Thunderbolt/PCIe)",
 		"Kernel Runtime Attack (module/rootkit)",
 		"Cold Boot Attack (RAM dump)",
+		"Platform Data Exposure",
 		"Brute-Force / Key Theft (LUKS)",
 		"Physical Debug Attack (JTAG/DCI)",
 		"Firmware Tampering (SPI flash/replay/downgrade)",
 		"SMM Attack (ring -2 rootkit)",
+		"Boot Parameter Bypass",
 	}
 	for i, name := range expected {
 		if vectors[i].Name != name {

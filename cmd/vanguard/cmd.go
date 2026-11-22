@@ -47,7 +47,28 @@ type UpdatePolicyCmd struct {
 	Cleanup      bool   `short:"c" help:"Remove old unused pcrlock NV indices from TPM"`
 	DryRun       bool   `help:"Show what would be done without modifying TPM or writing policy"`
 	JSON         bool   `help:"Output results as JSON (implies --dry-run for non-mutating commands)"`
-	Config       string `type:"path" help:"Path to TOML config file (e.g., /etc/vanguard.toml). Reads uki_path and luks_device from config if not set via flags."`
+	// RepairToken re-seals the LUKS token against the freshly generated
+	// policy when the token pins a different (old) pcrlock NV index.
+	// Runs systemd-cryptenroll --wipe-slot=tpm2 automatically. Requires
+	// the disk passphrase (systemd-cryptenroll prompts for it) unless
+	// --non-interactive is given.
+	RepairToken bool `help:"After update: if the LUKS token pins a stale NV index, re-seal it against the new policy (runs systemd-cryptenroll)"`
+	// NonInteractive makes --repair-token unlock the volume with the
+	// EXISTING TPM2 token instead of prompting for the passphrase
+	// (systemd-cryptenroll --unlock-tpm2-device=auto, systemd 256+).
+	// This is what the vanguard-pcrlock-relock.service uses, so a policy
+	// regeneration after a firmware update also re-points the token.
+	NonInteractive bool `help:"With --repair-token: unlock the volume via the existing TPM2 token instead of prompting for the passphrase"`
+	// RepairUnlock selects an explicit unlock method for --repair-token
+	// (e.g. "tpm2-device" or "key-file"). Overrides --non-interactive.
+	RepairUnlock string `help:"With --repair-token: unlock method (tpm2-device, key-file, fido2-device)"`
+
+	// luksHeaderEnabled mirrors the LUKS header binding decision made in
+	// Run, so the repair flow knows whether the PCR 11 prediction must be
+	// refreshed after a re-seal. Not a flag.
+	luksHeaderEnabled bool
+	RepairUnlockValue string `help:"With --repair-token: value for the selected unlock method"`
+	Config            string `type:"path" help:"Path to TOML config file (e.g., /etc/vanguard.toml). Reads uki_path and luks_device from config if not set via flags."`
 }
 
 // VerifyPCRLockCmd verifies TPM2 pcrlock setup

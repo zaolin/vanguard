@@ -9,7 +9,7 @@ import (
 	"github.com/google/go-tpm/tpm2"
 )
 
-// --- Tests for computeNVName ---
+// --- Tests for ComputeNVNameFromPublic ---
 
 func TestComputeNVName_SpecCompliant(t *testing.T) {
 	// Build a proper TPM2B_NV_PUBLIC:
@@ -22,7 +22,7 @@ func TestComputeNVName_SpecCompliant(t *testing.T) {
 	binary.BigEndian.PutUint16(data[12:14], 0)
 	binary.BigEndian.PutUint16(data[14:16], 34)
 
-	name, err := computeNVName(data)
+	name, err := ComputeNVNameFromPublic(data[2:])
 	if err != nil {
 		t.Fatalf("computeNVName: %v", err)
 	}
@@ -49,7 +49,7 @@ func TestComputeNVName_NoTPM2BSize(t *testing.T) {
 	binary.BigEndian.PutUint32(data[6:10], 0)
 	binary.BigEndian.PutUint16(data[10:12], 0)
 
-	name, err := computeNVName(data)
+	name, err := ComputeNVNameFromPublic(data)
 	if err != nil {
 		t.Fatalf("computeNVName: %v", err)
 	}
@@ -61,7 +61,7 @@ func TestComputeNVName_NoTPM2BSize(t *testing.T) {
 }
 
 func TestComputeNVName_TooShort(t *testing.T) {
-	_, err := computeNVName([]byte{0x01, 0x80})
+	_, err := ComputeNVNameFromPublic([]byte{0x01, 0x80})
 	if err == nil {
 		t.Error("expected error for short blob, got nil")
 	}
@@ -76,7 +76,7 @@ func TestComputeNVName_UnsupportedNameAlg(t *testing.T) {
 	binary.BigEndian.PutUint16(data[12:14], 0)
 	binary.BigEndian.PutUint16(data[14:16], 34)
 
-	_, err := computeNVName(data)
+	_, err := ComputeNVNameFromPublic(data[2:])
 	if err == nil {
 		t.Error("expected error for unsupported nameAlg, got nil")
 	}
@@ -96,7 +96,7 @@ func TestComputeNVName_WithAuthPolicy(t *testing.T) {
 	copy(data[14:46], authPolicy)
 	binary.BigEndian.PutUint16(data[46:48], 34)
 
-	name, err := computeNVName(data)
+	name, err := ComputeNVNameFromPublic(data[2:])
 	if err != nil {
 		t.Fatalf("computeNVName with authPolicy: %v", err)
 	}
@@ -119,11 +119,11 @@ func TestComputeNVName_DifferentAuthPolicyProducesDifferentName(t *testing.T) {
 			data[i] = authPolicyByte
 		}
 		binary.BigEndian.PutUint16(data[46:48], 34)
-		return data
+		return data[2:]
 	}
 
-	name1, _ := computeNVName(makeBlob(0xAA))
-	name2, _ := computeNVName(makeBlob(0xBB))
+	name1, _ := ComputeNVNameFromPublic(makeBlob(0xAA))
+	name2, _ := ComputeNVNameFromPublic(makeBlob(0xBB))
 
 	if hex.EncodeToString(name1) == hex.EncodeToString(name2) {
 		t.Error("different authPolicy should produce different NV name — NV redefinition detection requires this")
@@ -154,19 +154,19 @@ func TestComputeNVName_VolatileBitsDoNotChangeName(t *testing.T) {
 		binary.BigEndian.PutUint32(data[8:12], attrs)
 		binary.BigEndian.PutUint16(data[12:14], 0) // authPolicySize = 0
 		binary.BigEndian.PutUint16(data[14:16], 34)
-		return data
+		return data[2:]
 	}
 
 	// Written=0 (token state) vs Written=1 (TPM state after make-policy)
-	nameBeforeWrite, _ := computeNVName(makeBlob(false, false, false))
-	nameAfterWrite, _ := computeNVName(makeBlob(true, false, false))
+	nameBeforeWrite, _ := ComputeNVNameFromPublic(makeBlob(false, false, false))
+	nameAfterWrite, _ := ComputeNVNameFromPublic(makeBlob(true, false, false))
 
 	if hex.EncodeToString(nameBeforeWrite) != hex.EncodeToString(nameAfterWrite) {
 		t.Error("NV name should be identical regardless of Written bit — volatile bits must be masked")
 	}
 
 	// ReadLocked and WriteLocked should also not affect the name
-	nameLocked, _ := computeNVName(makeBlob(true, true, true))
+	nameLocked, _ := ComputeNVNameFromPublic(makeBlob(true, true, true))
 	if hex.EncodeToString(nameBeforeWrite) != hex.EncodeToString(nameLocked) {
 		t.Error("NV name should be identical regardless of ReadLocked/WriteLocked bits")
 	}
@@ -187,11 +187,11 @@ func TestComputeNVName_NonVolatileBitsChangeName(t *testing.T) {
 		binary.BigEndian.PutUint32(data[8:12], attrs)
 		binary.BigEndian.PutUint16(data[12:14], 0)
 		binary.BigEndian.PutUint16(data[14:16], 34)
-		return data
+		return data[2:]
 	}
 
-	name1, _ := computeNVName(makeBlob(false))
-	name2, _ := computeNVName(makeBlob(true))
+	name1, _ := ComputeNVNameFromPublic(makeBlob(false))
+	name2, _ := ComputeNVNameFromPublic(makeBlob(true))
 
 	if hex.EncodeToString(name1) == hex.EncodeToString(name2) {
 		t.Error("different PolicyWrite attribute should produce different NV name — spoofing detection requires this")

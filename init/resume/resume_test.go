@@ -1,6 +1,10 @@
 package resume
 
-import "testing"
+import (
+	"testing"
+
+	"github.com/zaolin/vanguard/init/lvm"
+)
 
 func TestNormalizeLVMPath(t *testing.T) {
 	tests := []struct {
@@ -31,9 +35,9 @@ func TestEscapeMapperName(t *testing.T) {
 		{"vg-root-swap", "vg--root--swap"},
 	}
 	for _, tt := range tests {
-		got := escapeMapperName(tt.input)
+		got := lvm.EscapeMapperName(tt.input)
 		if got != tt.want {
-			t.Errorf("escapeMapperName(%q) = %q, want %q", tt.input, got, tt.want)
+			t.Errorf("EscapeMapperName(%q) = %q, want %q", tt.input, got, tt.want)
 		}
 	}
 }

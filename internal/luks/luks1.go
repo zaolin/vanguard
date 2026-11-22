@@ -3,6 +3,7 @@ package luks
 import (
 	"bytes"
 	"crypto/cipher"
+	"crypto/subtle"
 	"encoding/binary"
 	"fmt"
 	"hash"
@@ -162,7 +163,9 @@ func (d *deviceV1) UnsealVolume(keyslotIdx int, passphrase []byte) (*Volume, err
 	// verify with digest
 	generatedDigest := pbkdf2.Key(finalKey, d.hdr.MkDigestSalt[:], int(d.hdr.MkDigestIter), int(d.hdr.KeyBytes), h)
 	defer clearSlice(generatedDigest)
-	if !bytes.Equal(generatedDigest[:20], d.hdr.MkDigest[:]) {
+	// Constant-time comparison: this is the passphrase check. A byte-by-byte
+	// early-exit comparison leaks how many leading bytes matched.
+	if subtle.ConstantTimeCompare(generatedDigest[:20], d.hdr.MkDigest[:]) != 1 {
 		return nil, ErrPassphraseDoesNotMatch
 	}
 

@@ -96,8 +96,10 @@ When `--luks-device` (`-l`) is specified, Vanguard automatically enables LUKS he
 
 **How it works:**
 1. During `vanguard update`, the LUKS2 header (binary header + JSON metadata area) is hashed with SHA256 and a `.pcrlock` component directory (`755-vanguard-luks-header.pcrlock.d/`) is created with two variant files: `luks-header.pcrlock` (current on-disk header hash, matches the next boot) and `luks-header-eventlog.pcrlock` (previous boot's hash, lets make-policy validate the current event log).
-2. During boot, vanguard's init hashes the LUKS2 header **before** attempting unlock and extends PCR 11 with the hash. A CEL-JSON record is written to `/run/log/systemd/tpm2-measure.log` so `systemd-pcrlock make-policy` can match the measurement.
+2. During boot, vanguard's init hashes the LUKS2 header **before** attempting unlock and extends PCR 11 with the hash. A CEL-JSON record is written to `/run/log/systemd/tpm2-measure.log` so `systemd-pcrlock make-policy` can match the measurement. The record carries the measured device path, so several LUKS devices stay distinguishable and the measurement order can be reproduced.
 3. The pcrlock policy predicts the PCR 11 value after the extension. If the header matches, unseal succeeds. If the header was tampered, PCR 11 won't match and unseal fails.
+
+**Multiple LUKS devices:** only devices that carry a **pcrlock token** are measured. Extending PCR 11 for a device the policy does not cover (a passphrase-only data disk, an encrypted USB stick) would shift the PCR 11 hash chain and make the protected device fail to unseal even though nothing about it changed. When several pcrlock-covered devices exist, their digests form a chain in measurement order; `vanguard update` writes a component variant for each of them so `make-policy` can reconstruct the whole chain.
 
 **Benefits:**
 - Detects LUKS header tampering (e.g., attacker adds a keyslot, modifies cipher parameters)
@@ -105,6 +107,8 @@ When `--luks-device` (`-l`) is specified, Vanguard automatically enables LUKS he
 - Binds the disk encryption state to the TPM policy
 
 **Status semantics (important):** the policy's PCR 11 value is an *at-unseal-time* prediction (sd-stub kernel measurement + LUKS header hash). After the disk is unlocked, systemd extends PCR 11 further (sysinit/ready phases), so the **live PCR 11 value in a booted system legitimately diverges from the policy** and always reports as a live mismatch. This is expected, not tampering. `vanguard status` therefore verifies the actual security property — the on-disk header digest against the enrollment-time component digests in `/etc/pcrlock.d/755-vanguard-luks-header.pcrlock.d/` — and reports CRITICAL only when the header itself changed. The PCR DETAILS table shows both the header digest comparison and the live PCR 11 value (annotated with post-unlock extensions).
+
+**Stale NV index:** the sealed TPM blob binds the pcrlock NV index's *name*, so if the policy is regenerated at a different index, the old token can never be unsealed again. Vanguard detects this before prompting for a PIN and reports the re-enroll command (`vanguard enroll -u <uki> -l <device>`, or `vanguard update --repair-token` to do it automatically).
 
 **Caveats:**
 - LUKS header changes (adding/removing keyslots, re-encrypting) break unlock - re-run `vanguard update -l <device>` after.
@@ -261,9 +265,17 @@ sequenceDiagram
 
 ```bash
 # 1. Update policy BEFORE installing new kernel
+#    (policy regeneration reuses the existing pcrlock NV index; if the
+#    policy file was lost, the index pinned by the LUKS token is recovered
+#    so the token stays valid. vanguard update refuses to run when neither
+#    source is available and a token exists — a fresh allocation would
+#    break the next boot with "Token NV mismatch".)
 sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2
 
-# 2. Re-enroll token with updated policy
+# 2. Re-seal token with updated policy (two options)
+#    a) automatically, in the same run (prompts for the disk passphrase):
+sudo vanguard update -u /boot/EFI/Gentoo/kernel.efi -l /dev/nvme0n1p2 --repair-token
+#    b) or manually:
 sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto \
   --tpm2-with-pin=yes \
   --tpm2-pcrlock=/boot/EFI/Gentoo/kernel.pcrlock.json \

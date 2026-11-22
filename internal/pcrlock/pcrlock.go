@@ -5,6 +5,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -499,6 +500,48 @@ func LockLUKSHeader(devicePath string) error {
 		return fmt.Errorf("failed to write LUKS header pcrlock: %w", err)
 	}
 
+	// Variants for the OTHER policy-covered LUKS devices.
+	//
+	// With several LUKS devices the initrd extends PCR 11 once per
+	// policy-covered device, forming a hash chain. make-policy matches the
+	// component against the event log, so every digest in that chain needs
+	// a variant — otherwise the chain cannot be reconstructed and PCR 11
+	// is dropped from the policy.
+	extra, extraErr := otherMeasuredLUKSHeaderDigests(devicePath)
+	if extraErr != nil && Verbose {
+		// Without these digests the PCR 11 chain cannot be reconstructed
+		// and PCR 11 is dropped from the policy — worth knowing when
+		// debugging a missing PCR 11.
+		fmt.Printf("Note: could not collect the other measured LUKS header digests: %v\n", extraErr)
+	}
+	if len(extra) > 0 {
+		for i, d := range extra {
+			variant := map[string]interface{}{
+				"records": []map[string]interface{}{
+					{
+						"pcr": 11,
+						"digests": []map[string]interface{}{
+							{
+								"hashAlg": "sha256",
+								"digest":  fmt.Sprintf("%x", d),
+							},
+						},
+					},
+				},
+			}
+			raw, mErr := json.MarshalIndent(variant, "", "  ")
+			if mErr != nil {
+				continue
+			}
+			name := fmt.Sprintf("luks-header-extra-%d.pcrlock", i)
+			if wErr := os.WriteFile(filepath.Join(variantDir, name), raw, 0644); wErr != nil {
+				if Verbose {
+					fmt.Printf("Note: failed to write LUKS header variant %s: %v\n", name, wErr)
+				}
+			}
+		}
+	}
+
 	if Verbose {
 		fmt.Printf("[+] Locked LUKS header for %s (PCR 11, digest: %x)\n", devicePath, digest)
 	}
@@ -578,7 +621,61 @@ func lockLUKSHeaderEventlog(variantDir string) error {
 // `systemd-pcrlock cel` and finds the vanguard-luks-header PCR 11 record.
 // The record is identified by exclusion: it's the PCR 11 record that
 // doesn't have content_type "pcclient_std" (sd-stub) or "systemd" (phases).
+// otherMeasuredLUKSHeaderDigests returns the LUKS header digests measured
+// for OTHER policy-covered devices (i.e. all event-log LUKS header
+// records except the one belonging to the policy device).
+//
+// The initrd measures every LUKS device that carries a pcrlock token, and
+// each measurement extends PCR 11 — the values form a hash chain. The
+// policy's own device contributes one digest; the rest belong to the
+// chain and need component variants too, or make-policy cannot match the
+// chain and drops PCR 11.
+func otherMeasuredLUKSHeaderDigests(policyDevice string) ([][]byte, error) {
+	all, err := findAllLUKSHeaderDigestsFromEventLog()
+	if err != nil {
+		return nil, err
+	}
+	policyDigest, err := computeLUKSHeaderDigest(policyDevice)
+	if err != nil {
+		return nil, err
+	}
+	var others [][]byte
+	for _, d := range all {
+		if bytes.Equal(d, policyDigest) {
+			continue
+		}
+		others = append(others, d)
+	}
+	return others, nil
+}
+
+// findLUKSHeaderDigestFromEventLog returns the digest of the FIRST
+// vanguard-luks-header record in the event log.
+//
+// The records are identified by exclusion: sd-stub measurements have
+// content_type "pcclient_std" and systemd phase measurements have
+// content_type "systemd". Our vanguard-luks-header record has neither
+// (systemd-pcrlock cel strips unrecognized content), so we pick the
+// PCR 11 record that doesn't match either known content_type.
+//
+// For a multi-LUKS-device system several such records exist. The initrd
+// only measures devices that carry a pcrlock token (see
+// init/luks.UnlockDevices), so in practice there is one record per
+// policy-covered device. The PCR 11 prediction is built by replaying ALL
+// of them in event-log order (see InjectLUKSHeaderPrediction), which is
+// exactly the order the initrd extended PCR 11 in.
 func findLUKSHeaderDigestFromEventLog() ([]byte, error) {
+	digests, err := findAllLUKSHeaderDigestsFromEventLog()
+	if err != nil {
+		return nil, err
+	}
+	return digests[0], nil
+}
+
+// findAllLUKSHeaderDigestsFromEventLog returns all vanguard-luks-header
+// digests from the event log, in event-log order (the order the initrd
+// extended PCR 11).
+func findAllLUKSHeaderDigestsFromEventLog() ([][]byte, error) {
 	cmd := exec.Command(PCRLockBinPath(), "cel")
 	output, err := cmd.Output()
 	if err != nil {
@@ -590,6 +687,7 @@ func findLUKSHeaderDigestFromEventLog() ([]byte, error) {
 		return nil, fmt.Errorf("failed to parse event log: %w", err)
 	}
 
+	var result [][]byte
 	for _, event := range events {
 		pcr, ok := event["pcr"].(float64)
 		if !ok || int(pcr) != 11 {
@@ -620,12 +718,19 @@ func findLUKSHeaderDigestFromEventLog() ([]byte, error) {
 			hashAlg, _ := dMap["hashAlg"].(string)
 			digestHex, _ := dMap["digest"].(string)
 			if hashAlg == "sha256" && digestHex != "" {
-				return hex.DecodeString(digestHex)
+				decoded, decErr := hex.DecodeString(digestHex)
+				if decErr == nil {
+					result = append(result, decoded)
+				}
+				break
 			}
 		}
 	}
 
-	return nil, fmt.Errorf("no vanguard-luks-header record found in event log")
+	if len(result) == 0 {
+		return nil, fmt.Errorf("no vanguard-luks-header record found in event log")
+	}
+	return result, nil
 }
 
 // InjectLUKSHeaderPrediction post-processes a pcrlock.json policy file to
@@ -655,27 +760,39 @@ func InjectLUKSHeaderPrediction(policyPath, devicePath string) error {
 	}
 
 	// Read the event log to get the old LUKS header hash and all PCR 11
-	// records that come before it (sd-stub measurements)
-	cmd := exec.Command(PCRLockBinPath(), "cel")
-	output, err := cmd.Output()
+	// records that come before it (sd-stub measurements).
+	//
+	// The raw JSON-SEQ log is preferred: unlike `systemd-pcrlock cel`, it
+	// keeps the content of unrecognized records, including the
+	// vanguard-device tag that attributes each LUKS header measurement to
+	// its device. Without that tag the chain position of the policy device
+	// can only be guessed.
+	events, err := measurementLogReader()
 	if err != nil {
-		return fmt.Errorf("failed to read event log: %w", err)
-	}
-
-	var events []map[string]interface{}
-	if err := json.Unmarshal(output, &events); err != nil {
-		return fmt.Errorf("failed to parse event log: %w", err)
+		cmd := exec.Command(PCRLockBinPath(), "cel")
+		output, cmdErr := cmd.Output()
+		if cmdErr != nil {
+			return fmt.Errorf("failed to read event log: %w (raw measurement log: %v)", cmdErr, err)
+		}
+		if err := json.Unmarshal(output, &events); err != nil {
+			return fmt.Errorf("failed to parse event log: %w", err)
+		}
 	}
 
 	// Collect all PCR 11 extension digests in order (sd-stub + LUKS header).
 	// We need to replay them to compute the predicted PCR 11 value.
-	// The LUKS header record is identified by exclusion: it's the PCR 11
-	// record that doesn't have content_type "pcclient_std" (sd-stub) or
+	//
+	// The LUKS header records are identified by exclusion: they're the PCR 11
+	// records that don't have content_type "pcclient_std" (sd-stub) or
 	// "systemd" (phases). systemd-pcrlock cel strips the content field
 	// from unrecognized records, so we can't search by content string.
+	//
+	// Multi-device: the initrd measures EVERY pcrlock-covered LUKS device,
+	// so there can be several LUKS header records. They form a hash chain
+	// in measurement order. Each record keeps the device tag it was
+	// measured from (empty when the log does not carry it).
 	var pcr11Extensions [][]byte
-	var oldLUKSDigest []byte
-	foundLUKS := false
+	var luksRecords []luksHeaderRecord
 
 	for _, event := range events {
 		pcr, ok := event["pcr"].(float64)
@@ -711,16 +828,18 @@ func InjectLUKSHeaderPrediction(policyPath, devicePath string) error {
 			// Our record has neither (stripped by cel).
 			contentType, _ := event["content_type"].(string)
 			if contentType != "pcclient_std" && contentType != "systemd" {
-				oldLUKSDigest = digest
-				foundLUKS = true
-				// Don't add to pcr11Extensions — we'll replace with new digest
+				luksRecords = append(luksRecords, luksHeaderRecord{
+					digest: digest,
+					device: eventDeviceTag(event),
+				})
+				// Don't add to pcr11Extensions — we rebuild the chain below
 			} else {
 				pcr11Extensions = append(pcr11Extensions, digest)
 			}
 		}
 	}
 
-	if !foundLUKS {
+	if len(luksRecords) == 0 {
 		// No LUKS header record in event log — nothing to inject
 		if Verbose {
 			fmt.Printf("Note: No vanguard-luks-header record in event log, skipping injection\n")
@@ -728,8 +847,12 @@ func InjectLUKSHeaderPrediction(policyPath, devicePath string) error {
 		return nil
 	}
 
-	// Compute predicted PCR 11 with OLD hash (what make-policy predicted)
-	// Replay: PCR11 = SHA256(SHA256(...SHA256(0 || ext1) || ext2...) || oldLUKS)
+	// Compute predicted PCR 11 with OLD hashes (what make-policy predicted)
+	// Replay: PCR11 = SHA256(SHA256(...SHA256(0 || ext1) || ext2...) || luks1 || luks2 ...)
+	//
+	// The LUKS header digests form the tail of the chain, in measurement
+	// order. For a single device the chain is ext... || luks1; for several
+	// policy-covered devices it is ext... || luks1 || luks2 || ...
 	pcr11Old := make([]byte, 32) // start with all-zeros
 	for _, ext := range pcr11Extensions {
 		h := sha256.New()
@@ -737,14 +860,25 @@ func InjectLUKSHeaderPrediction(policyPath, devicePath string) error {
 		h.Write(ext)
 		pcr11Old = h.Sum(nil)
 	}
-	if oldLUKSDigest != nil {
+	for _, rec := range luksRecords {
 		h := sha256.New()
 		h.Write(pcr11Old)
-		h.Write(oldLUKSDigest)
+		h.Write(rec.digest)
 		pcr11Old = h.Sum(nil)
 	}
 
-	// Compute predicted PCR 11 with NEW hash (what the next boot will produce)
+	// Compute predicted PCR 11 with NEW hashes (what the next boot will produce).
+	//
+	// The re-enrollment (vanguard update → systemd-cryptenroll) rewrites
+	// the LUKS2 JSON metadata of the device the policy binds, changing
+	// THAT device's header hash. The other devices' headers are unchanged,
+	// so exactly one record in the chain is replaced.
+	//
+	// Which one is identified by the vanguard-device tag the initrd wrote
+	// at measurement time — not by position. Guessing a position (e.g.
+	// "the last one") would produce a prediction that does not match the
+	// next boot whenever the policy device is not measured last, and a
+	// clean system would then fail to unseal.
 	pcr11New := make([]byte, 32)
 	for _, ext := range pcr11Extensions {
 		h := sha256.New()
@@ -752,10 +886,19 @@ func InjectLUKSHeaderPrediction(policyPath, devicePath string) error {
 		h.Write(ext)
 		pcr11New = h.Sum(nil)
 	}
-	h := sha256.New()
-	h.Write(pcr11New)
-	h.Write(newDigest)
-	pcr11New = h.Sum(nil)
+
+	idx, err := policyRecordIndex(luksRecords, devicePath)
+	if err != nil {
+		return err
+	}
+	luksRecords[idx].digest = newDigest
+
+	for _, rec := range luksRecords {
+		h := sha256.New()
+		h.Write(pcr11New)
+		h.Write(rec.digest)
+		pcr11New = h.Sum(nil)
+	}
 
 	// Read the existing policy
 	policyData, err := os.ReadFile(policyPath)
@@ -902,7 +1045,80 @@ func computeLUKSHeaderDigest(devicePath string) ([]byte, error) {
 // protection mask") is included in the error message. Without this, the user
 // sees only "make-policy failed: exit status 1" with no clue why PCRs were
 // dropped.
-func MakePolicy(outputPath string) error {
+// MakePolicy generates the pcrlock policy at outputPath.
+//
+// luksDevice may be empty. When given, it serves as a second source for
+// NV index reuse: if the existing policy file is missing or unreadable
+// (a previous make-policy run failed or was interrupted — the file is
+// deleted before make-policy regenerates it), the NV index pinned by the
+// LUKS device's systemd-tpm2 token still identifies the index used by the
+// previous successful enrollment. Reusing THAT index (and skipping the
+// destructive undefine) keeps the on-disk token valid; silently allocating
+// a fresh index would orphan the token and hard-fail every subsequent
+// boot with "Token NV mismatch".
+// getLUKSTokenForReuse wraps GetLUKSTPMToken as a package variable so the
+// NV-reuse decision is unit-testable without a real device.
+var getLUKSTokenForReuse = func(devicePath string) (*LUKSTPMToken, error) {
+	return GetLUKSTPMToken(devicePath)
+}
+
+// resolveReuseNVIndex determines which pcrlock NV index make-policy should
+// reuse so an existing systemd-tpm2 token is not orphaned by a fresh
+// allocation. Sources, in priority order:
+//
+//  1. The existing policy file's nvIndex field.
+//  2. The LUKS token's pinned tpm2_pcrlock_nv index — survives the policy
+//     file being lost to an interrupted earlier run.
+//  3. Refusal: if neither source yields an index but a pcrlock token
+//     exists on the device, an unconditional fresh allocation would orphan
+//     that token and hard-fail every subsequent boot with "Token NV
+//     mismatch" — error out with re-enroll instructions instead.
+//
+// Returns 0 when a fresh allocation is safe (no token, or none found).
+func resolveReuseNVIndex(outputPath, luksDevice string) (int, error) {
+	// Source 1: existing policy file
+	if data, err := os.ReadFile(outputPath); err == nil {
+		type nvInfo struct {
+			NVIndex int `json:"nvIndex"`
+		}
+		var info nvInfo
+		if err := json.Unmarshal(data, &info); err == nil && info.NVIndex != 0 {
+			return info.NVIndex, nil
+		}
+	}
+
+	// Source 2: LUKS token pin
+	if luksDevice != "" {
+		token, tokErr := getLUKSTokenForReuse(luksDevice)
+		switch {
+		case tokErr == nil:
+			if token.NVIndex != 0 {
+				if Verbose {
+					fmt.Printf("[+] Policy file missing/unreadable — reusing NV index pinned by LUKS token: 0x%x\n", token.NVIndex)
+				}
+				return token.NVIndex, nil
+			}
+			// Token found but pins no index — only refusal candidate when
+			// it is a pcrlock token at all.
+			if token.HasPCRLock {
+				return 0, fmt.Errorf("no NV index to reuse: policy file %s is missing or has no nvIndex, and the token on %s pins no index — refusing to let make-policy allocate a fresh index (it would orphan the existing pcrlock token and break the next boot). Restore the policy file (backup or regenerate from a machine-readable 'systemd-pcrlock make-policy' run) or wipe the token first: systemd-cryptenroll --wipe-slot=tpm2 %s", outputPath, luksDevice, luksDevice)
+			}
+			return 0, nil // non-pcrlock token (e.g. classic PCR-bound): fresh index is fine
+		case errors.Is(tokErr, ErrNoTPMToken):
+			// Nothing is enrolled on this device: fresh allocation is the
+			// correct initial-enrollment behaviour.
+			return 0, nil
+		default:
+			// The lookup itself failed (cryptsetup error, I/O). Allocating
+			// a fresh index while a token may exist would orphan it and
+			// break the next boot — refuse instead of guessing.
+			return 0, fmt.Errorf("cannot read the LUKS token on %s: %w — refusing to allocate a fresh NV index while the token state is unknown", luksDevice, tokErr)
+		}
+	}
+	return 0, nil
+}
+
+func MakePolicy(outputPath, luksDevice string) error {
 	stdout, _ := cmdOutput()
 
 	// Create output directory if needed
@@ -910,29 +1126,29 @@ func MakePolicy(outputPath string) error {
 		return fmt.Errorf("failed to create output directory: %w", err)
 	}
 
-	// Try to reuse existing NV index to prevent exhaustion
+	// Try to reuse existing NV index to prevent exhaustion — and, more
+	// importantly, to not orphan the systemd-tpm2 token on the LUKS device.
+	// resolveReuseNVIndex implements the source priority (policy file >
+	// token pin > refuse), see its docs.
+	oldNVIndex, err := resolveReuseNVIndex(outputPath, luksDevice)
+	if err != nil {
+		return err
+	}
 	var nvIndexArgs []string
-	if data, err := os.ReadFile(outputPath); err == nil {
-		// Use a simple struct to extract just the NV index
-		type nvInfo struct {
-			NVIndex int `json:"nvIndex"`
+	if oldNVIndex != 0 {
+		nvIndexArgs = []string{fmt.Sprintf("--nv-index=0x%x", oldNVIndex)}
+		if Verbose {
+			fmt.Printf("[+] Reusing existing NV Index: 0x%x\n", oldNVIndex)
 		}
-		var info nvInfo
-		if err := json.Unmarshal(data, &info); err == nil && info.NVIndex != 0 {
-			nvIndexArgs = []string{fmt.Sprintf("--nv-index=0x%x", info.NVIndex)}
-			if Verbose {
-				fmt.Printf("[+] Reusing existing NV Index: 0x%x\n", info.NVIndex)
-			}
 
-			// We MUST undefine the existing index because systemd-pcrlock make-policy
-			// tries to define it anew and fails if it exists.
-			// This effectively "reuses" the slot by freeing it up first.
-			// Use native go-tpm2 instead of shelling out to tpm2_nvundefine.
-			tpmClient := tpm.New()
-			if err := tpmClient.NVUndefineSpace(uint32(info.NVIndex)); err != nil {
-				if Verbose {
-					fmt.Printf("Note: failed to undefine NV index 0x%x: %v (make-policy will handle it)\n", info.NVIndex, err)
-				}
+		// We MUST undefine the existing index because systemd-pcrlock make-policy
+		// tries to define it anew and fails if it exists.
+		// This effectively "reuses" the slot by freeing it up first.
+		// Use native go-tpm2 instead of shelling out to tpm2_nvundefine.
+		tpmClient := tpm.New()
+		if err := tpmClient.NVUndefineSpace(uint32(oldNVIndex)); err != nil {
+			if Verbose {
+				fmt.Printf("Note: failed to undefine NV index 0x%x: %v (make-policy will handle it)\n", oldNVIndex, err)
 			}
 		}
 	}
@@ -984,10 +1200,18 @@ func MakePolicy(outputPath string) error {
 
 	if err := cmd.Run(); err != nil {
 		stderrStr := strings.TrimSpace(stderrBuf.String())
-		if stderrStr != "" {
-			return fmt.Errorf("make-policy failed: %w\nstderr:\n%s", err, stderrStr)
+		hint := ""
+		// We undefined the reused index before invoking make-policy. If it
+		// now fails, the index does not exist anymore while the LUKS token
+		// still pins it — the next boot would hard-fail with "Token NV
+		// mismatch". Tell the user immediately, not at next boot.
+		if oldNVIndex != 0 && luksDevice != "" {
+			hint = fmt.Sprintf("\nWARNING: NV index 0x%x was undefined for reuse but make-policy failed — the token on %s still pins it. Re-run 'vanguard update' (same UKI/device) to regenerate the policy at 0x%x, or re-enroll the token with systemd-cryptenroll.", oldNVIndex, luksDevice, oldNVIndex)
 		}
-		return fmt.Errorf("make-policy failed: %w", err)
+		if stderrStr != "" {
+			return fmt.Errorf("make-policy failed: %w\nstderr:\n%s%s", err, stderrStr, hint)
+		}
+		return fmt.Errorf("make-policy failed: %w%s", err, hint)
 	}
 	return nil
 }

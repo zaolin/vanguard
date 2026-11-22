@@ -667,6 +667,43 @@ func isAuthFailure(err error) bool {
 	return false
 }
 
+// IsNVIndexMissing reports whether err is the TPM's response for an NV index
+// that is not defined (TPM_RC_HANDLE).
+//
+// Other errors must not be reported as "the index is gone": a transport
+// failure, TPM_RC_FAILURE or a lockout is transient, and telling the user to
+// re-enroll the token would be wrong — the next boot may work again.
+func IsNVIndexMissing(err error) bool {
+	var rc tpm2.TPMRC
+	if errors.As(err, &rc) {
+		return canonicalTPMRC(rc) == tpm2.TPMRCHandle
+	}
+	return false
+}
+
+// IsAuthorizationFailure reports whether err is a TPM authorization failure
+// (an auth value was rejected or is required). Status checks use it to tell
+// "this machine requires an authorization I do not have" apart from "the TPM
+// is broken".
+func IsAuthorizationFailure(err error) bool {
+	if isAuthFailure(err) {
+		return true
+	}
+	var rc tpm2.TPMRC
+	if errors.As(err, &rc) {
+		return canonicalTPMRC(rc) == tpm2.TPMRCBadAuth
+	}
+	return false
+}
+
+// IsTPMResponseError reports whether err is a response code returned by the
+// TPM itself. Anything else is a transport/IO failure, which says nothing
+// about whether the TPM works.
+func IsTPMResponseError(err error) bool {
+	var rc tpm2.TPMRC
+	return errors.As(err, &rc)
+}
+
 // readSeedPolicyPCRs reads the PCR values needed for the seed read policy
 // (PCR 7 in the SHA256 bank — single-branch policy).
 func (c *Client) readSeedPolicyPCRs(tpm transport.TPM) (map[int][]byte, error) {

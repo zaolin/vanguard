@@ -361,6 +361,17 @@ func unescapeLVMName(name string) string {
 	return strings.ReplaceAll(name, "--", "-")
 }
 
+// EscapeMapperName escapes hyphens in LVM VG/LV names for device-mapper
+// naming: device-mapper names escape a literal hyphen as "--", and the
+// single-hyphen separator between VG and LV stays single. So VG "gentoo"
+// LV "root" maps to "gentoo-root", and VG "gentoo-sys" LV "root" maps to
+// "gentoo--sys-root". Exported so mount/resume path normalization shares
+// one implementation instead of diverging (the unescaped variant silently
+// misses volumes whose names contain hyphens).
+func EscapeMapperName(name string) string {
+	return strings.ReplaceAll(name, "-", "--")
+}
+
 // EnsureDevSymlinks creates /dev/<vg>/<lv> symlinks in the initramfs devtmpfs
 // just before switch_root. This is critical because switch_root moves the initramfs
 // /dev (devtmpfs) to /sysroot/dev via MS_MOVE, so any symlinks created here

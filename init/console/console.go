@@ -3,6 +3,9 @@ package console
 import (
 	"fmt"
 	"os"
+	"strings"
+	"sync/atomic"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -13,9 +16,21 @@ var consoleFd *os.File
 // Set this from main.go based on the debug build tag.
 var DebugEnabled bool
 
-// TUIActive is set to true when the TUI is running to suppress direct console output.
-// This prevents console output from interfering with bubbletea's alt screen.
-var TUIActive bool
+// tuiActive records whether the TUI is running, to suppress direct console
+// output. The TUI sets it from its own goroutine while console output happens
+// on others, so the state must be atomic — a plain bool is a data race.
+var tuiActive atomic.Bool
+
+// SetTUIActive records whether the TUI currently owns the console.
+func SetTUIActive(active bool) {
+	tuiActive.Store(active)
+}
+
+// TUIActive reports whether the TUI is running. Console output is suppressed
+// while it is, to avoid interfering with bubbletea's alt screen.
+func TUIActive() bool {
+	return tuiActive.Load()
+}
 
 // LogFunc is a callback for boot logging - will be set by the main init package.
 // All console output (Print and DebugPrint) will be sent to this function.
@@ -79,7 +94,7 @@ func RestoreKernelMessages() {
 // (like tpm2-tss library) from corrupting the TUI display.
 // Returns a function to restore stderr. Call this before exec.Command.Run().
 func SuppressStderr() func() {
-	if !TUIActive {
+	if !TUIActive() {
 		return func() {}
 	}
 
@@ -108,7 +123,7 @@ func SuppressStderr() func() {
 func Print(format string, args ...interface{}) {
 	msg := fmt.Sprintf(format, args...)
 	// Skip console output when TUI is active to avoid interfering with alt screen
-	if consoleFd != nil && !TUIActive {
+	if consoleFd != nil && !TUIActive() {
 		fmt.Fprint(consoleFd, msg)
 	}
 	LogFunc(msg)
@@ -123,7 +138,7 @@ func DebugPrint(format string, args ...interface{}) {
 	}
 	msg := fmt.Sprintf(format, args...)
 	// Skip console output when TUI is active to avoid interfering with alt screen
-	if consoleFd != nil && !TUIActive {
+	if consoleFd != nil && !TUIActive() {
 		fmt.Fprint(consoleFd, msg)
 	}
 	LogFunc(msg)
@@ -160,16 +175,39 @@ func ReadPassword(prompt string) (string, error) {
 	}
 
 	// Disable echo and related echo flags to prevent password keystroke leakage
-	newState := *oldState
-	newState.Lflag &^= unix.ECHO | unix.ECHOE | unix.ECHOK | unix.ECHOCTL | unix.ECHOPRT | unix.ECHOKE
-	if err := unix.IoctlSetTermios(fd, unix.TCSETS, &newState); err != nil {
+	newState := termiosForEntry(oldState, false)
+	if err := unix.IoctlSetTermios(fd, unix.TCSETS, newState); err != nil {
 		return "", fmt.Errorf("failed to disable echo: %w", err)
 	}
 	defer unix.IoctlSetTermios(fd, unix.TCSETS, oldState)
 
 	// Read password (max 4KB to prevent memory exhaustion)
 	const maxPasswordLen = 4096
-	var password []byte
+	password := readEntry(f, maxPasswordLen)
+	fmt.Fprint(f, "\n")
+
+	return password, nil
+}
+
+// termiosForEntry returns the terminal state to use while reading an entry.
+// With echo false every echo flag is cleared (passphrases, PINs); with echo
+// true ECHO is set (one-time recovery codes). Canonical mode is left
+// untouched so the kernel line discipline handles erase and delivers the
+// line on Enter.
+func termiosForEntry(old *unix.Termios, echo bool) *unix.Termios {
+	state := *old
+	if echo {
+		state.Lflag |= unix.ECHO
+	} else {
+		state.Lflag &^= unix.ECHO | unix.ECHOE | unix.ECHOK | unix.ECHOCTL | unix.ECHOPRT | unix.ECHOKE
+	}
+	return &state
+}
+
+// readEntry reads one line from f, up to maxLen bytes, stopping at the line
+// ending. The read buffer is zeroed afterwards.
+func readEntry(f *os.File, maxLen int) string {
+	var line []byte
 	buf := make([]byte, 1)
 	for {
 		n, err := f.Read(buf)
@@ -179,16 +217,106 @@ func ReadPassword(prompt string) (string, error) {
 		if buf[0] == '\n' || buf[0] == '\r' {
 			break
 		}
-		if len(password) >= maxPasswordLen {
+		if len(line) >= maxLen {
 			continue
 		}
-		password = append(password, buf[0])
+		line = append(line, buf[0])
 	}
-	// Zero the read buffer
 	buf[0] = 0
+	return string(line)
+}
+
+// ReadCode reads a fixed-length, non-secret entry code (e.g. the HOTP
+// recovery code) from the console WITH echo. Unlike passphrases, these
+// codes are one-time values that gate a second factor; hiding them makes
+// typos and wrong-keymap input impossible to diagnose. The terminal is
+// left in canonical mode, so the line discipline handles backspace.
+func ReadCode(prompt string) (string, error) {
+	f, err := os.OpenFile("/dev/console", os.O_RDWR, 0)
+	if err != nil {
+		if consoleFd == nil {
+			return "", fmt.Errorf("console not initialized")
+		}
+		f = consoleFd
+	} else {
+		defer f.Close()
+	}
+
+	fmt.Fprint(f, prompt)
+
+	fd := int(f.Fd())
+	oldState, err := unix.IoctlGetTermios(fd, unix.TCGETS)
+	if err != nil {
+		return "", fmt.Errorf("failed to get terminal state: %w", err)
+	}
+	// Ensure echo is on (cheap no-op when it already is). Canonical mode
+	// is left untouched — the kernel buffers the line and delivers it on
+	// Enter, including local erase handling.
+	newState := termiosForEntry(oldState, true)
+	if err := unix.IoctlSetTermios(fd, unix.TCSETS, newState); err != nil {
+		return "", fmt.Errorf("failed to enable echo: %w", err)
+	}
+	defer unix.IoctlSetTermios(fd, unix.TCSETS, oldState)
+
+	const maxCodeLen = 4096
+	line := readEntry(f, maxCodeLen)
 	fmt.Fprint(f, "\n")
 
-	return string(password), nil
+	return strings.TrimSpace(line), nil
+}
+
+// WaitEnterTimeout bounds how long WaitEnter waits for the user to press
+// Enter. An unattended boot (serial console without a reader, a VM with no
+// console) must not hang forever in PID 1 — the error message stays on
+// screen for the timeout, then the boot continues to its halt path.
+const WaitEnterTimeout = 30 * time.Second
+
+// WaitEnter waits until the user presses Enter on the console or the
+// timeout expires. Used on fatal failure paths so the error stays on
+// screen until the user has read it (errors that vanish in under a second
+// are unreadable).
+//
+// The wait is bounded: an unattended boot (a serial console without a
+// reader, a VM with no console) must not hang forever in PID 1. Polling
+// with a deadline bounds the wait without leaking a goroutine or leaving a
+// read pending on a descriptor that is about to be closed.
+func WaitEnter() {
+	if fd, err := unix.Open("/dev/console", unix.O_RDONLY|unix.O_NONBLOCK|unix.O_CLOEXEC, 0); err == nil {
+		defer unix.Close(fd)
+		waitEnter(fd, WaitEnterTimeout)
+		return
+	}
+	if consoleFd != nil {
+		// Fallback: the shared console descriptor. It must not be closed
+		// here — other console functions keep using it.
+		waitEnter(int(consoleFd.Fd()), WaitEnterTimeout)
+	}
+}
+
+// waitEnter polls fd for Enter until timeout expires. Non-Enter input is
+// drained so a stray keypress does not terminate the wait.
+func waitEnter(fd int, timeout time.Duration) {
+	deadline := time.Now().Add(timeout)
+	for {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return
+		}
+		fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+		n, err := unix.Poll(fds, int(remaining.Milliseconds()))
+		if err != nil || n == 0 {
+			// Timeout or error: the boot continues to its halt path.
+			return
+		}
+		var buf [1]byte
+		nread, err := unix.Read(fd, buf[:])
+		if err != nil || nread == 0 {
+			return
+		}
+		if buf[0] == '\n' || buf[0] == '\r' {
+			return
+		}
+	}
 }
 
 // ZeroString converts a string to a mutable byte slice, zeroes it, and returns

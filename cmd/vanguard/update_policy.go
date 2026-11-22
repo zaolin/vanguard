@@ -3,7 +3,9 @@ package main
 import (
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"sort"
 	"strings"
 
 	"github.com/zaolin/vanguard/internal/config"
@@ -58,12 +60,16 @@ func (c *UpdatePolicyCmd) Run() error {
 	}
 
 	if c.PolicyOutput == "" {
-		// Case-insensitive .efi stripping — handles kernel.efi, kernel.EFI, BOOTX64.EFI
-		ukiBase := c.UKIPath
-		if strings.HasSuffix(strings.ToLower(ukiBase), ".efi") {
-			ukiBase = ukiBase[:len(ukiBase)-4]
+		c.PolicyOutput = policyPathForUKI(c.UKIPath)
+	}
+
+	// Validate the repair flags before touching the TPM: an unsupported
+	// --repair-unlock method must be rejected before the policy (and the NV
+	// index) is regenerated, not after the system was already mutated.
+	if c.RepairToken {
+		if _, err := c.repairUnlockArgs(repairUnlockPassphrase); err != nil {
+			return err
 		}
-		c.PolicyOutput = ukiBase + ".pcrlock.json"
 	}
 
 	if _, err := os.Stat(pcrlock.PCRLockBinPath()); err != nil {
@@ -110,6 +116,7 @@ func (c *UpdatePolicyCmd) Run() error {
 		if err := pcrlock.LockGPT(gptDevice); err != nil {
 			if err == pcrlock.ErrNoGPT {
 				gptEnabled = false
+				fmt.Printf("Note: PCR 5 (GPT) not locked: %v — the disk behind %s is not GPT-partitioned\n", err, c.LUKSDevice)
 				if err := pcrlock.MaskPolicy("600-gpt.pcrlock"); err != nil {
 					if c.Verbose {
 						fmt.Printf("Note: failed to mask GPT policy: %v\n", err)
@@ -133,7 +140,8 @@ func (c *UpdatePolicyCmd) Run() error {
 		}
 	}
 
-	luksHeaderEnabled := c.LUKSDevice != "" && !c.NoLUKSHeader
+	c.luksHeaderEnabled = c.LUKSDevice != "" && !c.NoLUKSHeader
+	luksHeaderEnabled := c.luksHeaderEnabled
 
 	if luksHeaderEnabled {
 		if err := pcrlock.LockLUKSHeader(c.LUKSDevice); err != nil {
@@ -155,6 +163,10 @@ func (c *UpdatePolicyCmd) Run() error {
 		}
 	}
 
+	// The repair flow must use the EFFECTIVE decision (after the fallback
+	// above), not the requested one: refreshing a prediction for a masked
+	// header binding would contradict the summary.
+	c.luksHeaderEnabled = luksHeaderEnabled
 	if err := pcrlock.LockUKIWithPEFallback(c.UKIPath); err != nil {
 		return fmt.Errorf("failed to lock UKI: %w", err)
 	}
@@ -182,7 +194,7 @@ func (c *UpdatePolicyCmd) Run() error {
 	fmt.Println(box("Make Policy", []string{
 		"Enter Recovery PIN when prompted:",
 	}))
-	if err := pcrlock.MakePolicy(c.PolicyOutput); err != nil {
+	if err := pcrlock.MakePolicy(c.PolicyOutput, c.LUKSDevice); err != nil {
 		return fmt.Errorf("failed to generate policy: %w", err)
 	}
 
@@ -192,11 +204,12 @@ func (c *UpdatePolicyCmd) Run() error {
 	// the NEW hash (because vanguard update just re-enrolled the TPM2 token,
 	// changing the LUKS2 JSON metadata). InjectLUKSHeaderPrediction adds
 	// the NEW predicted PCR 11 value so the next boot's unseal succeeds.
+	//
+	// A failure here is not cosmetic: without the prediction the next boot
+	// cannot unseal. It must not be hidden behind --verbose.
 	if luksHeaderEnabled {
 		if err := pcrlock.InjectLUKSHeaderPrediction(c.PolicyOutput, c.LUKSDevice); err != nil {
-			if c.Verbose {
-				fmt.Printf("Note: failed to inject LUKS header prediction: %v\n", err)
-			}
+			return fmt.Errorf("failed to inject the LUKS header prediction into the policy (the next boot may not unseal): %w", err)
 		}
 	}
 
@@ -252,19 +265,63 @@ func (c *UpdatePolicyCmd) Run() error {
 	}
 	summaryLines = append(summaryLines, fmt.Sprintf("Active PCRs:  %s", strings.Join(activePCRs, ", ")))
 
+	// Token state, used below for --repair-token.
+	//
+	// Staleness is decided by comparing the serialized ESYS_TR of the
+	// pcrlock NV index: the token's tpm2_pcrlock_nv blob against the
+	// policy's nvHandle blob. systemd matches the two byte by byte to find
+	// the policy that belongs to a token, so this answers exactly the
+	// question at hand: does the token still point at the NV index the
+	// freshly generated policy describes?
+	//
+	// A policy regeneration undefines and redefines the NV index. The new
+	// definition can carry a different public area (a fresh recovery PIN),
+	// which changes the NV name — and the sealed blob binds that name, so
+	// the old token can no longer unseal although the index number is
+	// unchanged. An identical definition leaves the token valid, which the
+	// blob comparison below reports correctly.
+	tokenIsStale := false     // no LUKS device → nothing to repair
+	tokenUndecidable := false // token state could not be determined
+
 	if c.LUKSDevice != "" {
 		token, err := pcrlock.GetLUKSTPMToken(c.LUKSDevice)
 		if err != nil {
 			summaryLines = append(summaryLines, warnStyle.Render(fmt.Sprintf("Token:        not found on %s", c.LUKSDevice)))
 		} else {
-			if token.NVIndex == policyNVIndex {
+			newPolicy, policyErr := pcrlock.ParsePolicy(c.PolicyOutput)
+			if policyErr != nil {
+				return fmt.Errorf("failed to parse policy for token comparison: %w", policyErr)
+			}
+			stale, staleErr := pcrlock.TokenMatchesPolicy(token, newPolicy)
+			switch {
+			case staleErr != nil:
+				// The token's usability cannot be verified (no nvHandle,
+				// a hybrid PCR+pcrlock token, an unreadable blob).
+				// Neither claim "OK" nor trigger a repair: the state is
+				// unknown, and the user must decide.
+				tokenUndecidable = true
+				summaryLines = append(summaryLines, warnStyle.Render(fmt.Sprintf("Token:        cannot verify — %v", staleErr)))
+			case stale:
+				tokenIsStale = true
+				summaryLines = append(summaryLines, errStyle.Render(fmt.Sprintf(
+					"Token stale! The token is bound to a previous state of NV index 0x%x and can no longer unseal", token.NVIndex)))
+			case token.NVHandle == "":
+				// Classic PCR-bound token: the pcrlock NV index does not
+				// apply to it, so there is nothing to repair.
+				summaryLines = append(summaryLines, fmt.Sprintf("Token:        %s (not pcrlock-bound)", okStyle.Render("OK")))
+			default:
 				summaryLines = append(summaryLines, fmt.Sprintf("Token:        %s (NV matches)", okStyle.Render("OK")))
-			} else {
-				summaryLines = append(summaryLines, errStyle.Render(fmt.Sprintf("Token NV mismatch! Policy=0x%x, Token=0x%x", policyNVIndex, token.NVIndex)))
+			}
+			// Undecidable tokens always get the manual instructions: no
+			// automatic repair runs for them, even with --repair-token.
+			if tokenUndecidable || (tokenIsStale && !c.RepairToken) {
 				summaryLines = append(summaryLines, "")
 				summaryLines = append(summaryLines, dimStyle.Render("Re-enroll token:"))
 				summaryLines = append(summaryLines, dimStyle.Render(fmt.Sprintf(" systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto")))
 				summaryLines = append(summaryLines, dimStyle.Render(fmt.Sprintf("   --tpm2-with-pin=yes --tpm2-pcrlock=%s %s", c.PolicyOutput, c.LUKSDevice)))
+				if tokenIsStale {
+					summaryLines = append(summaryLines, dimStyle.Render("Or re-run with --repair-token to do this automatically."))
+				}
 			}
 		}
 	}
@@ -278,6 +335,17 @@ func (c *UpdatePolicyCmd) Run() error {
 	}
 
 	fmt.Println(box("Summary", summaryLines))
+
+	// Repair a token that no longer matches the regenerated policy. The
+	// sealed blob's authPolicy binds the OLD index's NV name, so no
+	// in-place re-pointing is possible — the blob must be re-sealed, which
+	// is exactly what systemd-cryptenroll does. Do it automatically when
+	// asked.
+	if c.RepairToken && tokenIsStale {
+		if err := c.repairToken(policyNVIndex); err != nil {
+			return err
+		}
+	}
 
 	if c.Cleanup {
 		keepIndices := []int{policyNVIndex}
@@ -311,8 +379,25 @@ func (c *UpdatePolicyCmd) Run() error {
 		if pcrErr != nil {
 			integrityLines = append(integrityLines, errStyle.Render(fmt.Sprintf("✗ PCR check failed: %v", pcrErr)))
 		} else {
+			// Build an enforcement map (PCR → enforced?) with the same
+			// IsEnforcedValues semantics as vanguard verify/status, so
+			// unbound PCRs render as informational instead of alarming
+			// "mismatch" rows (e.g. PCR 14 shim-policy, all-zeros by
+			// design).
+			enforced := make(map[int]bool)
+			for _, pv := range newPolicy.PCRValues {
+				enforced[pv.PCR] = pcrlock.IsEnforcedValues(pv.Values)
+			}
+
 			pcrFailures := 0
-			for p, match := range pcrMatches {
+			// Deterministic PCR order for stable output
+			pcrList := make([]int, 0, len(pcrMatches))
+			for p := range pcrMatches {
+				pcrList = append(pcrList, p)
+			}
+			sort.Ints(pcrList)
+			for _, p := range pcrList {
+				match := pcrMatches[p]
 				// PCR 11: the policy predicts the at-unseal-time value and
 				// systemd extends PCR 11 after unlock, so the live comparison
 				// always mismatches in a booted system. Use the header digest
@@ -324,9 +409,19 @@ func (c *UpdatePolicyCmd) Run() error {
 						match = hb.Match
 					}
 				}
+				if !match && !enforced[p] {
+					// Unbound PCR (e.g. all-zeros prediction): informational.
+					integrityLines = append(integrityLines,
+						dimStyle.Render(fmt.Sprintf("— PCR %-2d unbound (all-zeros prediction, not enforced)", p)))
+					continue
+				}
 				if !match {
 					pcrFailures++
-					integrityLines = append(integrityLines, errStyle.Render(fmt.Sprintf("✗ PCR %d mismatch (current: %s)", p, currentValues[p])))
+					current := currentValues[p]
+					if current == "" {
+						current = "(unreadable)"
+					}
+					integrityLines = append(integrityLines, errStyle.Render(fmt.Sprintf("✗ PCR %d mismatch (current: %s)", p, current)))
 				}
 			}
 			if pcrFailures == 0 {
@@ -346,6 +441,222 @@ func (c *UpdatePolicyCmd) Run() error {
 
 type updateResults struct {
 	pcr7Locked bool
+}
+
+// Seams for the repair flow, so its ordering and verification can be tested
+// without a TPM or a LUKS device.
+var (
+	getLUKSTPMToken        = pcrlock.GetLUKSTPMToken
+	injectHeaderPrediction = pcrlock.InjectLUKSHeaderPrediction
+	cryptenrollLookPath    = func() (string, error) { return exec.LookPath("systemd-cryptenroll") }
+	// stdinIsTerminal reports whether a passphrase prompt can be answered.
+	// It is a variable so both repair branches can be tested.
+	stdinIsTerminal = func() bool { return isTerminal(os.Stdin) }
+)
+
+// repairRunner executes systemd-cryptenroll with the given arguments. It is
+// a package variable so the repair flow can be tested without a TPM.
+var repairRunner = func(cryptenroll string, args []string) error {
+	cmd := exec.Command(cryptenroll, args...)
+	cmd.Stdin = os.Stdin
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	return cmd.Run()
+}
+
+// repairUnlockMethod describes how the volume is unlocked for the re-seal.
+type repairUnlockMethod int
+
+const (
+	// repairUnlockPassphrase prompts for the disk passphrase.
+	repairUnlockPassphrase repairUnlockMethod = iota
+	// repairUnlockTPM2Token unlocks with the existing TPM2 token (systemd
+	// 256+), which needs no passphrase.
+	repairUnlockTPM2Token
+)
+
+// repairUnlockArgs returns the systemd-cryptenroll arguments for the chosen
+// unlock method.
+//
+// Only real cryptenroll options may be produced: cryptenroll knows
+// --unlock-key-file, --unlock-fido2-device and --unlock-tpm2-device, and
+// nothing like --unlock-password or --unlock-empty. An unsupported method is
+// rejected here instead of surfacing as a cryptenroll "Unknown option".
+func (c *UpdatePolicyCmd) repairUnlockArgs(method repairUnlockMethod) ([]string, error) {
+	if method == repairUnlockTPM2Token {
+		return []string{"--unlock-tpm2-device=auto"}, nil
+	}
+
+	switch c.RepairUnlock {
+	case "", "password":
+		// No explicit method: cryptenroll prompts for the passphrase.
+		return nil, nil
+	case "key-file", "fido2-device", "tpm2-device":
+		if c.RepairUnlockValue == "" {
+			return nil, fmt.Errorf("--repair-unlock=%s requires --repair-unlock-value", c.RepairUnlock)
+		}
+		return []string{"--unlock-" + c.RepairUnlock + "=" + c.RepairUnlockValue}, nil
+	default:
+		return nil, fmt.Errorf("--repair-unlock: unsupported method %q (supported: key-file, fido2-device, tpm2-device; omit for a passphrase prompt)", c.RepairUnlock)
+	}
+}
+
+// manualRepairMessage is the operator-facing instruction for the
+// unattended case, where the token cannot be re-sealed automatically.
+func manualRepairMessage(luksDevice, ukiPath, policyPath string) string {
+	uki := ukiPath
+	if uki == "" {
+		uki = "<uki>"
+	}
+	return fmt.Sprintf(
+		"the LUKS token on %s cannot be re-sealed automatically: it no longer matches the regenerated policy "+
+			"(e.g. after a firmware/Secure Boot update changed PCR 7), and this run has no terminal for the "+
+			"passphrase. Re-enroll the token manually:\n"+
+			"  sudo vanguard enroll -u %s -l %s\n"+
+			"or:\n"+
+			"  sudo systemd-cryptenroll --wipe-slot=tpm2 --tpm2-device=auto --tpm2-pcrlock=%s %s",
+		luksDevice, uki, luksDevice, policyPath, luksDevice)
+}
+
+// repairToken re-seals the LUKS token against the freshly generated
+// policy. The sealed blob's authPolicy binds the OLD index's NV name, so
+// the blob must be re-sealed — which is what systemd-cryptenroll does.
+func (c *UpdatePolicyCmd) repairToken(policyNVIndex int) error {
+	fmt.Println()
+	fmt.Println("  " + headerSty.Render("REPAIRING LUKS TOKEN"))
+	fmt.Println()
+	fmt.Printf("  Token no longer matches the policy (NV index 0x%x).\n", policyNVIndex)
+
+	cryptenroll, lookErr := cryptenrollLookPath()
+	if lookErr != nil {
+		return fmt.Errorf("--repair-token: systemd-cryptenroll not found — install systemd with cryptsetup support")
+	}
+
+	// Unlock method: prefer unlocking the volume with the EXISTING TPM2
+	// token (--unlock-tpm2-device=auto, systemd 256+). That needs no
+	// passphrase, so it works unattended. Fall back to the passphrase
+	// prompt when the token-based unlock is unavailable (older systemd) or
+	// the operator asked for it.
+	method := repairUnlockPassphrase
+	switch {
+	case c.RepairUnlock != "":
+		method = repairUnlockPassphrase // explicit selection, handled in repairUnlockArgs
+	case c.NonInteractive:
+		method = repairUnlockTPM2Token
+	}
+
+	runRepair := func(m repairUnlockMethod) error {
+		args := []string{
+			"--wipe-slot=tpm2",
+			"--tpm2-device=auto",
+			"--tpm2-pcrlock=" + c.PolicyOutput,
+		}
+		unlockArgs, err := c.repairUnlockArgs(m)
+		if err != nil {
+			return err
+		}
+		args = append(args, unlockArgs...)
+		args = append(args, c.LUKSDevice)
+
+		fmt.Printf("  Running: systemd-cryptenroll %s\n", strings.Join(args, " "))
+		fmt.Println()
+		return repairRunner(cryptenroll, args)
+	}
+
+	switch method {
+	case repairUnlockTPM2Token:
+		fmt.Println("  Unlocking the volume with the existing TPM2 token (no passphrase).")
+	default:
+		fmt.Println("  Unlocking the volume — you will be prompted for the disk passphrase.")
+		fmt.Println("  (use --non-interactive to unlock via the existing TPM2 token instead)")
+	}
+
+	// confirmRepaired verifies that the re-seal took effect. A failed
+	// re-read means the state is unknown — report it instead of claiming
+	// success. Used after every successful attempt, including the retry.
+	confirmRepaired := func() error {
+		token, tokErr := getLUKSTPMToken(c.LUKSDevice)
+		if tokErr != nil {
+			return fmt.Errorf("--repair-token: re-seal ran but the token could not be re-read: %w", tokErr)
+		}
+		newPolicy, policyErr := pcrlock.ParsePolicy(c.PolicyOutput)
+		if policyErr != nil {
+			return fmt.Errorf("--repair-token: re-seal ran but the policy could not be parsed: %w", policyErr)
+		}
+		status, note, _ := tokenNVStatus(token, newPolicy)
+		if status != "match" {
+			// "Not stale" is not sufficient proof: a classic PCR-bound
+			// token has no pcrlock binding at all, and an undecidable
+			// token is not verified either. Only an actual pcrlock-bound
+			// match confirms the repair.
+			fmt.Println()
+			fmt.Printf("  %s Token does not match the policy after the re-seal (%s)\n", errStyle.Render("✗"), status)
+			return fmt.Errorf("--repair-token: token state after the re-seal is %q, want a pcrlock-bound match (%s)", status, note)
+		}
+		fmt.Println()
+		fmt.Printf("  %s Token re-sealed — it matches the policy again\n", okStyle.Render("✓"))
+		return nil
+	}
+
+	// afterRepaired confirms the repair and then refreshes the PCR 11
+	// prediction: cryptenroll rewrites the LUKS2 JSON metadata, so the
+	// header digest — and with it the PCR 11 the next boot produces —
+	// changes. The prediction injected before the repair would otherwise be
+	// stale, and the repaired token would still fail to unseal.
+	afterRepaired := func() error {
+		if err := confirmRepaired(); err != nil {
+			return err
+		}
+		if !c.luksHeaderEnabled {
+			return nil
+		}
+		if err := injectHeaderPrediction(c.PolicyOutput, c.LUKSDevice); err != nil {
+			return fmt.Errorf("the token was re-sealed but the LUKS header prediction could not be refreshed: %w", err)
+		}
+		return nil
+	}
+
+	repairErr := runRepair(method)
+	if repairErr == nil {
+		return afterRepaired()
+	}
+
+	// The repair failed. The unattended case cannot succeed: the very
+	// situation the relock service exists for (a firmware update changed
+	// PCR 7) means the OLD token can no longer unlock the volume. Asking
+	// for a passphrase without a terminal would hang the service, so the
+	// operator is told what to run instead.
+	if !stdinIsTerminal() {
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintf(os.Stderr, "  %s Token re-seal failed: %v\n", errStyle.Render("✗"), repairErr)
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, manualRepairMessage(c.LUKSDevice, c.UKIPath, c.PolicyOutput))
+		fmt.Fprintln(os.Stderr)
+		// The policy was regenerated successfully — failing the whole
+		// command here would skip the relock service's ExecStartPost
+		// (recovery --auto-reseed) and leave the recovery seed stale
+		// as well. Report and continue instead.
+		return nil
+	}
+
+	// Interactive: the passphrase prompt already ran in the first
+	// attempt, so retrying it identically would only repeat the same
+	// failure. Only a token-based unlock is worth a second try.
+	if method == repairUnlockPassphrase && c.RepairUnlock == "" {
+		fmt.Println()
+		fmt.Printf("  %s Re-seal failed: %v\n", errStyle.Render("✗"), repairErr)
+		fmt.Println()
+		fmt.Println("  The passphrase unlock did not succeed. Try the TPM-token unlock:")
+		fmt.Println("    sudo vanguard update -u " + c.UKIPath + " -l " + c.LUKSDevice + " --repair-token --non-interactive")
+		return fmt.Errorf("--repair-token: systemd-cryptenroll failed: %w", repairErr)
+	}
+
+	fmt.Println()
+	fmt.Printf("  %s Re-seal failed (%v) — retrying with the TPM2 token.\n", warnStyle.Render("⚠"), repairErr)
+	if retryErr := runRepair(repairUnlockTPM2Token); retryErr != nil {
+		return fmt.Errorf("--repair-token: systemd-cryptenroll failed: %w (TPM-token retry also failed: %v)", repairErr, retryErr)
+	}
+	return afterRepaired()
 }
 
 func box(title string, lines []string) string {

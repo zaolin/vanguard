@@ -7,7 +7,20 @@ ConditionPathExists=/etc/vanguard.toml
 
 [Service]
 Type=oneshot
-ExecStart=/usr/bin/vanguard update --config /etc/vanguard.toml --no-verify
+# Regenerate the pcrlock policy and re-seal the LUKS token against it.
+#
+# --repair-token --non-interactive unlocks the volume with the EXISTING TPM2
+# token (systemd-cryptenroll --unlock-tpm2-device=auto, systemd 256+), so no
+# passphrase is needed while the old token still unseals.
+#
+# Note the ordering constraint: regenerating the policy redefines the NV
+# index, which invalidates the old token. If that happens before the re-seal,
+# the volume can only be unlocked with the disk passphrase. In that case the
+# command prints the manual re-enrollment step on stderr and still exits 0 —
+# systemd runs ExecStartPost only after a successful ExecStart, and the
+# recovery reseed there must not be skipped just because the token needs
+# manual attention.
+ExecStart=/usr/bin/vanguard update --config /etc/vanguard.toml --no-verify --repair-token --non-interactive
 ExecStartPost=/usr/bin/vanguard recovery --auto-reseed
 RemainAfterExit=no
 

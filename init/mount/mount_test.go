@@ -59,6 +59,31 @@ func TestNormalizeLVMPath(t *testing.T) {
 	}
 }
 
+// TestNormalizeLVMPathHyphenEscaping pins the device-mapper name escaping:
+// hyphens inside VG/LV names double up in mapper names, so the mapper path
+// built here matches what LVM actually creates. Neither path exists in the
+// unit-test environment, so the fallback ("prefer mapper path when neither
+// exists") applies — which is exactly the escaping we want to verify.
+func TestNormalizeLVMPathHyphenEscaping(t *testing.T) {
+	cases := []struct {
+		input string
+		want  string
+	}{
+		// simple names: no escaping
+		{"/dev/gentoo/root", "/dev/mapper/gentoo-root"},
+		// hyphen in VG: escaped as --
+		{"/dev/gentoo-sys/root", "/dev/mapper/gentoo--sys-root"},
+		// hyphens in both VG and LV
+		{"/dev/a-b/c-d", "/dev/mapper/a--b-c--d"},
+	}
+	for _, tt := range cases {
+		got := normalizeLVMPath(tt.input)
+		if got != tt.want {
+			t.Errorf("normalizeLVMPath(%q) = %q, want %q", tt.input, got, tt.want)
+		}
+	}
+}
+
 func TestDecodeUTF16LE(t *testing.T) {
 	b := []byte{0x45, 0x00, 0x46, 0x00, 0x49, 0x00}
 	got := decodeUTF16LE(b)

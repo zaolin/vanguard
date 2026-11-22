@@ -44,6 +44,29 @@ type verifyToken struct {
 	NVIndex    int  `json:"nvIndex"`
 	HasPCRLock bool `json:"hasPcrlock"`
 	NVMatch    bool `json:"nvMatch"`
+	// NVStatus is "match", "stale", "not-pcrlock-bound" or "unknown". The
+	// token can only be called fresh when its NV binding was actually
+	// verified — an undecidable state must not read as a match.
+	NVStatus string `json:"nvStatus"`
+	NVNote   string `json:"nvNote,omitempty"`
+}
+
+// tokenNVStatus classifies the token against the policy with the shared
+// staleness check (the same one `vanguard update --repair-token` uses).
+// A numeric index comparison alone misses an index that was redefined at the
+// same handle.
+func tokenNVStatus(token *pcrlock.LUKSTPMToken, policy *pcrlock.Policy) (status, note string, matches bool) {
+	stale, err := pcrlock.TokenMatchesPolicy(token, policy)
+	switch {
+	case err != nil:
+		return "unknown", err.Error(), false
+	case stale:
+		return "stale", "the token no longer matches the policy's NV index", false
+	case token.NVHandle == "":
+		return "not-pcrlock-bound", "", true
+	default:
+		return "match", "", true
+	}
 }
 
 func (c *VerifyPCRLockCmd) runJSON(policy *pcrlock.Policy) error {
@@ -111,13 +134,25 @@ func (c *VerifyPCRLockCmd) runJSON(policy *pcrlock.Policy) error {
 
 	if c.LUKSDevice != "" {
 		token, err := pcrlock.GetLUKSTPMToken(c.LUKSDevice)
-		if err == nil && token != nil {
+		if err != nil || token == nil {
+			// A failed lookup is an unknown token state, not a successful
+			// verification: report it instead of omitting the token.
+			note := "no systemd-tpm2 token"
+			if err != nil {
+				note = err.Error()
+			}
+			result.Token = &verifyToken{NVStatus: "unknown", NVNote: note, NVMatch: false}
+			result.AllMatch = false
+		} else {
+			status, note, matches := tokenNVStatus(token, policy)
 			result.Token = &verifyToken{
 				NVIndex:    token.NVIndex,
 				HasPCRLock: token.HasPCRLock,
-				NVMatch:    token.NVIndex == policy.NVIndex,
+				NVMatch:    matches,
+				NVStatus:   status,
+				NVNote:     note,
 			}
-			if !result.Token.NVMatch {
+			if !matches {
 				result.AllMatch = false
 			}
 		}
@@ -271,13 +306,18 @@ func (c *VerifyPCRLockCmd) runHuman(policy *pcrlock.Policy) error {
 			tokenLines = append(tokenLines, errStyle.Render("✗ No systemd-tpm2 token found"))
 			allMatch = false
 		} else {
-			if token.NVIndex == 0 {
-				tokenLines = append(tokenLines, warnStyle.Render("⚠ No NV index in token (standalone policy)"))
-			} else if token.NVIndex != policy.NVIndex {
-				tokenLines = append(tokenLines, errStyle.Render(
-					fmt.Sprintf("✗ Wrong NV: token=0x%x policy=0x%x", token.NVIndex, policy.NVIndex)))
+			status, note, _ := tokenNVStatus(token, policy)
+			switch status {
+			case "unknown":
+				tokenLines = append(tokenLines, warnStyle.Render(fmt.Sprintf("⚠ Token state cannot be verified: %s", note)))
 				allMatch = false
-			} else {
+			case "stale":
+				tokenLines = append(tokenLines, errStyle.Render(
+					fmt.Sprintf("✗ Token is stale: it no longer matches the policy's NV index (token=0x%x policy=0x%x)", token.NVIndex, policy.NVIndex)))
+				allMatch = false
+			case "not-pcrlock-bound":
+				tokenLines = append(tokenLines, warnStyle.Render("⚠ No NV binding in token (classic PCR-bound token)"))
+			default:
 				tokenLines = append(tokenLines, fmt.Sprintf("%s NV index matches policy (0x%x)", okStyle.Render("✓"), token.NVIndex))
 			}
 

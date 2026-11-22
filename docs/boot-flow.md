@@ -153,7 +153,8 @@ flowchart TD
 
     J -->|Yes| L[Native Go dm-crypt setup via ioctl]
     J -->|No| M[Log PCR values for debug]
-    M --> StrictCheck{Strict mode?}
+    M --> M2[Show TPM failure reason<br/>dwell ≥ 2s]
+    M2 --> StrictCheck{Strict mode?}
     StrictCheck -->|Yes| R{HOTP recovery<br/>3 attempts/boot,<br/>fail cap 10}
     StrictCheck -->|No| K[TUI passphrase prompt]
 
@@ -168,6 +169,18 @@ flowchart TD
     O -->|No, < 3 attempts| N
     O -->|No, = 3| P
 ```
+
+**Prompt routing:** passphrase and PIN prompts go through the TUI only while
+its Run loop is actually alive (`tui.PromptAvailable()`). After the strict
+path tears the TUI down for HOTP recovery, prompts fall back to the plain
+console — a dead TUI never swallows the passphrase prompt. HOTP codes are
+read with echo enabled (they are one-time values, not secrets); passphrases
+and PINs stay hidden.
+
+**Halt paths:** every fatal failure (unlock failure, PCR 7
+Secure-Boot checks, no root device, mount failure) prints its reason *after*
+the TUI is torn down, then waits for the user to press Enter before halting,
+so the error stays on screen until it has been read.
 
 **Token strategy detection** (`init/luks/detect.go`):
 - **PIN-only** - no PCRs, no pcrlock → skips policy hash verification

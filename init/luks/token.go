@@ -15,6 +15,8 @@ import (
 
 // TPM2Token represents a parsed systemd-tpm2 token.
 type TPM2Token struct {
+	// ID is the LUKS2 header token ID this token was parsed from.
+	ID int
 	// Blob is the TPM2 sealed blob containing private and public key material.
 	Blob []byte
 	// PCRs are the PCR indices bound to this token (legacy, empty for pcrlock).
@@ -37,10 +39,10 @@ type TPM2Token struct {
 	SRKHandle uint32
 	// SRKData is the serialized SRK public data (tpm2_srk from systemd v255+).
 	SRKData []byte
-	// PCRLockNVPublic is the raw TPM2B_NV_PUBLIC blob from the token
-	// (tpm2_pcrlock_nv field). Used to verify the NV index name at boot,
-	// catching NV index redefinition/spoofing attacks.
-	PCRLockNVPublic []byte
+	// PCRLockNVHandle is the serialized ESYS_TR of the pcrlock NV index
+	// (token field tpm2_pcrlock_nv). It identifies the NV index the token
+	// is bound to and is used to verify the NV index identity at boot.
+	PCRLockNVHandle []byte
 	// Keyslots are the LUKS keyslots this token unlocks.
 	Keyslots []int
 }
@@ -166,20 +168,24 @@ func ParseTPM2Token(token lk.Token) (*TPM2Token, error) {
 		buildtags.Debug("  srk data decoded: %d bytes\n", len(srkData))
 	}
 
-	// Decode the raw TPM2B_NV_PUBLIC blob for NV index name verification.
-	// This is the full NV public area from the token, used to detect NV
-	// index redefinition/spoofing at boot time.
-	var pcrlockNVPublic []byte
+	// Decode the serialized ESYS_TR of the pcrlock NV index. The blob
+	// identifies the NV index the token is bound to and carries the
+	// index's public area, which is used to detect NV index
+	// redefinition/spoofing at boot time.
+	var pcrlockNVHandle []byte
 	if payload.PCRLockNVDataAlt != "" {
-		pcrlockNVPublic, err = base64.StdEncoding.DecodeString(payload.PCRLockNVDataAlt)
+		pcrlockNVHandle, err = base64.StdEncoding.DecodeString(payload.PCRLockNVDataAlt)
 		if err != nil {
-			buildtags.Debug("tpm2 token: failed to decode NV public data: %v\n", err)
-		} else {
-			buildtags.Debug("tpm2 token: NV public data decoded: %d bytes\n", len(pcrlockNVPublic))
+			// A present but undecodable NV field means the token is
+			// corrupt. Dropping it silently would disable the NV identity
+			// check at unseal time while the token still looks valid.
+			return nil, fmt.Errorf("failed to decode tpm2_pcrlock_nv: %w", err)
 		}
+		buildtags.Debug("tpm2 token: NV handle data decoded: %d bytes\n", len(pcrlockNVHandle))
 	}
 
 	return &TPM2Token{
+		ID:              token.ID,
 		Blob:            blob,
 		PCRs:            payload.PCRs,
 		PCRBank:         pcrBank,
@@ -191,7 +197,7 @@ func ParseTPM2Token(token lk.Token) (*TPM2Token, error) {
 		PCRLockNV:       pcrlockNV,
 		SRKHandle:       srkHandle,
 		SRKData:         srkData,
-		PCRLockNVPublic: pcrlockNVPublic,
+		PCRLockNVHandle: pcrlockNVHandle,
 		Keyslots:        token.Slots,
 	}, nil
 }
@@ -234,7 +240,7 @@ func (t *TPM2Token) Unseal(tpmClient *intpm.Client, pin []byte, pcrlockPolicy *i
 		PCRLockNV:       t.PCRLockNV,
 		SRKHandle:       t.SRKHandle,
 		SRKData:         t.SRKData,
-		PCRLockNVPublic: t.PCRLockNVPublic,
+		PCRLockNVHandle: t.PCRLockNVHandle,
 	}
 
 	if pcrlockPolicy != nil {

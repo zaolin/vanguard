@@ -5,12 +5,14 @@ import (
 	"crypto/cipher"
 	"crypto/sha256"
 	"crypto/sha512"
+	"crypto/subtle"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
 	"hash"
 	"os"
+	"sort"
 	"strconv"
 	"strings"
 	"unsafe"
@@ -152,6 +154,13 @@ func (d *deviceV2) Slots() []int {
 	return append(highPrio, normPrio...)
 }
 
+// Tokens returns the LUKS2 tokens ordered by token ID.
+//
+// The metadata stores tokens in a map[int]json.RawMessage, and Go
+// randomizes map iteration order — returning them unsorted made the token
+// selection order vary between boots (which token is tried first at
+// unlock, which token `vanguard status` reports). Sorting by the header
+// token ID makes the behavior deterministic.
 func (d *deviceV2) Tokens() ([]Token, error) {
 	var tokens []Token
 
@@ -160,7 +169,16 @@ func (d *deviceV2) Tokens() ([]Token, error) {
 		Keyslots []json.Number
 	}
 
-	for i, t := range d.meta.Tokens {
+	// Collect the token IDs and sort them — map iteration order is random.
+	ids := make([]int, 0, len(d.meta.Tokens))
+	for id := range d.meta.Tokens {
+		ids = append(ids, id)
+	}
+	sort.Ints(ids)
+
+	for _, i := range ids {
+		t := d.meta.Tokens[i]
+
 		var node tokenNode
 		if err := json.Unmarshal(t, &node); err != nil {
 			return nil, err
@@ -294,7 +312,12 @@ func (d *deviceV2) UnsealVolume(keyslotIdx int, passphrase []byte) (*Volume, err
 	if len(expectedDigest) > len(generatedDigest) {
 		return nil, fmt.Errorf("keyslotIdx[%v].digest.Digest length %d exceeds hash output %d", keyslotIdx, len(expectedDigest), len(generatedDigest))
 	}
-	if !bytes.Equal(generatedDigest[0:len(expectedDigest)], expectedDigest) {
+	// Constant-time comparison: this is the passphrase check. A
+	// byte-by-byte early-exit comparison leaks how many leading bytes of
+	// the digest matched, which is a (weak) timing oracle on the
+	// derived key. LUKS2 digests may be truncated by design, so the
+	// comparison is over the stored length.
+	if subtle.ConstantTimeCompare(generatedDigest[0:len(expectedDigest)], expectedDigest) != 1 {
 		return nil, ErrPassphraseDoesNotMatch
 	}
 	clearSlice(generatedDigest)

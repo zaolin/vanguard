@@ -11,6 +11,7 @@ package recovery
 
 import (
 	"fmt"
+	"time"
 
 	"github.com/zaolin/vanguard/init/buildtags"
 	"github.com/zaolin/vanguard/init/console"
@@ -39,6 +40,15 @@ var LogFunc func(event string, kvPairs ...string) = func(event string, kvPairs .
 //
 // Returns true if recovery succeeded (passphrase fallback should be enabled).
 func TryHOTP(tpmClient *intpm.Client, devicePath string) bool {
+	// 0. Make sure the TPM device is up before checking NV state. A device
+	// still enumerating would otherwise read as "recovery not configured"
+	// and silently skip recovery.
+	if !tpmClient.WaitForDevice(3 * time.Second) {
+		console.Print("recovery: TPM device not available for recovery\n")
+		LogFunc("RECOVERY_TPM_UNAVAILABLE", "device", devicePath)
+		return false
+	}
+
 	// 1. Check if recovery is provisioned (seed index exists).
 	if !tpmClient.RecoveryNVExists(intpm.DefaultRecoverySeedNVIndex) {
 		buildtags.Debug("recovery: no HOTP recovery configured (seed NV index not found)\n")
@@ -91,7 +101,11 @@ func TryHOTP(tpmClient *intpm.Client, devicePath string) bool {
 		console.Print("vanguard: TPM unlock failed. Enter recovery HOTP code (attempt %d of %d):\n",
 			attempt, MaxHOTPAttempts)
 
-		code, err := console.ReadPassword("Recovery code: ")
+		// Read the code WITH echo: it is an 8-digit one-time value, not a
+		// long-lived secret — the passphrase remains the real key. Not
+		// seeing the digits makes typos and wrong-keymap input impossible
+		// to diagnose at the boot console.
+		code, err := console.ReadCode("Recovery code: ")
 		if err != nil {
 			console.Print("recovery: failed to read code: %v\n", err)
 			return false

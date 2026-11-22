@@ -1,9 +1,15 @@
 package main
 
 import (
+	"context"
+	"fmt"
+	"io/fs"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
+	"time"
 )
 
 // hardwareSecurityInfo contains hardware-level security feature status.
@@ -183,8 +189,10 @@ func detectMemoryEncryption() (status string, encType string, advice string) {
 		}
 
 		// AMD TSME: check for tsme_status sysfs files
-		tsmeActive, _ := detectTSME()
-		if tsmeActive {
+		if tsmeActive, tsmeCount := detectTSME(); tsmeActive {
+			if tsmeCount > 1 {
+				return "active", fmt.Sprintf("AMD TSME (%d devices)", tsmeCount), ""
+			}
 			return "active", "AMD TSME", ""
 		}
 
@@ -214,13 +222,20 @@ func detectMemoryEncryption() (status string, encType string, advice string) {
 			return "active", "Intel TME", ""
 		}
 
-		// Check dmesg for TME activation message
-		if dmesgContains("x86/tme: enabled by BIOS") {
+		// TME activation is reported in the kernel log. Read it once:
+		// reading it spawns dmesg (or opens /dev/kmsg), and the two
+		// checks below would otherwise do that twice.
+		//
+		// A failed read must not be reported as "TME not detected":
+		// the state is unknown, so say so.
+		log, err := readKernelLog()
+		if err != nil {
+			return "not-available", "", fmt.Sprintf("Intel TME could not be detected (kernel log unavailable: %v). Enable Intel TME in BIOS setup for cold boot attack resistance", err)
+		}
+		if strings.Contains(log, "x86/tme: enabled by BIOS") {
 			return "active", "Intel TME", ""
 		}
-
-		// Check if TME is available but not enabled
-		if dmesgContains("x86/tme: not enabled by BIOS") {
+		if strings.Contains(log, "x86/tme: not enabled by BIOS") {
 			return "available", "Intel TME", "Enable Intel TME (Total Memory Encryption) in BIOS setup for cold boot attack resistance"
 		}
 
@@ -233,26 +248,86 @@ func detectMemoryEncryption() (status string, encType string, advice string) {
 	return "not-available", "", "Memory encryption not available on this platform"
 }
 
+// memoryEncryptionActiveNow reports whether RAM encryption is actually active
+// right now, based on positive kernel evidence — not on CPU flags or on a boot
+// parameter that merely REQUESTS it.
+//
+// mem_encrypt=on only asks for SME: on a CPU or kernel without support it does
+// nothing. Treating it as proof would suppress a real suspend-to-RAM warning.
+func memoryEncryptionActiveNow() bool {
+	// TSME is reported directly by the driver, which is authoritative.
+	if active, _ := detectTSMEFn(); active {
+		return true
+	}
+
+	log, err := readKernelLog()
+	if err != nil {
+		return false
+	}
+	// Intel: the kernel states explicitly whether TME was enabled.
+	if strings.Contains(log, "x86/tme: enabled by BIOS") {
+		return true
+	}
+	if strings.Contains(log, "x86/tme: not enabled by BIOS") {
+		return false
+	}
+	// AMD: mem_encrypt.c prints this only when the features are active
+	// (verified in arch/x86/mm/mem_encrypt.c: print_mem_encrypt_feature_info).
+	return strings.Contains(log, "Memory Encryption Features active")
+}
+
+// detectTSMEFn is the TSME probe, as a variable so tests can stub it.
+var detectTSMEFn = detectTSME
+
 // detectTSME checks for AMD Transparent Secure Memory Encryption via sysfs.
 // TSME is a BIOS-controlled always-on feature, not cmdline-activated.
 func detectTSME() (active bool, count int) {
-	// Search for tsme_status files under /sys/devices/
-	matches, err := filepath.Glob("/sys/devices/**/tsme_status")
-	if err != nil || len(matches) == 0 {
-		return false, 0
-	}
-	count = len(matches)
-	for _, path := range matches {
-		data, err := os.ReadFile(path)
+	return detectTSMEIn(sysDevicesRoot)
+}
+
+// sysDevicesRoot is the sysfs directory tree the TSME lookup walks.
+const sysDevicesRoot = "/sys/devices"
+
+// tsmeStatusFile is the sysfs attribute the AMD TSME driver exposes.
+const tsmeStatusFile = "tsme_status"
+
+// detectTSMEIn searches root recursively for tsme_status files and reports
+// whether any of them report TSME as active.
+//
+// The lookup must recurse: on real hardware the file lives several levels
+// deep (e.g. /sys/devices/pci0000:00/0000:00:08.1/0000:c1:00.2/tsme_status).
+// A filepath.Glob with a "**" pattern cannot be used — Go's Glob has no
+// recursive wildcard and would only match a single path segment.
+func detectTSMEIn(root string) (active bool, count int) {
+	// The callback never returns an error, so the walk always succeeds;
+	// the returned error is only non-nil for a broken root.
+	if err := filepath.WalkDir(root, func(path string, d fs.DirEntry, err error) error {
 		if err != nil {
-			continue
+			// Unreadable subtrees (permission, disappearing devices) must
+			// not abort the search.
+			return nil
 		}
-		val := strings.TrimSpace(string(data))
-		if val == "1" {
-			return true, count
+		if d.IsDir() || d.Name() != tsmeStatusFile {
+			return nil
 		}
+		data, readErr := os.ReadFile(path)
+		if readErr != nil {
+			// A device whose status cannot be read tells us nothing:
+			// count only devices with a readable status so the reported
+			// device count matches what was actually inspected.
+			return nil
+		}
+		count++
+		if strings.TrimSpace(string(data)) == "1" {
+			active = true
+		}
+		return nil
+	}); err != nil {
+		// A completely unreadable sysfs tree means no TSME could be
+		// detected — report it as inactive rather than claiming a result.
+		return false, count
 	}
-	return false, count
+	return active, count
 }
 
 // detectCPUVendor reads the CPU vendor from /proc/cpuinfo.
@@ -301,16 +376,86 @@ func fileExists(path string) bool {
 	return err == nil
 }
 
-// dmesgContains checks if the kernel log contains a specific string.
-// Uses /dev/kmsg for reading (available to root).
-func dmesgContains(pattern string) bool {
-	// Try reading from /dev/kmsg (requires root)
-	data, err := os.ReadFile("/dev/kmsg")
+// dmesgTimeout bounds the dmesg(8) invocation.
+const dmesgTimeout = 5 * time.Second
+
+// maxKernelLogBytes caps how much kernel log is read into memory.
+const maxKernelLogBytes = 256 * 1024
+
+// dmesgRunner runs dmesg(8) and returns its output. It is a package
+// variable so the kernel-log reading can be tested without dmesg.
+var dmesgRunner = func() ([]byte, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), dmesgTimeout)
+	defer cancel()
+	// No --color flag: dmesg only colorizes when stdout is a terminal,
+	// and the option does not exist before util-linux 2.38 — passing it
+	// there would fail the whole command.
+	return exec.CommandContext(ctx, "dmesg").Output()
+}
+
+// kmsgReader reads the kernel log from /dev/kmsg. It is a package
+// variable so the reading can be tested without the real device.
+var kmsgReader = func() (string, error) {
+	return readKmsg("/dev/kmsg")
+}
+
+// readKmsg reads the kernel log from path.
+//
+// It must use raw syscalls: os.File.Read registers the descriptor with the
+// Go runtime poller, which turns an EAGAIN into a wait for the next kernel
+// record — exactly the hang this code must avoid. /dev/kmsg has no EOF, so
+// a blocking read would wait forever on a quiet system.
+func readKmsg(path string) (string, error) {
+	fd, err := syscall.Open(path, syscall.O_RDONLY|syscall.O_NONBLOCK|syscall.O_CLOEXEC, 0)
 	if err != nil {
-		// Fallback: try journalctl if available
-		return false
+		return "", fmt.Errorf("open %s: %w", path, err)
 	}
-	return strings.Contains(string(data), pattern)
+	defer syscall.Close(fd)
+
+	var out []byte
+	buf := make([]byte, 16*1024)
+	for len(out) < maxKernelLogBytes {
+		n, err := syscall.Read(fd, buf)
+		if n > 0 {
+			out = append(out, buf[:n]...)
+			continue
+		}
+		if err == syscall.EAGAIN || err == syscall.EWOULDBLOCK {
+			// Ring buffer drained — done.
+			break
+		}
+		if err != nil {
+			if len(out) > 0 {
+				break
+			}
+			return "", fmt.Errorf("read %s: %w", path, err)
+		}
+		if n == 0 {
+			break
+		}
+	}
+	if len(out) == 0 {
+		return "", fmt.Errorf("no kernel log data available")
+	}
+	return string(out), nil
+}
+
+// readKernelLog returns the kernel log contents.
+//
+// It prefers dmesg(8), which handles the ring buffer correctly and yields
+// plain text. The /dev/kmsg fallback reads with raw non-blocking syscalls:
+// /dev/kmsg has no EOF, and a blocking read would wait for the next kernel
+// record to appear.
+func readKernelLog() (string, error) {
+	out, dmesgErr := dmesgRunner()
+	if dmesgErr == nil {
+		return string(out), nil
+	}
+	log, kmsgErr := kmsgReader()
+	if kmsgErr != nil {
+		return "", fmt.Errorf("dmesg failed: %w; /dev/kmsg failed: %w", dmesgErr, kmsgErr)
+	}
+	return log, nil
 }
 
 // checkHardwareWarnings generates warnings based on hardware security status.

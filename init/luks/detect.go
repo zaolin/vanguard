@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"sort"
 
 	"github.com/zaolin/vanguard/init/buildtags"
 	"github.com/zaolin/vanguard/internal/pcrlock"
@@ -135,7 +136,18 @@ func findSystemdTPM2TokenInHeader(devicePath string) (map[string]interface{}, er
 		return nil, err
 	}
 
-	for _, token := range config.Tokens {
+	// Iterate token IDs in sorted order — the JSON object is decoded into a
+	// map, and Go randomizes map iteration order. Picking the first
+	// systemd-tpm2 token from an unsorted map made the detected strategy
+	// (and therefore the PCR policy applied) vary between boots.
+	tokenIDs := make([]string, 0, len(config.Tokens))
+	for id := range config.Tokens {
+		tokenIDs = append(tokenIDs, id)
+	}
+	sort.Strings(tokenIDs)
+
+	for _, id := range tokenIDs {
+		token := config.Tokens[id]
 		tokenType, ok := token["type"].(string)
 		if !ok {
 			continue

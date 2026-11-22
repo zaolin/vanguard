@@ -11,6 +11,7 @@ import (
 
 	"github.com/zaolin/vanguard/init/buildtags"
 	"github.com/zaolin/vanguard/init/console"
+	"github.com/zaolin/vanguard/internal/pcrlock"
 	intpm "github.com/zaolin/vanguard/internal/tpm"
 )
 
@@ -40,7 +41,7 @@ var eventLogPath = "/run/log/systemd/tpm2-measure.log"
 // hashed, or the PCR extend fails, the measurement is skipped and the boot
 // continues. The pcrlock policy will simply not include PCR 11 in this case.
 func (d *Device) MeasureHeader() error {
-	return measureHeaderWithDeps(d.Path, intpm.New, writeEventLogRecord)
+	return measureHeaderWithDeps(d.Path, intpm.New, writeEventLogRecordFor)
 }
 
 // measureHeaderWithDeps is the testable core of MeasureHeader. It accepts
@@ -48,7 +49,7 @@ func (d *Device) MeasureHeader() error {
 func measureHeaderWithDeps(
 	devicePath string,
 	newTPMClient func() *intpm.Client,
-	writeEventLog func(int, []byte) error,
+	writeEventLog func(int, []byte, string) error,
 ) error {
 	digest, err := HashLUKS2Header(devicePath)
 	if err != nil {
@@ -72,8 +73,10 @@ func measureHeaderWithDeps(
 		PCRUsedForLUKSHeader, hex.EncodeToString(digest))
 
 	// Write CEL-JSON record to the userspace event log so systemd-pcrlock
-	// make-policy can match it against our .pcrlock component file.
-	if err := writeEventLog(PCRUsedForLUKSHeader, digest); err != nil {
+	// make-policy can match it against our .pcrlock component file. The
+	// device path is included so the host side can keep multiple LUKS
+	// devices apart and reproduce the measurement order.
+	if err := writeEventLog(PCRUsedForLUKSHeader, digest, devicePath); err != nil {
 		buildtags.Debug("luks: failed to write event log record: %v\n", err)
 	}
 
@@ -101,18 +104,38 @@ type celContent struct {
 	Data      map[string]string `json:"data"`
 }
 
+// LUKSHeaderDataKey is the CEL data key carrying the measured device path
+// in a vanguard-luks-header record.
+//
+// It exists so the host side (internal/pcrlock) can tell the LUKS header
+// records apart and keep them in the same ORDER the initrd measured them.
+// Without it, several LUKS devices produce several indistinguishable
+// records and the policy's predicted PCR 11 cannot be reconstructed
+// reliably (the old code took the first one for the component and the
+// last one for the prediction — two different records).
+//
+// The constant lives in internal/pcrlock because both the writer (this
+// package) and the reader (the policy generator) must agree on it.
+const LUKSHeaderDataKey = pcrlock.LUKSHeaderDataKey
+
 // writeEventLogRecord appends a CEL-JSON record to the userspace TPM2 event log
 // at /run/log/systemd/tpm2-measure.log. The file uses JSON-SEQ format: records
 // are separated by RS (0x1E). An exclusive BSD flock is acquired to ensure
 // atomic writes, matching systemd-pcrextend's behavior.
 func writeEventLogRecord(pcr int, digest []byte) error {
+	return writeEventLogRecordFor(pcr, digest, "")
+}
+
+// writeEventLogRecordFor appends a CEL-JSON record, optionally tagging it
+// with the device path it was measured from.
+func writeEventLogRecordFor(pcr int, digest []byte, devicePath string) error {
 	// Ensure the directory exists
 	dir := filepath.Dir(eventLogPath)
 	if err := os.MkdirAll(dir, 0755); err != nil {
 		return fmt.Errorf("failed to create event log directory: %w", err)
 	}
 
-	data, err := buildCELRecord(pcr, digest)
+	data, err := buildCELRecord(pcr, digest, devicePath)
 	if err != nil {
 		return err
 	}
@@ -142,7 +165,13 @@ func writeEventLogRecord(pcr int, digest []byte) error {
 
 // buildCELRecord constructs the CEL-JSON record bytes for the given PCR and
 // digest. Separated from writeEventLogRecord for testability.
-func buildCELRecord(pcr int, digest []byte) ([]byte, error) {
+func buildCELRecord(pcr int, digest []byte, devicePath string) ([]byte, error) {
+	data := map[string]string{
+		"string": "vanguard-luks-header",
+	}
+	if devicePath != "" {
+		data[LUKSHeaderDataKey] = devicePath
+	}
 	record := celRecord{
 		PCR: pcr,
 		Digests: []celDigest{{
@@ -151,18 +180,16 @@ func buildCELRecord(pcr int, digest []byte) ([]byte, error) {
 		}},
 		Content: celContent{
 			EventType: "EV_IPL",
-			Data: map[string]string{
-				"string": "vanguard-luks-header",
-			},
+			Data:      data,
 		},
 		ContentType: "data",
 	}
 
-	data, err := json.Marshal(record)
+	raw, err := json.Marshal(record)
 	if err != nil {
 		return nil, fmt.Errorf("failed to marshal CEL record: %w", err)
 	}
-	return data, nil
+	return raw, nil
 }
 
 // writeCELData writes the RS separator and CEL-JSON data to the given writer.

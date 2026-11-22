@@ -41,6 +41,18 @@ var ErrWrongPIN = errors.New("incorrect PIN")
 // records the specific failure, but the caller sees only this generic error.
 var ErrPolicyFailed = errors.New("TPM policy failed")
 
+// ErrTokenStaleNVIndex indicates the LUKS token pins a pcrlock NV index
+// that no longer exists in the TPM — the policy was regenerated at a
+// different index (e.g. after the policy file was lost), so the sealed
+// blob can never be unsealed again. This is NOT an attacker-oracle
+// condition: it is a configuration drift that requires re-enrolling the
+// token, and the user MUST be told so (the boot otherwise falls back to
+// HOTP recovery with no explanation).
+//
+// It deliberately does NOT wrap ErrPolicyFailed: wrapping it would make
+// the generic "TPM unlock failed" mapping swallow the actionable detail.
+var ErrTokenStaleNVIndex = errors.New("LUKS token pins a stale pcrlock NV index")
+
 // HashAlgorithm is the TPM hash algorithm type.
 type HashAlgorithm = tpm2.TPMAlgID
 
@@ -72,7 +84,7 @@ type UnsealOpts struct {
 	PCRLockNV       uint32          // NV index for pcrlock (0 = default 0x01c20000)
 	SRKHandle       uint32          // Persistent SRK handle (0 = create transient)
 	SRKData         []byte          // Serialized SRK public data (tpm2_srk from systemd v255+)
-	PCRLockNVPublic []byte          // Raw TPM2B_NV_PUBLIC from token (for NV name verification)
+	PCRLockNVHandle []byte          // Serialized ESYS_TR of the pcrlock NV index (token field tpm2_pcrlock_nv)
 	PCRPredictions  []PCRPrediction // Predicted PCR values for pcrlock super-PCR policy
 }
 
@@ -496,33 +508,31 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 		NVIndex: tpm2.TPMHandle(nvIndex),
 	}.Execute(tpm)
 	if err != nil {
-		return nil, fmt.Errorf("NVReadPublic failed for 0x%x: %w", nvIndex, err)
+		if !IsNVIndexMissing(err) {
+			// A transient failure (transport error, TPM_RC_FAILURE, a
+			// TPM that is still enumerating) is not a stale index: report
+			// the real error instead of telling the user to re-enroll a
+			// token that is still valid.
+			return nil, fmt.Errorf("NVReadPublic for NV index 0x%x failed: %w", nvIndex, err)
+		}
+		// The token-pinned NV index is gone (e.g. a policy regeneration
+		// with a lost policy file let make-policy allocate a fresh index,
+		// and cleanup removed the old one). This is NOT recoverable at
+		// boot: PolicyAuthorizeNV folds the NV NAME into the session
+		// digest, and the sealed object's authPolicy was bound to the old
+		// index's name at enrollment — the TPM rejects any substitute
+		// index. The token must be re-sealed against the current policy
+		// (vanguard enroll). Say so plainly instead of a bare TPM error;
+		// strict mode then proceeds to HOTP recovery.
+		buildtags.Debug("tpm: token-pinned NV index 0x%x unavailable: %v\n", nvIndex, err)
+		return nil, fmt.Errorf("%w: index 0x%x is missing from the TPM (the policy was regenerated at a different index) — re-enroll the token: vanguard enroll -u <uki> -l <device>", ErrTokenStaleNVIndex, nvIndex)
 	}
 	buildtags.Debug("tpm: NV index 0x%x, NV Name (%d bytes): %x\n", nvIndex, len(nvReadPublicRsp.NVName.Buffer), nvReadPublicRsp.NVName.Buffer)
 
-	// Security check: verify the NV index name against the token's pinned
-	// TPM2B_NV_PUBLIC. The NV name is a cryptographic hash over the entire
-	// NV public area (including authPolicy, attributes, and dataSize), so
-	// any redefinition or spoofing of the NV index produces a different name.
-	// This catches:
-	//   - NV index redefinition (attacker undefines real index, defines rogue one)
-	//   - NV index spoofing (attacker creates index with same attributes but
-	//     different authPolicy)
-	//   - Most replay attacks (old NV contents can't match a new NV public area)
-	// The token carries the full TPM2B_NV_PUBLIC in the tpm2_pcrlock_nv field.
-	if len(opts.PCRLockNVPublic) > 0 {
-		expectedName, err := computeNVName(opts.PCRLockNVPublic)
-		if err != nil {
-			buildtags.Debug("tpm: WARNING: failed to compute expected NV name from token: %v\n", err)
-		} else {
-			if !bytes.Equal(expectedName, nvReadPublicRsp.NVName.Buffer) {
-				buildtags.Debug("tpm: NV name mismatch!\n  expected: %x\n  actual:   %x\n", expectedName, nvReadPublicRsp.NVName.Buffer)
-				return nil, fmt.Errorf("NV index name mismatch — possible tampering detected (NV index may have been redefined)")
-			}
-			buildtags.Debug("tpm: NV index name verified against token\n")
-		}
-	} else {
-		buildtags.Debug("tpm: WARNING: no NV public blob in token, cannot verify NV index name\n")
+	// Security check: the NV index in the TPM must be the index the token
+	// was sealed against (NV redefinition/spoofing detection).
+	if err := verifyNVIndexIdentity(opts.PCRLockNVHandle, nvIndex, nvReadPublicRsp.NVPublic.Bytes()); err != nil {
+		return nil, err
 	}
 
 	// Pre-check: compute the expected super-PCR policy digest offline from
@@ -737,12 +747,43 @@ func (c *Client) unsealWithPCRLock(tpm transport.TPM, loadRsp *tpm2.LoadResponse
 		}
 
 		buildtags.Debug("tpm: Unseal failed (auth=%s): %v\n", auth.name, err)
-		lastErr = classifyUnsealError(err, false)
+		// usePCRLock MUST be true here: this function only ever unseals
+		// pcrlock tokens, and collapsing wrong-PIN and wrong-PCR into
+		// ErrPolicyFailed is the error-oracle protection. Passing false
+		// classified a mistyped PIN as ErrPCRMismatch, which (a) defeated
+		// the oracle protection and (b) made the initrd skip the PIN
+		// retry and tell the user their "system configuration changed".
+		lastErr = classifyUnsealError(err, true)
 		if errors.Is(lastErr, ErrTPMLockout) {
 			return nil, lastErr
 		}
 
 		if !needsAuth {
+			break
+		}
+
+		// The "empty" auth variant exists for tokens that declare a PIN
+		// but were sealed without one. It only makes sense when the
+		// previous attempt failed for a reason OTHER than a rejected
+		// auth value:
+		//
+		//   - AUTH_FAIL means the session's policy digest MATCHED the
+		//     object's authPolicy and the TPM then rejected the auth
+		//     value. The object was therefore sealed WITH
+		//     PolicyAuthValue, so a variant that omits that command
+		//     produces a different policy digest and cannot succeed —
+		//     not even for an object with an empty auth value
+		//     (TestEmptyAuthVariantCannotRescuePolicyAuthValueTokens).
+		//   - POLICY_FAIL means the digests differed: either the PCR
+		//     state changed, or the object was sealed WITHOUT
+		//     PolicyAuthValue and the PIN variant's extra command broke
+		//     the digest. In the latter case the empty variant is the
+		//     one that matches, so it is worth trying.
+		//
+		// Measured on swtpm (TestDACounterSemantics): the empty variant
+		// fails the policy check before the auth check and does NOT
+		// consume a dictionary-attack slot.
+		if isAuthValueRejected(err) {
 			break
 		}
 	}
@@ -956,7 +997,12 @@ func (c *Client) createSRK(tpm transport.TPM, primaryAlg string) (tpm2.AuthHandl
 	}
 
 	cleanup := func() {
-		tpm2.FlushContext{FlushHandle: rsp.ObjectHandle}.Execute(tpm)
+		// A failed flush leaves a transient object allocated; on a direct
+		// /dev/tpm0 connection that can exhaust the TPM's object memory
+		// over repeated calls, so it must be visible rather than silent.
+		if _, err := (tpm2.FlushContext{FlushHandle: rsp.ObjectHandle}).Execute(tpm); err != nil {
+			buildtags.Debug("tpm: flushing the transient SRK failed: %v\n", err)
+		}
 	}
 
 	return srk, cleanup, nil
@@ -1220,6 +1266,27 @@ func ParseBlob(blob []byte) (private, public []byte, err error) {
 	public = blob[:publicSize]
 
 	return private, public, nil
+}
+
+// isAuthValueRejected reports whether the TPM rejected the auth value
+// itself (as opposed to failing a policy/PCR check). A rejected auth value
+// means the PIN was wrong — retrying without an auth value cannot succeed.
+func isAuthValueRejected(err error) bool {
+	var tpmRC tpm2.TPMRC
+	if errors.As(err, &tpmRC) {
+		if errors.Is(tpmRC, tpm2.TPMRCAuthFail) || errors.Is(tpmRC, tpm2.TPMRCBadAuth) {
+			return true
+		}
+	}
+	var fmt1Err tpm2.TPMFmt1Error
+	if errors.As(err, &fmt1Err) {
+		errStr := fmt1Err.Error()
+		if containsAny(errStr, "AUTH_FAIL", "BAD_AUTH") {
+			return true
+		}
+	}
+	errStr := err.Error()
+	return containsAny(errStr, "AUTH_FAIL", "BAD_AUTH", "authorization", "auth fail", "HMAC check failed")
 }
 
 // classifyUnsealError converts TPM errors to semantic errors.
@@ -1498,7 +1565,12 @@ func (c *Client) loadExternalSRK(tpm transport.TPM, publicData []byte) (tpm2.Aut
 	}
 
 	cleanup := func() {
-		tpm2.FlushContext{FlushHandle: rsp.ObjectHandle}.Execute(tpm)
+		// A failed flush leaves a transient object allocated; on a direct
+		// /dev/tpm0 connection that can exhaust the TPM's object memory
+		// over repeated calls, so it must be visible rather than silent.
+		if _, err := (tpm2.FlushContext{FlushHandle: rsp.ObjectHandle}).Execute(tpm); err != nil {
+			buildtags.Debug("tpm: flushing the transient SRK failed: %v\n", err)
+		}
 	}
 
 	return srk, cleanup, nil

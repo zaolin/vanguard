@@ -1,6 +1,7 @@
 package pcrlock
 
 import (
+	"path/filepath"
 	"testing"
 
 	"github.com/google/go-tpm/tpm2"
@@ -10,9 +11,7 @@ import (
 // TestReadNVIndexDetails_NotFound verifies that ReadNVIndexDetails returns
 // an error for a non-existent index.
 func TestReadNVIndexDetails_NotFound(t *testing.T) {
-	if _, err := swtpmtest.Setup(t); err != nil {
-		t.Skip("swtpm not available")
-	}
+	swtpmtest.SetupEnvTransport(t)
 
 	_, err := ReadNVIndexDetails(0x01999999)
 	if err == nil {
@@ -24,15 +23,14 @@ func TestReadNVIndexDetails_NotFound(t *testing.T) {
 // the no-TPM case gracefully.
 func TestReadCurrentPCRs_NoTPM(t *testing.T) {
 	// readCurrentPCRs uses tpm.New() internally
-	if _, err := swtpmtest.Setup(t); err != nil {
-		t.Skip("swtpm not available")
-	}
+	swtpmtest.SetupEnvTransport(t)
 
 	// Reading PCRs from a real TPM or swtpm should work
 	pcrs, err := readCurrentPCRs([]int{7})
 	if err != nil {
-		// May fail if no /dev/tpmrm0 — that's fine
-		t.Skipf("readCurrentPCRs failed (no TPM device): %v", err)
+		// SetupEnv provides a simulator, so a failure here is a real
+		// regression, not a missing environment.
+		t.Fatalf("readCurrentPCRs failed against the simulator: %v", err)
 	}
 
 	if len(pcrs) == 0 {
@@ -43,6 +41,15 @@ func TestReadCurrentPCRs_NoTPM(t *testing.T) {
 		t.Error("PCR 7 not in result")
 	} else if len(val) != 64 { // hex-encoded 32 bytes = 64 chars
 		t.Errorf("PCR 7 value length: got %d, want 64", len(val))
+	}
+}
+
+// TestReadCurrentPCRs_UnavailableTPM pins the failure path: an unreachable
+// TPM must produce an error, not a panic or an empty success.
+func TestReadCurrentPCRs_UnavailableTPM(t *testing.T) {
+	t.Setenv("VANGUARD_TPM_SOCKET", filepath.Join(t.TempDir(), "missing.sock"))
+	if _, err := readCurrentPCRs([]int{7}); err == nil {
+		t.Error("expected an error when no TPM is reachable")
 	}
 }
 

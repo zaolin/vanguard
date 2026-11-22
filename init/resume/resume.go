@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"golang.org/x/sys/unix"
+
+	"github.com/zaolin/vanguard/init/lvm"
 )
 
 // Debug function placeholder - will be set by the main init package
@@ -166,8 +168,9 @@ func normalizeLVMPath(device string) string {
 	}
 
 	// Construct the /dev/mapper/<vg>-<lv> path
-	// Note: hyphens in VG/LV names are escaped as double hyphens in mapper names
-	mapperName := escapeMapperName(vg) + "-" + escapeMapperName(lv)
+	// Hyphens in VG/LV names are escaped as double hyphens in mapper names
+	// via the shared helper (init/lvm) so both normalizers agree.
+	mapperName := lvm.EscapeMapperName(vg) + "-" + lvm.EscapeMapperName(lv)
 	mapperPath := filepath.Join("/dev/mapper", mapperName)
 
 	// Check if the mapper path exists, prefer it if so
@@ -182,11 +185,6 @@ func normalizeLVMPath(device string) string {
 
 	// Neither exists yet, prefer the mapper path
 	return mapperPath
-}
-
-// escapeMapperName escapes hyphens in VG/LV names for device-mapper naming
-func escapeMapperName(name string) string {
-	return strings.ReplaceAll(name, "-", "--")
 }
 
 // resolveDeviceRef resolves UUID= or PARTUUID= references to device paths

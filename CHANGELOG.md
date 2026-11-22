@@ -1,8 +1,16 @@
 # Changelog
 
-## Unreleased
+## v0.4.0 — 2026-11-21
 
 ### Features
+
+- **TPM vulnerability and functional health checks in `vanguard status`**
+  - Vendor/firmware identity via `TPM2_GetCapability` with a curated offline advisory table (ROCA, TPM-Fail, faulTPM, simulator) plus BIOS/AGESA identification from DMI. The AGESA patch level is reported as not automatically verifiable instead of being guessed.
+  - Functional checks that answer whether the TPM actually protects the disk key: PCR banks (paginated), RNG smoke (accumulated 32-byte reads so short responses are not false alarms), a seal/unseal roundtrip in the normal run (transient objects only, `NoDA`, no dictionary-attempt consumption), and an NV-contents-vs-policy-digest check shared with the initrd pre-check.
+  - Boot parameter audit: vanguard test hooks (`testpin`, `testpass`, `testmode`, `testhotp`) with the initrd's exact activation semantics, plus generic bypasses (`init=/bin/sh`, `rdinit`, `single`, `rd.break`, `debug`).
+  - Platform data exposure: swap encryption classified by dm-crypt TARGET TYPE (recursing into linear PVs, so LVM-over-LUKS is recognized; RAID/multipath is unknown rather than a false verdict), zram backing-device resolution (`none` = RAM-only, full paths unchanged), suspend-to-RAM exposure gated on positive memory-encryption evidence (TSME, TME-by-BIOS, `Memory Encryption Features active`), and all-zero-PCR detection.
+  - New threat vectors: `TPM Vulnerabilities (vendor/firmware)`, `TPM Functional Health`, `Boot Parameter Bypass`, `Platform Data Exposure`; all present in `--json` as well.
+  - Protection tiers deliberately ignore vendor advisories: a healthy Intel or AMD machine no longer sits at permanent WARNING, while verified defects still drive the tier.
 
 - **Recovery switched from TOTP to HOTP (RFC 4226) — no clock dependency**
   - The initramfs has no trustworthy clock: the RTC can be reset (dead CMOS battery, firmware update) and there is no network for NTP. TOTP recovery therefore depended on a TPM-stored reference timestamp plus a drift ladder and a two-code time-resync fallback, which proved fragile in practice.
@@ -19,6 +27,13 @@
 - **`root=UUID=` / `root=PARTUUID=` support** — resolved via `/dev/disk/by-*` symlinks created by a new builtin-only udev rule (`60-vanguard-persistent-disk.rules`); the stock rule creating these links is not shipped because it requires external ata_id/scsi_id binaries
 
 ### Fixed
+
+- **NV index identity was compared using the wrong data format.** The token's `tpm2_pcrlock_nv` is a serialized ESYS_TR handle (systemd v256), not a bare `TPM2B_NV_PUBLIC`; the staleness check now compares it with the policy's `nvHandle` byte for byte, exactly how systemd matches a token to its policy. The boot-time NV identity check parses the ESYS_TR layout and compares masked names of the token's and the TPM's public areas, so a redefined index is detected without false tamper alarms (the volatile attribute bits are masked on both sides, proven on swtpm).
+- **Initrd token loop**: a stale pcrlock token no longer blocks the other tokens; the shared PIN budget gates only PIN-bearing tokens; a TPM lockout has the highest error priority and stops the loop; the actionable stale-NV and lockout-state errors are no longer overwritten by later, less specific failures.
+- **Repair ordering and confirmation**: after a successful re-seal the LUKS header PCR 11 prediction is refreshed again (the header changed), the confirmation requires an actual pcrlock-bound match (a classic token is not "repaired"), and `--repair-unlock` is validated before anything is mutated.
+- **Status no longer reports false criticals for unreadable state**: unreadable PCRs/NV are "unknown" rather than mismatches; transport and authorization problems are "unverified" rather than "the TPM cannot protect the key"; an ambiguous policy selection refuses to guess instead of producing a false NV-tampering diagnosis.
+- **Fail-safe TPM authorization gating**: `TPM_PT_PERMANENT` reveals owner/lockout auth read-only. When the lockout state is unknown, the TPM is locked out, or owner/lockout auth is set, status skips operations that could consume dictionary-attack attempts.
+- **Test hygiene**: four tests that always skipped (and leaked swtpm processes) now really run against the simulator via `VANGUARD_TPM_SOCKET`; the LUKS token lookup is tested directly (a valid token is returned, a corrupt token is not "no token", token IDs are ordered numerically).
 
 - **`vanguard recovery --auto-reseed` destroyed the shared timestamp index and could fake success**
   - Root cause 1: temp-seed staging and cleanup used the composite `DefineRecoveryNVSpace`/`UndefineRecoveryNVSpace`, which also delete/recreate the shared timestamp index (0x01C30002) — every "successful" full reseed left the system with a live seed and NO timestamp index (the exact broken state observed on a live machine: seed present, timestamp missing, relock service dead)

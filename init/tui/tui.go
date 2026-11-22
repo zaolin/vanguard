@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/charmbracelet/bubbles/spinner"
@@ -31,6 +32,11 @@ const (
 	StageFsck       = "Checking filesystem"
 	StageSwitchroot = "Switching to root"
 )
+
+// maxPromptAttempts mirrors luks.MaxPINAttempts (3) for the on-screen
+// attempt counter. Kept here because the TUI package cannot import luks
+// (luks imports tui).
+const maxPromptAttempts = 3
 
 // Styles
 var (
@@ -68,6 +74,10 @@ type Model struct {
 	lockedOut       bool
 	lockoutMessage  string
 	lockoutRecovery string
+
+	// Standalone TPM error (PCR mismatch, token failure) — shown outside
+	// password mode, e.g. before HOTP recovery takes over the console.
+	tpmError string
 
 	// Window dimensions
 	width  int
@@ -224,6 +234,7 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.passwordMode = true
 		m.lockedOut = false
+		m.tpmError = ""
 		m.deviceName = msg.Device
 		m.passwordDone = msg.Done
 		m.passwordInput.Reset()
@@ -263,9 +274,12 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.lockoutRecovery = msg.RecoveryHint
 
 	case TPMErrorMsg:
-		// Show TPM error (PCR mismatch, etc.)
+		// Show TPM error (PCR mismatch, token failure) outside password
+		// mode. The TUI stays up; the caller dwells so the reason is
+		// readable before tearing the TUI down.
 		m.passwordMode = false
-		m.passwordErr = msg.Message
+		m.passwordErr = ""
+		m.tpmError = msg.Message
 
 	case QuitMsg:
 		m.done = true
@@ -339,13 +353,20 @@ func (m Model) View() string {
 		}
 		// Show attempt counter (1-indexed, always show current attempt)
 		attemptNum := m.attempts + 1
-		if attemptNum <= 3 {
-			mainContent.WriteString(helpStyle.Render(fmt.Sprintf("Attempt %d of 3", attemptNum)))
+		if attemptNum <= maxPromptAttempts {
+			mainContent.WriteString(helpStyle.Render(fmt.Sprintf("Attempt %d of %d", attemptNum, maxPromptAttempts)))
 			mainContent.WriteString("\n\n")
 		}
 		mainContent.WriteString(promptStyle.Render(fmt.Sprintf("Enter passphrase for %s:", m.deviceName)))
 		mainContent.WriteString("\n\n")
 		mainContent.WriteString(m.passwordInput.View())
+		mainContent.WriteString("\n")
+	}
+
+	// Standalone TPM error (outside password mode)
+	if m.tpmError != "" {
+		mainContent.WriteString("\n")
+		mainContent.WriteString(errorStyle.Render(m.tpmError))
 		mainContent.WriteString("\n")
 	}
 
@@ -370,6 +391,18 @@ func (m Model) View() string {
 // Program is the global TUI program instance
 var Program *tea.Program
 
+// running reports whether the TUI's Run loop is actually alive. Program
+// stays non-nil while the start goroutine is still inside Run() (and even
+// after it returned — until Quit() runs), so liveness checks must look at
+// this flag rather than a nil-check on Program alone.
+var running atomic.Bool
+
+// runExited is closed when Run() returns for any reason (start failure,
+// user pressed q/ctrl+c in stage mode, fatal model error). Prompt callers
+// select on it to fail fast instead of blocking until their timeout when
+// the TUI is already dead.
+var runExited chan struct{}
+
 // suppressKernelMessages aggressively suppresses kernel console output
 func suppressKernelMessages() {
 	// Set console log level to 0 (suppress all messages)
@@ -390,14 +423,28 @@ func Start() error {
 	suppressKernelMessages()
 
 	// Suppress console output to avoid interfering with TUI
-	console.TUIActive = true
+	console.SetTUIActive(true)
 
 	m := New()
 	Program = tea.NewProgram(m, tea.WithAltScreen())
+	runExited = make(chan struct{})
+	running.Store(true)
 
 	go func() {
+		// Mark the TUI dead when Run returns, whatever the reason: a
+		// failed start, an error inside the model, or the user quitting
+		// outside password mode. Without this, console output stays
+		// suppressed and prompt calls block until their timeout with
+		// nothing visible on screen.
+		defer func() {
+			running.Store(false)
+			console.SetTUIActive(false)
+			close(runExited)
+			restoreKernelMessages()
+		}()
 		if _, err := Program.Run(); err != nil {
-			// TUI failed to start, will fall back to console
+			// The TUI failed; prompt callers fall back to the console
+			// via PromptAvailable.
 		}
 	}()
 
@@ -428,11 +475,26 @@ func StageError(stage string, err error) {
 	}
 }
 
+// ErrPromptUnavailable is returned by the prompt entry points when the TUI
+// cannot accept a prompt (no program, Run loop dead, or debug builds).
+// Callers treat it as "fall back to the plain console".
+var ErrPromptUnavailable = fmt.Errorf("TUI not available")
+
+// PromptAvailable reports whether the TUI can currently accept password
+// prompts. IsEnabled() is a build-tag constant and says nothing about the
+// runtime state; this checks that the Run loop is actually alive. Callers
+// route prompts through it so a dead TUI (quit before the prompt, start
+// failure, user exited) falls back to the plain console instead of
+// blocking on the prompt timeout.
+func PromptAvailable() bool {
+	return Program != nil && running.Load()
+}
+
 // PromptPassword prompts for a password via the TUI
 // Returns the entered password or an error
 func PromptPassword(device string) (string, error) {
-	if Program == nil {
-		return "", fmt.Errorf("TUI not initialized")
+	if !PromptAvailable() {
+		return "", ErrPromptUnavailable
 	}
 
 	done := make(chan string, 1)
@@ -441,6 +503,17 @@ func PromptPassword(device string) (string, error) {
 	select {
 	case password := <-done:
 		return password, nil
+	case <-runExited:
+		// A result may already be queued (e.g. the user pressed ctrl+c and
+		// the Run loop exited). Prefer it over the exit signal: otherwise a
+		// cancel would randomly turn into "TUI unavailable" and the caller
+		// would re-prompt on the console.
+		select {
+		case password := <-done:
+			return password, nil
+		default:
+		}
+		return "", fmt.Errorf("%w: TUI exited before password entry", ErrPromptUnavailable)
 	case <-time.After(5 * time.Minute):
 		return "", fmt.Errorf("password prompt timeout")
 	}
@@ -456,8 +529,8 @@ func PasswordError(msg string) {
 // PasswordErrorWithRetry shows a password error and waits for retry
 // Returns the next password attempt
 func PasswordErrorWithRetry(msg string) (string, error) {
-	if Program == nil {
-		return "", fmt.Errorf("TUI not initialized")
+	if !PromptAvailable() {
+		return "", ErrPromptUnavailable
 	}
 
 	done := make(chan string, 1)
@@ -466,6 +539,17 @@ func PasswordErrorWithRetry(msg string) (string, error) {
 	select {
 	case password := <-done:
 		return password, nil
+	case <-runExited:
+		// A result may already be queued (e.g. the user pressed ctrl+c and
+		// the Run loop exited). Prefer it over the exit signal: otherwise a
+		// cancel would randomly turn into "TUI unavailable" and the caller
+		// would re-prompt on the console.
+		select {
+		case password := <-done:
+			return password, nil
+		default:
+		}
+		return "", fmt.Errorf("%w: TUI exited before password entry", ErrPromptUnavailable)
 	case <-time.After(5 * time.Minute):
 		return "", fmt.Errorf("password prompt timeout")
 	}
@@ -516,7 +600,8 @@ func Quit() {
 		}
 
 		Program = nil
-		console.TUIActive = false
+		running.Store(false)
+		console.SetTUIActive(false)
 		restoreKernelMessages()
 	}
 }

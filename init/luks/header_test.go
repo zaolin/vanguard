@@ -6,14 +6,13 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/zaolin/vanguard/internal/testutil"
 	intpm "github.com/zaolin/vanguard/internal/tpm"
 )
 
 func skipIfNoCryptsetup(t *testing.T) {
 	t.Helper()
-	if _, err := exec.LookPath("cryptsetup"); err != nil {
-		t.Skip("cryptsetup not found")
-	}
+	testutil.RequireCryptsetup(t)
 }
 
 func prepareLuks2Disk(t *testing.T, password string) *os.File {

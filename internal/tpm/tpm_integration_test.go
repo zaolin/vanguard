@@ -776,12 +776,24 @@ func TestIntegrationRealSystemdToken_UnsealWithOptsPCRLock(t *testing.T) {
 		Bank:           pcrlockPolicy.Bank,
 	})
 	if err != nil {
+		// A pcrlock token with a wrong PIN must collapse to
+		// ErrPolicyFailed — the error-oracle protection. ErrWrongPIN or
+		// ErrPCRMismatch here would mean the caller can distinguish a
+		// wrong PIN from a broken PCR chain, and the initrd would skip
+		// the PIN retry and blame the system configuration.
+		if errors.Is(err, ErrPolicyFailed) {
+			t.Logf("Unseal failed with wrong PIN, collapsed to ErrPolicyFailed (expected): %v", err)
+			if errors.Is(err, ErrWrongPIN) || errors.Is(err, ErrPCRMismatch) {
+				t.Errorf("pcrlock failure leaked a specific classification: %v", err)
+			}
+			return
+		}
 		if errors.Is(err, ErrWrongPIN) {
-			t.Logf("Unseal failed with wrong PIN (expected with placeholder): %v", err)
+			t.Errorf("pcrlock token leaked ErrWrongPIN (error oracle): %v", err)
 			return
 		}
 		if errors.Is(err, ErrPCRMismatch) {
-			t.Logf("Unseal failed with PCR mismatch (policy chain broken?): %v", err)
+			t.Errorf("pcrlock token leaked ErrPCRMismatch (error oracle): %v", err)
 			return
 		}
 		t.Fatalf("UnsealWithOpts: %v", err)
